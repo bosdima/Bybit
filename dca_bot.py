@@ -620,9 +620,38 @@ class BybitClient:
                 self._init_session()
             
             try:
+                # Получаем баланс UNIFIED аккаунта
                 response = self.session.get_wallet_balance(accountType="UNIFIED")
                 if response['retCode'] == 0:
-                    return self._parse_wallet_balance(response, coin)
+                    result_list = response['result']['list']
+                    if result_list:
+                        account_data = result_list[0]
+                        coins = account_data.get('coin', [])
+                        
+                        if coin:
+                            for c in coins:
+                                if c.get('coin') == coin:
+                                    wallet_balance = float(c.get('walletBalance', 0) or 0)
+                                    equity = float(c.get('equity', 0) or 0) or wallet_balance
+                                    locked = float(c.get('locked', 0) or 0)
+                                    available = wallet_balance - locked
+                                    usd_value = float(c.get('usdValue', 0) or 0)
+                                    
+                                    return {
+                                        'coin': coin,
+                                        'equity': equity or wallet_balance,
+                                        'walletBalance': wallet_balance,
+                                        'available': available,
+                                        'usdValue': usd_value,
+                                    }
+                            
+                            return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
+                        else:
+                            total_equity = float(account_data.get('totalEquity', 0) or 0)
+                            return {
+                                'total_equity': total_equity,
+                                'coins': coins,
+                            }
             except Exception as e:
                 logger.warning(f"wallet_balance failed: {e}")
             
@@ -631,44 +660,6 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error in get_balance: {e}")
             return {'error': str(e)}
-    
-    def _parse_wallet_balance(self, response: Dict, coin: str = None) -> Dict:
-        """Парсинг баланса"""
-        try:
-            result_list = response['result']['list']
-            if not result_list:
-                return {'error': 'Пустой список аккаунтов'}
-            
-            account_data = result_list[0]
-            coins = account_data.get('coin', [])
-            
-            if coin:
-                for c in coins:
-                    if c.get('coin') == coin:
-                        wallet_balance = float(c.get('walletBalance', 0) or 0)
-                        equity = float(c.get('equity', 0) or 0) or wallet_balance
-                        locked = float(c.get('locked', 0) or 0)
-                        available = wallet_balance - locked
-                        usd_value = float(c.get('usdValue', 0) or 0)
-                        
-                        return {
-                            'coin': coin,
-                            'equity': equity or wallet_balance,
-                            'walletBalance': wallet_balance,
-                            'available': available,
-                            'usdValue': usd_value,
-                        }
-                
-                return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
-            else:
-                total_equity = float(account_data.get('totalEquity', 0) or 0)
-                return {
-                    'total_equity': total_equity,
-                    'coins': coins,
-                }
-        except Exception as e:
-            logger.error(f"Error parsing wallet_balance: {e}")
-            return {'error': f'Ошибка парсинга: {str(e)}'}
     
     async def get_open_orders(self, symbol: str = None) -> List[Dict]:
         """Получить открытые ордера"""
@@ -1195,15 +1186,20 @@ class FastDCABot:
             symbol = self.db.get_setting('symbol', 'BTCUSDT')
             coin = symbol.replace('USDT', '')
             
+            # Получаем баланс
             coin_balance = await self.bybit.get_balance(coin)
+            usdt_balance = await self.bybit.get_balance('USDT')
             current_price = await self.bybit.get_symbol_price(symbol)
             
             message = f"📊 *Мой Портфель*\n\n"
             
-            if 'total_equity' in coin_balance:
-                message += f"💰 Общий баланс: `{coin_balance['total_equity']:.2f}` USDT\n\n"
+            # Информация о USDT
+            if usdt_balance and 'equity' in usdt_balance:
+                available_usdt = usdt_balance.get('available', usdt_balance.get('equity', 0))
+                message += f"💵 USDT доступно: `{available_usdt:.2f}`\n\n"
             
-            if 'equity' in coin_balance:
+            # Информация о монете
+            if coin_balance and 'equity' in coin_balance:
                 equity = coin_balance['equity']
                 available = coin_balance.get('available', 0)
                 usd_value = coin_balance.get('usdValue', 0)
@@ -1233,11 +1229,7 @@ class FastDCABot:
                     message += f"Текущая цена: `{current_price:.2f}` USDT\n"
                     message += f"{emoji} PnL: `{pnl_percent:+.2f}%` ({pnl_usd:+.2f} USDT)\n\n"
             
-            usdt_balance = await self.bybit.get_balance('USDT')
-            if 'equity' in usdt_balance:
-                available_usdt = usdt_balance.get('available', usdt_balance.get('equity', 0))
-                message += f"💵 USDT доступно: `{available_usdt:.2f}`\n\n"
-            
+            # Открытые ордера
             open_orders = await self.bybit.get_open_orders(symbol)
             
             if open_orders:
