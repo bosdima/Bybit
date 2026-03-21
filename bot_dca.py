@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - ИСПРАВЛЕННАЯ ВЕРСИЯ с TONUSDT по умолчанию
+Исправлено: отображение цен в формате до 4 знаков после запятой (1.2341)
 """
 
 import os
@@ -96,6 +97,18 @@ DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 
 # ==================== ПРОВЕРКА TELEGRAM API ====================
+
+def format_price(price: float, decimals: int = 4) -> str:
+    """Форматирование цены с указанным количеством знаков после запятой"""
+    if price is None:
+        return "N/A"
+    return f"{price:.{decimals}f}"
+
+def format_quantity(qty: float, decimals: int = 6) -> str:
+    """Форматирование количества с указанным количеством знаков после запятой"""
+    if qty is None:
+        return "N/A"
+    return f"{qty:.{decimals}f}"
 
 async def check_telegram_connection() -> Tuple[bool, float, str]:
     """
@@ -1246,7 +1259,7 @@ class DCAStrategy:
             self.db.log_action(
                 'DCA_PURCHASE',
                 symbol,
-                f"Куплено {result['quantity']} {symbol} за {result['total_usdt']} USDT "
+                f"Куплено {result['quantity']:.6f} {symbol} за {result['total_usdt']:.2f} USDT "
                 f"(множитель: {multiplier}, падение: {drop_percent:.2f}%)"
             )
         
@@ -1264,7 +1277,7 @@ class DCAStrategy:
                 self.db.log_action(
                     'SELL_COMPLETED',
                     symbol,
-                    f"Продано по цене {order['target_price']} (прибыль {order['profit_percent']}%)"
+                    f"Продано по цене {format_price(order['target_price'])} (прибыль {order['profit_percent']}%)"
                 )
                 
                 stats = self.db.get_dca_stats(symbol)
@@ -1397,7 +1410,7 @@ class FastDCABot:
                 except:
                     date_display = p['date'][:10] if p['date'] else "N/A"
             
-            btn_text = f"ID{p['id']}: {date_display} - {p['quantity']:.4f} по {p['price']:.2f}"
+            btn_text = f"ID{p['id']}: {date_display} - {format_quantity(p['quantity'], 4)} по {format_price(p['price'], 4)}"
             keyboard.append([KeyboardButton(btn_text)])
         keyboard.append([KeyboardButton("🏠 Главное меню")])
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -1536,13 +1549,13 @@ class FastDCABot:
                 emoji = "🟢" if pnl_percent >= 0 else "🔴"
                 
                 message += f"🪙 *{coin}*\n"
-                message += f"Количество: `{equity:.6f}`\n"
-                message += f"Доступно: `{available:.6f}`\n"
+                message += f"Количество: `{format_quantity(equity, 6)}`\n"
+                message += f"Доступно: `{format_quantity(available, 6)}`\n"
                 message += f"Стоимость: `{usd_value:.2f}` USDT\n"
                 if avg_price > 0:
-                    message += f"Средняя цена входа: `{avg_price:.2f}` USDT\n"
+                    message += f"Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
                 if current_price:
-                    message += f"Текущая цена: `{current_price:.2f}` USDT\n"
+                    message += f"Текущая цена: `{format_price(current_price, 4)}` USDT\n"
                     message += f"{emoji} PnL: `{pnl_percent:+.2f}%` ({pnl_usd:+.2f} USDT)\n\n"
             
             # Открытые ордера
@@ -1556,7 +1569,7 @@ class FastDCABot:
                     qty = float(order.get('qty', 0))
                     
                     if side == 'Sell':
-                        message += f"🔴 Продажа: `{qty:.4f}` @ `{price:.2f}`\n"
+                        message += f"🔴 Продажа: `{format_quantity(qty, 6)}` @ `{format_price(price, 4)}`\n"
                 
                 if len(open_orders) > 5:
                     message += f"_...и еще {len(open_orders) - 5}_\n"
@@ -1617,12 +1630,12 @@ class FastDCABot:
             
             text = f"📊 *ДЕТАЛЬНАЯ СТАТИСТИКА DCA*\n\n"
             text += f"📅 Начало: `{start_date_str}`\n"
-            text += f"💰 Куплено: `{total_amount:.6f}` {coin}\n"
-            text += f"💵 Средняя цена: `{avg_price:.2f}` USDT\n"
+            text += f"💰 Куплено: `{format_quantity(total_amount, 6)}` {coin}\n"
+            text += f"💵 Средняя цена: `{format_price(avg_price, 4)}` USDT\n"
             text += f"💵 Инвестировано: `{total_cost:.2f}` USDT\n"
             
             if current_price:
-                text += f"📈 Текущая цена: `{current_price:.2f}` USDT\n"
+                text += f"📈 Текущая цена: `{format_price(current_price, 4)}` USDT\n"
                 text += f"💰 Текущая стоимость: `{current_value:.2f}` USDT\n"
                 text += f"{pnl_emoji} Текущий PnL: `{pnl:.2f}` USDT ({pnl_sign}{pnl_percent:.2f}%)\n"
             
@@ -1634,7 +1647,7 @@ class FastDCABot:
             target_pnl = target_value - total_cost
             
             text += f"\n🎯 *ЦЕЛЕВАЯ ПРИБЫЛЬ {profit_percent}%:*\n"
-            text += f"Продать `{total_amount:.6f}` {coin} по цене `{target_price:.2f}` USDT\n"
+            text += f"Продать `{format_quantity(total_amount, 6)}` {coin} по цене `{format_price(target_price, 4)}` USDT\n"
             text += f"Получите: `{target_value:.2f}` USDT\n"
             text += f"Прибыль: `{target_pnl:.2f}` USDT"
             
@@ -1686,7 +1699,7 @@ class FastDCABot:
         price = await self.bybit.get_symbol_price(symbol)
         
         if price:
-            await update.message.reply_text(f"💹 *{symbol}*: `{price:.2f}` USDT", parse_mode='Markdown')
+            await update.message.reply_text(f"💹 *{symbol}*: `{format_price(price, 4)}` USDT", parse_mode='Markdown')
         else:
             await update.message.reply_text("❌ Не удалось получить цену. Проверьте символ или подключение к Bybit.")
     
@@ -1727,7 +1740,7 @@ class FastDCABot:
             await update.message.reply_text(
                 f"✅ DCA запущен!\n\n"
                 f"🪙 {symbol}\n"
-                f"💵 Начальная цена: {current_price:.2f} USDT",
+                f"💵 Начальная цена: {format_price(current_price, 4)} USDT",
                 reply_markup=self.get_main_keyboard()
             )
             self.db.log_action('DCA_STARTED', symbol, f"Цена: {current_price}")
@@ -1813,7 +1826,7 @@ class FastDCABot:
         
         await update.message.reply_text(
             f"✅ Символ изменен на {symbol}\n"
-            f"💰 Текущая цена: {price:.2f} USDT\n\n"
+            f"💰 Текущая цена: {format_price(price, 4)} USDT\n\n"
             f"Старые покупки ({old_symbol}) сохранены в истории.",
             reply_markup=self.get_settings_keyboard()
         )
@@ -2144,7 +2157,7 @@ class FastDCABot:
             qty = float(order.get('qty', 0))
             short_id = order.get('orderId', 'N/A')[:8]
             
-            message += f"*{i}.* `{short_id}` - `{qty:.6f}` @ `{price:.2f}`\n"
+            message += f"*{i}.* `{short_id}` - `{format_quantity(qty, 6)}` @ `{format_price(price, 4)}`\n"
         
         await update.message.reply_text(message, parse_mode='Markdown')
         return MANAGE_ORDERS
@@ -2175,8 +2188,10 @@ class FastDCABot:
         keyboard = []
         for i, order in enumerate(open_orders[:10], 1):
             order_id = order.get('orderId', 'N/A')
+            price = float(order.get('price', 0))
+            qty = float(order.get('qty', 0))
             keyboard.append([InlineKeyboardButton(
-                f"❌ Удалить ордер #{i}", 
+                f"❌ Удалить #{i} ({format_price(price, 4)})", 
                 callback_data=f"order_delete_{order_id}"
             )])
         
@@ -2218,7 +2233,7 @@ class FastDCABot:
             price = float(order.get('price', 0))
             qty = float(order.get('qty', 0))
             keyboard.append([InlineKeyboardButton(
-                f"✏️ Изменить #{i} ({price:.2f})", 
+                f"✏️ Изменить #{i} ({format_price(price, 4)})", 
                 callback_data=f"order_edit_{order_id}_{price}_{qty}"
             )])
         
@@ -2283,7 +2298,7 @@ class FastDCABot:
         context.user_data['editing_order_current_price'] = current_price
         
         await update.callback_query.edit_message_text(
-            f"✏️ Введите новую цену (текущая: {current_price:.2f}):"
+            f"✏️ Введите новую цену (текущая: {format_price(current_price, 4)}):"
         )
         context.user_data['current_state'] = EDIT_ORDER_PRICE
     
@@ -2317,7 +2332,7 @@ class FastDCABot:
             if result['success']:
                 self.db.update_order_price(order_id, new_price, 0)
                 await update.message.reply_text(
-                    f"✅ Цена изменена: {old_price:.2f} -> {new_price:.2f}",
+                    f"✅ Цена изменена: {format_price(old_price, 4)} -> {format_price(new_price, 4)}",
                     reply_markup=self.get_orders_management_keyboard()
                 )
             else:
@@ -2359,7 +2374,8 @@ class FastDCABot:
         context.user_data['manual_buy_symbol'] = symbol
         
         await update.message.reply_text(
-            f"💰 Текущая цена {symbol}: `{current_price:.2f}` USDT\n\nВведите цену лимитного ордера в USDT (или нажмите Отмена):",
+            f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
+            f"Введите цену лимитного ордера в USDT (например: {format_price(current_price, 4)}):",
             reply_markup=self.get_manual_buy_keyboard(),
             parse_mode='Markdown'
         )
@@ -2450,10 +2466,10 @@ class FastDCABot:
                 
                 await update.message.reply_text(
                     f"✅ *Лимитный ордер создан!*\n\n"
-                    f"Цена: `{price:.2f}` USDT\n"
+                    f"Цена: `{format_price(price, 4)}` USDT\n"
                     f"Сумма: `{amount:.2f}` USDT\n"
-                    f"Количество: `{result['quantity']:.6f}`\n"
-                    f"Цель продажи: `{target_price:.2f}` USDT ({profit_percent}%)",
+                    f"Количество: `{format_quantity(result['quantity'], 6)}`\n"
+                    f"Цель продажи: `{format_price(target_price, 4)}` USDT ({profit_percent}%)",
                     reply_markup=self.get_main_keyboard(),
                     parse_mode='Markdown'
                 )
@@ -2481,7 +2497,7 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         
         await update.message.reply_text(
-            f"➕ Введите цену покупки в USDT (или нажмите Отмена):",
+            f"➕ Введите цену покупки в USDT (например: 1.2341):",
             reply_markup=self.get_cancel_keyboard()
         )
         return MANUAL_ADD_PRICE
@@ -2502,13 +2518,13 @@ class FastDCABot:
             context.user_data['manual_price'] = price
             
             await update.message.reply_text(
-                f"✅ Цена {price} USDT\n\nВведите количество монет (или нажмите Отмена):",
+                f"✅ Цена {format_price(price, 4)} USDT\n\nВведите количество монет (например: 10.5):",
                 reply_markup=self.get_cancel_keyboard()
             )
             return MANUAL_ADD_AMOUNT
             
         except ValueError:
-            await update.message.reply_text("❌ Ошибка! Введите число или нажмите Отмена:", reply_markup=self.get_cancel_keyboard())
+            await update.message.reply_text("❌ Ошибка! Введите число (например: 1.2341) или нажмите Отмена:", reply_markup=self.get_cancel_keyboard())
             return MANUAL_ADD_PRICE
     
     async def manual_add_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2546,8 +2562,8 @@ class FastDCABot:
                 await update.message.reply_text(
                     f"✅ *Покупка добавлена!*\n\n"
                     f"ID: `{purchase_id}`\n"
-                    f"Цена: `{price:.2f}` USDT\n"
-                    f"Количество: `{quantity:.6f}`\n"
+                    f"Цена: `{format_price(price, 4)}` USDT\n"
+                    f"Количество: `{format_quantity(quantity, 6)}`\n"
                     f"Сумма: `{amount_usdt:.2f}` USDT",
                     reply_markup=self.get_main_keyboard(),
                     parse_mode='Markdown'
@@ -2558,7 +2574,7 @@ class FastDCABot:
             return ConversationHandler.END
             
         except ValueError:
-            await update.message.reply_text("❌ Ошибка! Введите число или нажмите Отмена:", reply_markup=self.get_cancel_keyboard())
+            await update.message.reply_text("❌ Ошибка! Введите число (например: 10.5) или нажмите Отмена:", reply_markup=self.get_cancel_keyboard())
             return MANUAL_ADD_AMOUNT
     
     # ============= РЕДАКТИРОВАНИЕ ПОКУПОК =============
@@ -2627,8 +2643,8 @@ class FastDCABot:
             await update.message.reply_text(
                 f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n"
                 f"📅 Дата: `{date_display}`\n"
-                f"💰 Цена: `{purchase['price']:.2f}` USDT\n"
-                f"📊 Количество: `{purchase['quantity']:.6f}`",
+                f"💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n"
+                f"📊 Количество: `{format_quantity(purchase['quantity'], 6)}`",
                 reply_markup=self.get_edit_purchases_keyboard(),
                 parse_mode='Markdown'
             )
@@ -2641,7 +2657,7 @@ class FastDCABot:
     
     async def edit_price_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Начать редактирование цены"""
-        await update.message.reply_text("💰 Введите новую цену (или нажмите Отмена):", reply_markup=self.get_cancel_keyboard())
+        await update.message.reply_text("💰 Введите новую цену (например: 1.2341):", reply_markup=self.get_cancel_keyboard())
         return EDIT_PRICE
     
     async def edit_price_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2668,7 +2684,7 @@ class FastDCABot:
             new_amount_usdt = new_price * purchase['quantity']
             
             if self.db.update_purchase(purchase_id, price=new_price, amount_usdt=new_amount_usdt):
-                await update.message.reply_text(f"✅ Цена обновлена: {new_price:.2f} USDT")
+                await update.message.reply_text(f"✅ Цена обновлена: {format_price(new_price, 4)} USDT")
             else:
                 await update.message.reply_text("❌ Ошибка при обновлении")
             
@@ -2676,12 +2692,12 @@ class FastDCABot:
             return EDIT_PURCHASE_SELECT
             
         except ValueError:
-            await update.message.reply_text("❌ Ошибка! Введите число или нажмите Отмена:", reply_markup=self.get_cancel_keyboard())
+            await update.message.reply_text("❌ Ошибка! Введите число (например: 1.2341) или нажмите Отмена:", reply_markup=self.get_cancel_keyboard())
             return EDIT_PRICE
     
     async def edit_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Начать редактирование количества"""
-        await update.message.reply_text("📊 Введите новое количество (или нажмите Отмена):", reply_markup=self.get_cancel_keyboard())
+        await update.message.reply_text("📊 Введите новое количество (например: 10.5):", reply_markup=self.get_cancel_keyboard())
         return EDIT_AMOUNT
     
     async def edit_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2708,7 +2724,7 @@ class FastDCABot:
             new_amount_usdt = purchase['price'] * new_quantity
             
             if self.db.update_purchase(purchase_id, quantity=new_quantity, amount_usdt=new_amount_usdt):
-                await update.message.reply_text(f"✅ Количество обновлено: {new_quantity:.6f}")
+                await update.message.reply_text(f"✅ Количество обновлено: {format_quantity(new_quantity, 6)}")
             else:
                 await update.message.reply_text("❌ Ошибка при обновлении")
             
@@ -2716,7 +2732,7 @@ class FastDCABot:
             return EDIT_PURCHASE_SELECT
             
         except ValueError:
-            await update.message.reply_text("❌ Ошибка! Введите число или нажмите Отмена:", reply_markup=self.get_cancel_keyboard())
+            await update.message.reply_text("❌ Ошибка! Введите число (например: 10.5) или нажмите Отмена:", reply_markup=self.get_cancel_keyboard())
             return EDIT_AMOUNT
     
     def parse_date(self, date_str: str) -> str:
@@ -2848,8 +2864,8 @@ class FastDCABot:
         await update.message.reply_text(
             f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n"
             f"📅 Дата: `{date_display}`\n"
-            f"💰 Цена: `{purchase['price']:.2f}` USDT\n"
-            f"📊 Количество: `{purchase['quantity']:.6f}`",
+            f"💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n"
+            f"📊 Количество: `{format_quantity(purchase['quantity'], 6)}`",
             reply_markup=self.get_edit_purchases_keyboard(),
             parse_mode='Markdown'
         )
