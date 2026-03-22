@@ -2233,16 +2233,33 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         current_price = await self.bybit.get_symbol_price(symbol)
         
+        # Получаем рекомендацию по мартингейлу для текущей цены
+        recommendation = await self.strategy.get_recommended_purchase(symbol)
+        
         msg = f"➕ *Добавление покупки вручную*\n\n"
         msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
         
-        # Получаем настройки лестницы для расчета падения
+        # Добавляем информацию о падении от цены старта
         ladder_settings = self.db.get_ladder_settings(symbol)
         if ladder_settings['start_price'] > 0:
-            drop_percent = ((ladder_settings['start_price'] - (current_price if current_price else 0)) / ladder_settings['start_price']) * 100
-            msg += f"📉 Падение от цены старта ({format_price(ladder_settings['start_price'], 4)}): `{drop_percent:.1f}%`\n\n"
+            drop_from_start = ((ladder_settings['start_price'] - current_price) / ladder_settings['start_price']) * 100
+            msg += f"📉 Падение от цены старта ({format_price(ladder_settings['start_price'], 4)}): `{drop_from_start:.1f}%`\n\n"
+        
+        # Добавляем рекомендацию по мартингейлу
+        if recommendation['success'] and recommendation['should_buy']:
+            msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
+            msg += f"📉 Падение: `{recommendation.get('drop_percent', 0):.1f}%`\n"
+            msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+        elif recommendation['success']:
+            msg += f"⏳ *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
+            msg += f"📉 Текущее падение: `{recommendation.get('current_drop', 0):.1f}%`\n"
+            msg += f"💰 Следующая цена покупки: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n"
+            msg += f"📊 Рекомендуемая сумма при достижении: `{recommendation.get('amount_usdt', 1.1):.2f}` USDT\n\n"
         
         msg += f"Введите цену покупки (USDT):"
+        
+        context.user_data['manual_add_recommendation'] = recommendation
+        context.user_data['manual_add_current_price'] = current_price
         
         await update.message.reply_text(msg, reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         
