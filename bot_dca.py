@@ -815,7 +815,7 @@ class Database:
             'level': level
         }
     
-    def get_ladder_summary(self, symbol: str = None) -> Dict:
+    def get_ladder_summary(self, symbol: str = None, current_price: float = None) -> Dict:
         """Получить сводку по лестнице"""
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
@@ -878,9 +878,15 @@ class Database:
                     'status': 'pending'
                 })
         
-        # Находим текущий максимальный уровень
-        current_drop = max([p.get('drop_percent', 0) for p in purchases], default=0)
-        current_step = int(current_drop / settings['step_percent']) if current_drop > 0 else 0
+        # Находим текущий максимальный уровень из покупок
+        max_purchase_drop = max([p.get('drop_percent', 0) for p in purchases], default=0)
+        current_step = int(max_purchase_drop / settings['step_percent']) if max_purchase_drop > 0 else 0
+        
+        # Рассчитываем текущее падение от цены старта, если передана текущая цена
+        current_drop = 0
+        if current_price and settings['start_price'] > 0:
+            current_drop = ((settings['start_price'] - current_price) / settings['start_price']) * 100
+            current_drop = max(0, current_drop)
         
         return {
             'symbol': symbol,
@@ -890,6 +896,7 @@ class Database:
             'base_amount': settings['base_amount'],
             'max_amount': settings['max_amount'],
             'current_step': current_step,
+            'max_purchase_drop': max_purchase_drop,
             'current_drop': current_drop,
             'steps': steps
         }
@@ -1653,17 +1660,14 @@ class FastDCABot:
                     increase_needed = ((target_info['target_price'] - current_price) / current_price * 100)
                     text += f"Нужен рост: `{increase_needed:+.2f}%` от текущей цены\n"
             
-            # Информация о лестнице
-            ladder_summary = self.db.get_ladder_summary(symbol)
-            if ladder_summary and ladder_summary['start_price'] > 0:
-                text += f"\n🪜 *НАСТРОЙКИ ЛЕСТНИЦЫ*\n"
-                text += f"Стартовая цена: `{format_price(ladder_summary['start_price'], 4)}` USDT\n"
-                text += f"Шаг падения: `{ladder_summary['step_percent']}%`\n"
-                text += f"Глубина просадки: `{ladder_summary['max_depth']}%`\n"
-                text += f"Базовая сумма: `{ladder_summary['base_amount']}` USDT\n"
-                text += f"Максимальная сумма: `{ladder_summary['max_amount']}` USDT\n"
-                text += f"Текущее падение: `{ladder_summary['current_drop']:.1f}%`\n"
-                text += f"Текущий шаг: `{ladder_summary['current_step']}`"
+            # Информация о лестнице - только стартовая цена
+            ladder_settings = self.db.get_ladder_settings(symbol)
+            if ladder_settings['start_price'] > 0:
+                text += f"\n🪜 *ЛЕСТНИЦА*\n"
+                text += f"Стартовая цена: `{format_price(ladder_settings['start_price'], 4)}` USDT\n"
+                text += f"Шаг падения: `{ladder_settings['step_percent']}%`\n"
+                text += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
+                text += f"Максимальная сумма: `{ladder_settings['max_amount']}` USDT"
             
             await update.message.reply_text(text, parse_mode='Markdown')
             
@@ -1769,7 +1773,9 @@ class FastDCABot:
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         ladder = self.db.get_ladder_settings(symbol)
-        summary = self.db.get_ladder_summary(symbol)
+        # Получаем текущую цену для расчета текущего падения
+        current_price = await self.bybit.get_symbol_price(symbol) if self.bybit_initialized else None
+        summary = self.db.get_ladder_summary(symbol, current_price)
         
         text = f"🪜 *ТЕКУЩИЕ НАСТРОЙКИ ЛЕСТНИЦЫ*\n\n"
         text += f"🪙 Токен: `{symbol}`\n"
@@ -1778,10 +1784,13 @@ class FastDCABot:
         text += f"📉 Глубина просадки: `{ladder['max_depth']}%`\n"
         text += f"💵 Базовая сумма: `{ladder['base_amount']}` USDT\n"
         text += f"💰 Максимальная сумма: `{ladder['max_amount']}` USDT\n"
-        text += f"📊 Текущее падение: `{summary['current_drop']:.1f}%`\n"
-        text += f"📊 Текущий шаг: `{summary['current_step']}`\n\n"
         
-        text += "*План покупок:*\n"
+        if current_price and ladder['start_price'] > 0:
+            current_drop = ((ladder['start_price'] - current_price) / ladder['start_price']) * 100
+            current_drop = max(0, current_drop)
+            text += f"📊 Текущее падение: `{current_drop:.1f}%`\n"
+        
+        text += f"\n*План покупок:*\n"
         for step in summary['steps'][:15]:
             status_emoji = "✅" if step['status'] == 'completed' else "⏳"
             text += f"{status_emoji} {step['drop_percent']:.0f}%: {step['amount']:.2f} USDT (коэф. {step['ratio']:.2f})\n"
@@ -2295,7 +2304,7 @@ class FastDCABot:
             drop_from_start = ((ladder_settings['start_price'] - current_price) / ladder_settings['start_price']) * 100
             drop_from_start = max(0, drop_from_start)
         
-        # Получаем рекомендацию для ТЕКУЩЕГО падения (а не следующего)
+        # Получаем рекомендацию для ТЕКУЩЕГО падения
         recommendation = self.db.get_recommendation_for_current_drop(drop_from_start, symbol)
         
         msg = f"➕ *Добавление покупки вручную*\n\n"
