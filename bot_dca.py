@@ -177,6 +177,26 @@ def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
     return level, ratio
 
 
+def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float) -> float:
+    """
+    Рассчитать сумму покупки по проценту падения
+    """
+    if drop_percent <= 0:
+        return base_amount
+    
+    level, ratio = get_ladder_levels(drop_percent)
+    
+    # Линейный рост суммы от base_amount до max_amount
+    if ratio >= 3:
+        amount = max_amount
+    elif ratio <= 0:
+        amount = base_amount
+    else:
+        amount = base_amount + (max_amount - base_amount) * (ratio / 3)
+    
+    return min(amount, max_amount)
+
+
 # ==================== DATABASE ====================
 
 class Database:
@@ -762,6 +782,39 @@ class Database:
             'reason': f'Ждем падения до {next_level:.1f}% ({format_price(next_price)})'
         }
     
+    def get_recommendation_for_current_drop(self, drop_percent: float, symbol: str = None) -> Dict:
+        """
+        Получить рекомендацию для текущего процента падения
+        """
+        if symbol is None:
+            symbol = self.get_setting('symbol', 'TONUSDT')
+        
+        settings = self.get_ladder_settings(symbol)
+        
+        if settings['start_price'] <= 0:
+            return {
+                'success': False,
+                'error': 'Не задана начальная цена лестницы'
+            }
+        
+        # Округляем падение до ближайшего уровня (вниз)
+        step_percent = settings['step_percent']
+        level_drop = int(drop_percent / step_percent) * step_percent
+        
+        # Рассчитываем сумму для этого уровня
+        amount = get_amount_by_drop(level_drop, settings['base_amount'], settings['max_amount'])
+        
+        # Рассчитываем коэффициент
+        level, ratio = get_ladder_levels(level_drop)
+        
+        return {
+            'success': True,
+            'drop_percent': level_drop,
+            'ratio': ratio,
+            'amount_usdt': amount,
+            'level': level
+        }
+    
     def get_ladder_summary(self, symbol: str = None) -> Dict:
         """Получить сводку по лестнице"""
         if symbol is None:
@@ -1284,7 +1337,7 @@ class DCAStrategy:
                 self.db.log_action('SELL_COMPLETED', symbol, f"Продано по {format_price(order['target_price'])}")
     
     async def get_recommended_purchase(self, symbol: str) -> Dict:
-        """Получить рекомендацию для ручной покупки"""
+        """Получить рекомендацию для ручной покупки (для следующего уровня)"""
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
             return {'success': False, 'error': 'Не удалось получить цену'}
@@ -2233,33 +2286,32 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         current_price = await self.bybit.get_symbol_price(symbol)
         
-        # Получаем рекомендацию по мартингейлу для текущей цены
-        recommendation = await self.strategy.get_recommended_purchase(symbol)
+        # Получаем настройки лестницы
+        ladder_settings = self.db.get_ladder_settings(symbol)
+        
+        # Рассчитываем текущее падение от цены старта
+        drop_from_start = 0
+        if ladder_settings['start_price'] > 0 and current_price:
+            drop_from_start = ((ladder_settings['start_price'] - current_price) / ladder_settings['start_price']) * 100
+            drop_from_start = max(0, drop_from_start)
+        
+        # Получаем рекомендацию для ТЕКУЩЕГО падения (а не следующего)
+        recommendation = self.db.get_recommendation_for_current_drop(drop_from_start, symbol)
         
         msg = f"➕ *Добавление покупки вручную*\n\n"
         msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
         
-        # Добавляем информацию о падении от цены старта
-        ladder_settings = self.db.get_ladder_settings(symbol)
         if ladder_settings['start_price'] > 0:
-            drop_from_start = ((ladder_settings['start_price'] - current_price) / ladder_settings['start_price']) * 100
             msg += f"📉 Падение от цены старта ({format_price(ladder_settings['start_price'], 4)}): `{drop_from_start:.1f}%`\n\n"
         
-        # Добавляем рекомендацию по мартингейлу
-        if recommendation['success'] and recommendation['should_buy']:
+        # Добавляем рекомендацию по мартингейлу для текущего уровня падения
+        if recommendation['success']:
             msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
-            msg += f"📉 Падение: `{recommendation.get('drop_percent', 0):.1f}%`\n"
+            msg += f"📉 Уровень падения: `{recommendation['drop_percent']:.0f}%`\n"
+            msg += f"📊 Коэффициент: `{recommendation['ratio']:.2f}`\n"
             msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
-        elif recommendation['success']:
-            msg += f"⏳ *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
-            msg += f"📉 Текущее падение: `{recommendation.get('current_drop', 0):.1f}%`\n"
-            msg += f"💰 Следующая цена покупки: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n"
-            msg += f"📊 Рекомендуемая сумма при достижении: `{recommendation.get('amount_usdt', 1.1):.2f}` USDT\n\n"
         
         msg += f"Введите цену покупки (USDT):"
-        
-        context.user_data['manual_add_recommendation'] = recommendation
-        context.user_data['manual_add_current_price'] = current_price
         
         await update.message.reply_text(msg, reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         
@@ -2280,9 +2332,9 @@ class FastDCABot:
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             drop_percent = self.db.get_drop_percent_from_start_price(price, symbol)
             
-            # Получаем рекомендуемую сумму по лестнице
-            ladder_info = self.db.calculate_ladder_purchase(price, symbol)
-            suggested_amount = ladder_info.get('amount_usdt', 1.1) if ladder_info.get('should_buy') else 1.1
+            # Получаем рекомендуемую сумму по лестнице для этого процента падения
+            recommendation = self.db.get_recommendation_for_current_drop(drop_percent, symbol)
+            suggested_amount = recommendation.get('amount_usdt', 1.1) if recommendation['success'] else 1.1
             
             await update.message.reply_text(f"✅ Цена {format_price(price, 4)} USDT\n📉 Падение от цены старта: `{drop_percent:.1f}%`\n\n💰 Введите количество монет:\n*Рекомендуемая сумма:* {suggested_amount:.2f} USDT", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
             return MANUAL_ADD_AMOUNT
