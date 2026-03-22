@@ -3,7 +3,7 @@
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
 
-ver 26.3.23
+ver 26.03.22
 """
 
 import os
@@ -63,6 +63,9 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
+# Версия бота (формируется из текущей даты)
+BOT_VERSION = datetime.now().strftime("%y.%m.%d")
+
 # Состояния для ConversationHandler
 (
     SELECTING_ACTION,
@@ -95,7 +98,8 @@ BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
     SET_LADDER_STEP_PERCENT,
     SET_LADDER_DEPTH,
     SET_LADDER_BASE_AMOUNT,
-) = range(30)
+    MANUAL_ADD_RECOMMENDATION,
+) = range(31)
 
 # Файл для экспорта/импорта
 DB_EXPORT_FILE = 'dca_data_export.json'
@@ -130,10 +134,6 @@ def calculate_ladder_amounts(base_amount: float, max_amount: float, steps_count:
     amounts = []
     if steps_count <= 0:
         return amounts
-    
-    # Первый шаг - базовая сумма (коэффициент 1)
-    # Но по стратегии на шаге 0 коэффициент 0, сумма 1.10 (базовая)
-    # На последнем шаге коэффициент 3, сумма = базовая * 3
     
     for i in range(steps_count):
         # Линейный рост коэффициента от 0 до 3
@@ -489,6 +489,14 @@ class Database:
             'avg_price': avg_price,
         }
     
+    def get_highest_price(self, symbol: str) -> float:
+        """Получить самую высокую цену покупки"""
+        purchases = self.get_purchases(symbol)
+        if not purchases:
+            return 0
+        highest_price = max(p['price'] for p in purchases)
+        return highest_price
+    
     def add_sell_order(self, symbol: str, order_id: str, quantity: float, 
                        target_price: float, profit_percent: float):
         """Добавить ордер на продажу"""
@@ -696,7 +704,6 @@ class Database:
         current_drop = ((settings['start_price'] - current_price) / settings['start_price']) * 100
         
         # Определяем следующий уровень для покупки
-        # Покупаем при каждом достижении нового уровня падения (кратного шагу)
         step_percent = settings['step_percent']
         next_level = int((max_drop + step_percent) / step_percent) * step_percent
         
@@ -1259,7 +1266,8 @@ class DCAStrategy:
                    'current_price': current_price}
         else:
             return {'success': True, 'should_buy': False, 'reason': ladder_info['reason'],
-                   'current_price': current_price, 'next_buy_price': ladder_info['target_price']}
+                   'current_price': current_price, 'next_buy_price': ladder_info['target_price'],
+                   'next_drop': ladder_info.get('next_drop', 0)}
     
     def calculate_target_info(self, stats: Dict, profit_percent: float) -> Dict:
         """Рассчитать информацию о целевой продаже"""
@@ -1320,8 +1328,8 @@ class FastDCABot:
             [KeyboardButton("💰 Ручная покупка (лимит)"), KeyboardButton("📈 Статистика DCA")],
             [KeyboardButton("➕ Добавить покупку вручную"), KeyboardButton("✏️ Редактировать покупки")],
             [KeyboardButton("⚙️ Настройки"), KeyboardButton("📋 Статус бота")],
-            [KeyboardButton("📉 Текущая цена"), KeyboardButton("📝 Управление ордерами")],
-            [KeyboardButton("🪜 Настройка лестницы"), KeyboardButton("🔔 Уведомления")],
+            [KeyboardButton("📝 Управление ордерами"), KeyboardButton("🪜 Настройка лестницы")],
+            [KeyboardButton("🔔 Уведомления"), KeyboardButton("🏠 Главное меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -1414,7 +1422,10 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return
         await update.message.reply_text(
-            f"👋 Привет, {update.effective_user.first_name}!\n\n🤖 DCA Bybit Bot (Мартингейл лесенкой)\nГлавное меню:",
+            f"👋 Привет, {update.effective_user.first_name}!\n\n"
+            f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
+            f"📌 Версия: {BOT_VERSION}\n\n"
+            f"Главное меню:",
             reply_markup=self.get_main_keyboard()
         )
     
@@ -1462,10 +1473,9 @@ class FastDCABot:
                 message += f"Количество: `{format_quantity(equity, 6)}`\n"
                 message += f"Доступно: `{format_quantity(available, 6)}`\n"
                 message += f"Стоимость: `{usd_value:.2f}` USDT\n"
+                message += f"Текущая цена: `{format_price(current_price, 4)}` USDT\n"
                 if avg_price > 0:
                     message += f"Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
-                if current_price:
-                    message += f"Текущая цена: `{format_price(current_price, 4)}` USDT\n"
                     message += f"{emoji} PnL: `{pnl_percent:+.2f}%` ({pnl_usd:+.2f} USDT)\n\n"
             
             # Получаем ордера с разделением
@@ -1600,20 +1610,6 @@ class FastDCABot:
         
         await update.message.reply_text(message, parse_mode='Markdown')
     
-    async def show_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        self._init_bybit()
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.")
-            return
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        price = await self.bybit.get_symbol_price(symbol)
-        if price:
-            await update.message.reply_text(f"💹 *{symbol}*: `{format_price(price, 4)}` USDT", parse_mode='Markdown')
-        else:
-            await update.message.reply_text("❌ Не удалось получить цену.")
-    
     async def toggle_dca(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -1632,12 +1628,22 @@ class FastDCABot:
                 await update.message.reply_text("❌ Не удалось получить цену")
                 return
             
+            # Берем самую высокую цену покупки как стартовую для лестницы
+            highest_price = self.db.get_highest_price(symbol)
+            if highest_price > 0:
+                start_price = highest_price
+            else:
+                start_price = current_price
+            
             ladder_settings = self.db.get_ladder_settings(symbol)
-            if ladder_settings['start_price'] <= 0:
-                ladder_settings['start_price'] = current_price
-                ladder_settings['last_buy_price'] = current_price
-                self.db.save_ladder_settings(ladder_settings)
-                await update.message.reply_text(f"🪜 Установлена стартовая цена: {format_price(current_price, 4)} USDT")
+            ladder_settings['start_price'] = start_price
+            ladder_settings['last_buy_price'] = start_price
+            self.db.save_ladder_settings(ladder_settings)
+            
+            if highest_price > 0:
+                await update.message.reply_text(f"🪜 Установлена стартовая цена: {format_price(start_price, 4)} USDT\n(по самой высокой цене покупки)")
+            else:
+                await update.message.reply_text(f"🪜 Установлена стартовая цена: {format_price(start_price, 4)} USDT")
             
             self.db.set_setting('dca_active', 'true')
             self.db.set_setting('initial_reference_price', str(current_price))
@@ -1647,7 +1653,7 @@ class FastDCABot:
             await update.message.reply_text(
                 f"✅ DCA запущен!\n\n"
                 f"🪙 {symbol}\n"
-                f"💰 Стартовая цена: {format_price(current_price, 4)} USDT\n"
+                f"💰 Стартовая цена: {format_price(start_price, 4)} USDT\n"
                 f"💵 Базовая сумма: {invest_amount} USDT\n"
                 f"📊 Шаг падения: {STEP_PERCENT}%\n"
                 f"📉 Макс. просадка: {MAX_DROP_DEPTH}%",
@@ -1844,70 +1850,76 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return SELECTING_ACTION
         await update.message.reply_text("🔔 *Настройки уведомлений*", reply_markup=self.get_notification_settings_keyboard(), parse_mode='Markdown')
-        return SELECTING_ACTION
+        return NOTIFICATION_SETTINGS_MENU
     
     async def show_current_notification_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return SELECTING_ACTION
+            return NOTIFICATION_SETTINGS_MENU
         settings = self.db.get_notification_settings()
         status = "✅ Включены" if settings['enabled'] else "❌ Выключены"
         text = f"📋 *НАСТРОЙКИ УВЕДОМЛЕНИЙ*\n\n📊 Процент: `{settings['alert_percent']}%`\n⏱ Частота: `{settings['alert_interval_minutes']}` мин\n🔔 Уведомления: {status}"
         await update.message.reply_text(text, parse_mode='Markdown', reply_markup=self.get_notification_settings_keyboard())
-        return SELECTING_ACTION
+        return NOTIFICATION_SETTINGS_MENU
     
     async def toggle_notifications(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return SELECTING_ACTION
+            return NOTIFICATION_SETTINGS_MENU
         settings = self.db.get_notification_settings()
         new_status = not settings['enabled']
         self.db.update_notification_settings(enabled=new_status)
         status = "включены" if new_status else "выключены"
         await update.message.reply_text(f"🔔 Уведомления {status}!", reply_markup=self.get_notification_settings_keyboard())
-        return SELECTING_ACTION
+        return NOTIFICATION_SETTINGS_MENU
     
     async def set_alert_percent_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return SELECTING_ACTION
+            return NOTIFICATION_SETTINGS_MENU
         await update.message.reply_text("📊 Введите процент для уведомления:", reply_markup=self.get_cancel_keyboard())
         return WAITING_ALERT_PERCENT
     
     async def set_alert_percent_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_notification_settings_keyboard())
+            return NOTIFICATION_SETTINGS_MENU
         try:
             percent = float(text.replace(',', '.'))
             if percent <= 0:
                 raise ValueError
             self.db.update_notification_settings(alert_percent=percent)
-            await update.message.reply_text(f"✅ Процент изменен на {percent}%", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
+            await update.message.reply_text(f"✅ Процент изменен на {percent}%", reply_markup=self.get_notification_settings_keyboard())
+            return NOTIFICATION_SETTINGS_MENU
         except ValueError:
             await update.message.reply_text("❌ Ошибка! Введите число.", reply_markup=self.get_cancel_keyboard())
             return WAITING_ALERT_PERCENT
     
     async def set_alert_interval_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return SELECTING_ACTION
+            return NOTIFICATION_SETTINGS_MENU
         await update.message.reply_text("⏱ Введите частоту проверки (минуты):", reply_markup=self.get_cancel_keyboard())
         return WAITING_ALERT_INTERVAL
     
     async def set_alert_interval_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_notification_settings_keyboard())
+            return NOTIFICATION_SETTINGS_MENU
         try:
             interval = int(float(text))
             if interval < 1:
                 raise ValueError
             self.db.update_notification_settings(alert_interval_minutes=interval)
-            await update.message.reply_text(f"✅ Частота изменена на {interval} минут", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
+            await update.message.reply_text(f"✅ Частота изменена на {interval} минут", reply_markup=self.get_notification_settings_keyboard())
+            return NOTIFICATION_SETTINGS_MENU
         except ValueError:
             await update.message.reply_text("❌ Ошибка! Введите целое число.", reply_markup=self.get_cancel_keyboard())
             return WAITING_ALERT_INTERVAL
+    
+    async def back_to_main_from_notifications(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_user_fast(update):
+            return SELECTING_ACTION
+        await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
+        return ConversationHandler.END
     
     # ============= УПРАВЛЕНИЕ ОРДЕРАМИ =============
     
@@ -2110,7 +2122,7 @@ class FastDCABot:
         if recommendation['success'] and recommendation['should_buy']:
             msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Сейчас хороший момент!\n📉 Падение {recommendation.get('drop_percent', 0):.1f}%\n📊 Сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
         elif recommendation['success']:
-            msg += f"⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения\n📉 Следующая цена: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n\n"
+            msg += f"⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения\n📉 Следующее падение: `{recommendation.get('next_drop', 0):.1f}%`\n💰 Следующая цена: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n\n"
         msg += f"Введите цену лимитного ордера (или нажмите Отмена):"
         await update.message.reply_text(msg, reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
         return MANUAL_BUY_PRICE
@@ -2182,7 +2194,38 @@ class FastDCABot:
     async def manual_add_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        await update.message.reply_text("➕ *Добавление покупки*\n\nВведите цену покупки (USDT):", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Bybit API не инициализирован.")
+            return ConversationHandler.END
+        
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        current_price = await self.bybit.get_symbol_price(symbol)
+        if current_price:
+            recommendation = await self.strategy.get_recommended_purchase(symbol)
+            
+            msg = f"➕ *Добавление покупки вручную*\n\n"
+            msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
+            
+            if recommendation['success'] and recommendation['should_buy']:
+                msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
+                msg += f"📉 Падение: `{recommendation.get('drop_percent', 0):.1f}%`\n"
+                msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+            elif recommendation['success']:
+                msg += f"⏳ *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
+                msg += f"📉 Текущее падение: `{recommendation.get('current_drop', 0):.1f}%`\n"
+                msg += f"💰 Следующая цена покупки: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n"
+                msg += f"📊 Рекомендуемая сумма при достижении: `{recommendation.get('amount_usdt', 1.1):.2f}` USDT\n\n"
+            
+            msg += f"Введите цену покупки (USDT):"
+            
+            context.user_data['manual_add_recommendation'] = recommendation
+            context.user_data['manual_add_current_price'] = current_price
+            
+            await update.message.reply_text(msg, reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        else:
+            await update.message.reply_text("➕ *Добавление покупки*\n\nВведите цену покупки (USDT):", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        
         return MANUAL_ADD_PRICE
     
     async def manual_add_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2195,7 +2238,11 @@ class FastDCABot:
             if price <= 0:
                 raise ValueError
             context.user_data['manual_price'] = price
-            await update.message.reply_text(f"✅ Цена {format_price(price, 4)} USDT\n\nВведите количество монет:", reply_markup=self.get_cancel_keyboard())
+            
+            recommendation = context.user_data.get('manual_add_recommendation', {})
+            suggested_amount = recommendation.get('amount_usdt', 1.1) if recommendation.get('should_buy') else 1.1
+            
+            await update.message.reply_text(f"✅ Цена {format_price(price, 4)} USDT\n\n💰 Введите количество монет:\n*Рекомендуемая сумма:* {suggested_amount:.2f} USDT", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
             return MANUAL_ADD_AMOUNT
         except ValueError:
             await update.message.reply_text("❌ Ошибка! Введите число.", reply_markup=self.get_cancel_keyboard())
@@ -2216,9 +2263,19 @@ class FastDCABot:
                 return ConversationHandler.END
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             amount_usdt = price * quantity
-            purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=amount_usdt, price=price, quantity=quantity, multiplier=1.0, drop_percent=0, step_level=0, date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            
+            # Получаем рекомендацию для drop_percent
+            recommendation = context.user_data.get('manual_add_recommendation', {})
+            drop_percent = recommendation.get('drop_percent', 0) if recommendation.get('should_buy') else 0
+            step_level = recommendation.get('step_level', 0) if recommendation.get('should_buy') else 0
+            
+            purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=amount_usdt, price=price, quantity=quantity, multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            
             if purchase_id:
-                await update.message.reply_text(f"✅ *Покупка добавлена!*\n\nID: `{purchase_id}`\nЦена: `{format_price(price, 4)}` USDT\nКоличество: `{format_quantity(quantity, 6)}`\nСумма: `{amount_usdt:.2f}` USDT", reply_markup=self.get_main_keyboard(), parse_mode='Markdown')
+                msg = f"✅ *Покупка добавлена!*\n\nID: `{purchase_id}`\nЦена: `{format_price(price, 4)}` USDT\nКоличество: `{format_quantity(quantity, 6)}`\nСумма: `{amount_usdt:.2f}` USDT"
+                if drop_percent > 0:
+                    msg += f"\n📉 Падение: `{drop_percent:.1f}%`"
+                await update.message.reply_text(msg, reply_markup=self.get_main_keyboard(), parse_mode='Markdown')
             else:
                 await update.message.reply_text("❌ Ошибка сохранения", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
@@ -2583,12 +2640,23 @@ class FastDCABot:
             return SELECTING_SYMBOL
         self.db.set_setting('symbol', symbol)
         self.db.set_setting('initial_reference_price', str(price))
+        
+        # Берем самую высокую цену покупки как стартовую для лестницы
+        highest_price = self.db.get_highest_price(symbol)
         ladder = self.db.get_ladder_settings(symbol)
-        if ladder['start_price'] <= 0:
+        
+        if highest_price > 0:
+            ladder['start_price'] = highest_price
+            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT\n🪜 Стартовая цена лестницы: {format_price(highest_price, 4)} USDT (по самой высокой цене покупки)")
+        elif ladder['start_price'] <= 0:
             ladder['start_price'] = price
-            ladder['last_buy_price'] = price
-            self.db.save_ladder_settings(ladder)
-        await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT", reply_markup=self.get_settings_keyboard())
+            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT\n🪜 Стартовая цена лестницы: {format_price(price, 4)} USDT")
+        else:
+            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT")
+        
+        ladder['last_buy_price'] = ladder['start_price']
+        self.db.save_ladder_settings(ladder)
+        
         return SELECTING_ACTION
     
     # ============= ЭКСПОРТ/ИМПОРТ =============
@@ -2704,10 +2772,10 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📉 Текущая цена)$'), self.show_price))
-        self.application.add_handler(MessageHandler(filters.Regex('^(🔔 Уведомления)$'), self.notification_settings_menu))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
+        self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
         
-        # Conversation для лестницы - исправлен для корректной работы
+        # Conversation для лестницы
         ladder_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu)],
             states={
@@ -2735,6 +2803,26 @@ class FastDCABot:
         )
         self.application.add_handler(ladder_conv)
         
+        # Conversation для уведомлений
+        notification_conv = ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления)$'), self.notification_settings_menu)],
+            states={
+                NOTIFICATION_SETTINGS_MENU: [
+                    MessageHandler(filters.Regex('^(📊 Процент для уведомления)$'), self.set_alert_percent_start),
+                    MessageHandler(filters.Regex('^(⏱ Частота проверки)$'), self.set_alert_interval_start),
+                    MessageHandler(filters.Regex('^(🔔 Вкл/Выкл уведомления)$'), self.toggle_notifications),
+                    MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_current_notification_settings),
+                    MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
+                ],
+                WAITING_ALERT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_alert_percent_save)],
+                WAITING_ALERT_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_alert_interval_save)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+            name="notification_conversation",
+            persistent=False,
+        )
+        self.application.add_handler(notification_conv)
+        
         # Основной ConversationHandler для настроек
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
@@ -2758,8 +2846,6 @@ class FastDCABot:
                 SET_MAX_DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_drop_done)],
                 SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done)],
                 SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done)],
-                WAITING_ALERT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_alert_percent_save)],
-                WAITING_ALERT_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_alert_interval_save)],
                 WAITING_IMPORT_FILE: [
                     MessageHandler(filters.Document.FileExtension("json"), self.import_database_receive),
                     MessageHandler(filters.Regex("^❌ Отмена$"), self.import_database_receive),
@@ -2846,6 +2932,7 @@ class FastDCABot:
     def run(self):
         print(f"\n{Fore.CYAN}{'='*60}")
         print(f"{Fore.CYAN}🚀 ЗАПУСК DCA BYBIT BOT (МАРТИНГЕЙЛ ЛЕСЕНКОЙ)")
+        print(f"{Fore.CYAN}Версия: {BOT_VERSION}")
         print(f"{Fore.CYAN}{'='*60}")
         
         if not TELEGRAM_TOKEN:
