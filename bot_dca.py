@@ -99,8 +99,7 @@ BOT_VERSION = datetime.now().strftime("%y.%m.%d")
     SET_LADDER_DEPTH,
     SET_LADDER_BASE_AMOUNT,
     MANUAL_ADD_RECOMMENDATION,
-    WAITING_ORDER_EXECUTION_CONFIRM,
-) = range(32)
+) = range(31)
 
 # Файл для экспорта/импорта
 DB_EXPORT_FILE = 'dca_data_export.json'
@@ -281,9 +280,7 @@ class Database:
                     enabled BOOLEAN DEFAULT 1,
                     alert_percent REAL DEFAULT 10.0,
                     alert_interval_minutes INTEGER DEFAULT 30,
-                    order_execution_enabled BOOLEAN DEFAULT 0,
-                    last_check TIMESTAMP,
-                    last_order_check TIMESTAMP
+                    last_check TIMESTAMP
                 )
             ''')
             
@@ -309,11 +306,11 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     order_id TEXT NOT NULL UNIQUE,
                     symbol TEXT NOT NULL,
-                    quantity REAL NOT NULL,
                     price REAL NOT NULL,
+                    quantity REAL NOT NULL,
                     amount_usdt REAL NOT NULL,
                     executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    processed BOOLEAN DEFAULT 0
+                    added_to_stats BOOLEAN DEFAULT 0
                 )
             ''')
             
@@ -336,6 +333,7 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '3.3'),
                 ('ladder_start_price', '0'),
+                ('order_execution_notify', 'false'),
             ]
             
             for key, value in defaults:
@@ -344,8 +342,8 @@ class Database:
                 ''', (key, value))
             
             cursor.execute('''
-                INSERT OR IGNORE INTO notifications (id, enabled, alert_percent, alert_interval_minutes, order_execution_enabled, last_check, last_order_check)
-                VALUES (1, 1, 10.0, 30, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                INSERT OR IGNORE INTO notifications (id, enabled, alert_percent, alert_interval_minutes, last_check)
+                VALUES (1, 1, 10.0, 30, CURRENT_TIMESTAMP)
             ''')
             
             conn.commit()
@@ -385,20 +383,15 @@ class Database:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
-            cursor.execute('SELECT enabled, alert_percent, alert_interval_minutes, order_execution_enabled FROM notifications WHERE id = 1')
+            cursor.execute('SELECT enabled, alert_percent, alert_interval_minutes FROM notifications WHERE id = 1')
             row = cursor.fetchone()
             conn.close()
             if row:
-                return {
-                    'enabled': bool(row[0]), 
-                    'alert_percent': row[1], 
-                    'alert_interval_minutes': row[2],
-                    'order_execution_enabled': bool(row[3]) if len(row) > 3 else False
-                }
-            return {'enabled': True, 'alert_percent': 10.0, 'alert_interval_minutes': 30, 'order_execution_enabled': False}
+                return {'enabled': bool(row[0]), 'alert_percent': row[1], 'alert_interval_minutes': row[2]}
+            return {'enabled': True, 'alert_percent': 10.0, 'alert_interval_minutes': 30}
         except Exception as e:
             logger.error(f"Error getting notification settings: {e}")
-            return {'enabled': True, 'alert_percent': 10.0, 'alert_interval_minutes': 30, 'order_execution_enabled': False}
+            return {'enabled': True, 'alert_percent': 10.0, 'alert_interval_minutes': 30}
     
     def update_notification_settings(self, **kwargs):
         """Обновить настройки уведомлений"""
@@ -416,9 +409,6 @@ class Database:
             if 'alert_interval_minutes' in kwargs:
                 updates.append("alert_interval_minutes = ?")
                 values.append(kwargs['alert_interval_minutes'])
-            if 'order_execution_enabled' in kwargs:
-                updates.append("order_execution_enabled = ?")
-                values.append(1 if kwargs['order_execution_enabled'] else 0)
             if updates:
                 values.append(1)
                 cursor.execute(f"UPDATE notifications SET {', '.join(updates)}, last_check = CURRENT_TIMESTAMP WHERE id = ?", values)
@@ -952,68 +942,74 @@ class Database:
     
     # ============= МЕТОДЫ ДЛЯ ИСПОЛНЕННЫХ ОРДЕРОВ =============
     
-    def add_executed_order(self, order_id: str, symbol: str, quantity: float, price: float, amount_usdt: float):
+    def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float) -> bool:
         """Добавить исполненный ордер"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT OR IGNORE INTO executed_orders (order_id, symbol, quantity, price, amount_usdt, executed_at)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (order_id, symbol, quantity, price, amount_usdt))
+                INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, added_to_stats)
+                VALUES (?, ?, ?, ?, ?, 0)
+            ''', (order_id, symbol, price, quantity, amount_usdt))
+            success = cursor.rowcount > 0
             conn.commit()
             conn.close()
+            return success
         except Exception as e:
             logger.error(f"Error adding executed order: {e}")
+            return False
     
-    def get_unprocessed_executed_orders(self) -> List[Dict]:
-        """Получить необработанные исполненные ордера"""
+    def get_unadded_executed_orders(self, symbol: str = None) -> List[Dict]:
+        """Получить исполненные ордера, которые еще не добавлены в статистику"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute('SELECT * FROM executed_orders WHERE processed = 0 ORDER BY executed_at ASC')
+            if symbol:
+                cursor.execute('SELECT * FROM executed_orders WHERE symbol = ? AND added_to_stats = 0 ORDER BY executed_at DESC', (symbol,))
+            else:
+                cursor.execute('SELECT * FROM executed_orders WHERE added_to_stats = 0 ORDER BY executed_at DESC')
             rows = cursor.fetchall()
             conn.close()
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error getting unprocessed executed orders: {e}")
+            logger.error(f"Error getting unadded executed orders: {e}")
             return []
     
-    def mark_executed_order_processed(self, order_id: str):
-        """Отметить ордер как обработанный"""
+    def mark_order_as_added(self, order_id: str) -> bool:
+        """Отметить ордер как добавленный в статистику"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
-            cursor.execute('UPDATE executed_orders SET processed = 1 WHERE order_id = ?', (order_id,))
+            cursor.execute('UPDATE executed_orders SET added_to_stats = 1 WHERE order_id = ?', (order_id,))
+            success = cursor.rowcount > 0
             conn.commit()
             conn.close()
+            return success
         except Exception as e:
-            logger.error(f"Error marking executed order processed: {e}")
+            logger.error(f"Error marking order as added: {e}")
+            return False
     
-    def get_last_order_check_time(self) -> str:
-        """Получить время последней проверки ордеров"""
+    def is_order_notified(self, order_id: str) -> bool:
+        """Проверить, было ли уже уведомление об ордере"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
-            cursor.execute('SELECT last_order_check FROM notifications WHERE id = 1')
-            row = cursor.fetchone()
+            cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ?', (order_id,))
+            exists = cursor.fetchone() is not None
             conn.close()
-            return row[0] if row else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return exists
         except Exception as e:
-            logger.error(f"Error getting last order check time: {e}")
-            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logger.error(f"Error checking order notified: {e}")
+            return False
     
-    def update_last_order_check_time(self):
-        """Обновить время последней проверки ордеров"""
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE notifications SET last_order_check = CURRENT_TIMESTAMP WHERE id = 1')
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.error(f"Error updating last order check time: {e}")
+    def get_order_execution_notify(self) -> bool:
+        """Получить настройку уведомлений об исполнении ордеров"""
+        return self.get_setting('order_execution_notify', 'false') == 'true'
+    
+    def set_order_execution_notify(self, enabled: bool):
+        """Установить настройку уведомлений об исполнении ордеров"""
+        self.set_setting('order_execution_notify', 'true' if enabled else 'false')
     
     def export_database(self) -> Tuple[bool, int, str]:
         """Экспорт базы данных"""
@@ -1028,13 +1024,12 @@ class Database:
             for key, value in cursor.fetchall():
                 settings[key] = value
             
-            cursor.execute('SELECT enabled, alert_percent, alert_interval_minutes, order_execution_enabled FROM notifications WHERE id = 1')
+            cursor.execute('SELECT enabled, alert_percent, alert_interval_minutes FROM notifications WHERE id = 1')
             notification_row = cursor.fetchone()
             notifications = {
                 'enabled': bool(notification_row[0]) if notification_row else True,
                 'alert_percent': notification_row[1] if notification_row else 10.0,
-                'alert_interval_minutes': notification_row[2] if notification_row else 30,
-                'order_execution_enabled': bool(notification_row[3]) if notification_row and len(notification_row) > 3 else False
+                'alert_interval_minutes': notification_row[2] if notification_row else 30
             }
             
             cursor.execute('SELECT start_date, symbol, initial_price FROM dca_start WHERE id = 1')
@@ -1045,10 +1040,12 @@ class Database:
                 'initial_price': dca_start_row[2] if dca_start_row else None
             } if dca_start_row else None
             
+            # Исправлено: преобразуем Row в словарь для каждой записи
             cursor.execute('SELECT * FROM ladder_settings')
             ladder_rows = cursor.fetchall()
             ladder_settings = []
             for row in ladder_rows:
+                # Преобразуем кортеж в словарь по индексам столбцов
                 ladder_dict = {
                     'id': row[0],
                     'symbol': row[1],
@@ -1063,6 +1060,21 @@ class Database:
                 }
                 ladder_settings.append(ladder_dict)
             
+            cursor.execute('SELECT * FROM executed_orders')
+            executed_rows = cursor.fetchall()
+            executed_orders = []
+            for row in executed_rows:
+                executed_orders.append({
+                    'id': row[0],
+                    'order_id': row[1],
+                    'symbol': row[2],
+                    'price': row[3],
+                    'quantity': row[4],
+                    'amount_usdt': row[5],
+                    'executed_at': row[6],
+                    'added_to_stats': row[7]
+                })
+            
             conn.close()
             
             export_data = {
@@ -1073,7 +1085,8 @@ class Database:
                 'settings': settings,
                 'notifications': notifications,
                 'dca_start': dca_start,
-                'ladder_settings': ladder_settings
+                'ladder_settings': ladder_settings,
+                'executed_orders': executed_orders
             }
             
             with open(DB_EXPORT_FILE, 'w', encoding='utf-8') as f:
@@ -1098,6 +1111,7 @@ class Database:
             cursor.execute("DELETE FROM settings")
             cursor.execute("DELETE FROM dca_start")
             cursor.execute("DELETE FROM ladder_settings")
+            cursor.execute("DELETE FROM executed_orders")
             
             purchases_imported = 0
             for purchase in data.get('purchases', []):
@@ -1149,11 +1163,8 @@ class Database:
             notifications = data.get('notifications', {})
             if notifications:
                 cursor.execute('''
-                    UPDATE notifications SET enabled = ?, alert_percent = ?, alert_interval_minutes = ?, order_execution_enabled = ?, last_check = CURRENT_TIMESTAMP WHERE id = 1
-                ''', (1 if notifications.get('enabled', True) else 0, 
-                      notifications.get('alert_percent', 10.0), 
-                      notifications.get('alert_interval_minutes', 30),
-                      1 if notifications.get('order_execution_enabled', False) else 0))
+                    UPDATE notifications SET enabled = ?, alert_percent = ?, alert_interval_minutes = ?, last_check = CURRENT_TIMESTAMP WHERE id = 1
+                ''', (1 if notifications.get('enabled', True) else 0, notifications.get('alert_percent', 10.0), notifications.get('alert_interval_minutes', 30)))
             
             for ladder in data.get('ladder_settings', []):
                 cursor.execute('''
@@ -1171,6 +1182,22 @@ class Database:
                     ladder.get('current_drop_percent', 0),
                     ladder.get('last_buy_price'),
                     ladder.get('created_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                ))
+            
+            for executed in data.get('executed_orders', []):
+                cursor.execute('''
+                    INSERT OR IGNORE INTO executed_orders 
+                    (id, order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    executed.get('id'),
+                    executed.get('order_id'),
+                    executed.get('symbol', 'TONUSDT'),
+                    executed.get('price', 0),
+                    executed.get('quantity', 0),
+                    executed.get('amount_usdt', 0),
+                    executed.get('executed_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    executed.get('added_to_stats', 0)
                 ))
             
             conn.commit()
@@ -1280,16 +1307,14 @@ class BybitClient:
         sell_orders = [o for o in orders if o.get('side') == 'Sell']
         return {'buy': buy_orders, 'sell': sell_orders}
     
-    async def get_order_history(self, symbol: str = None, start_time: str = None) -> List[Dict]:
+    async def get_order_history(self, symbol: str = None, limit: int = 50) -> List[Dict]:
         """Получить историю ордеров"""
         try:
             if not self.session:
                 self._init_session()
-            params = {"category": "spot", "limit": 50}
+            params = {"category": "spot", "limit": limit}
             if symbol:
                 params['symbol'] = symbol
-            if start_time:
-                params['startTime'] = start_time
             response = self.session.get_order_history(**params)
             if response['retCode'] == 0:
                 return response['result']['list']
@@ -1298,20 +1323,20 @@ class BybitClient:
             logger.error(f"Error getting order history: {e}")
             return []
     
-    async def get_executed_orders_since(self, symbol: str, since_time: str) -> List[Dict]:
+    async def get_executed_orders_since(self, symbol: str, since: datetime) -> List[Dict]:
         """Получить исполненные ордера с указанного времени"""
-        orders = await self.get_order_history(symbol)
+        orders = await self.get_order_history(symbol, limit=100)
         executed = []
         for order in orders:
-            if order.get('orderStatus') == 'Filled' and order.get('side') == 'Sell':
-                created_time = order.get('createdTime')
-                if created_time and created_time > since_time:
+            if order.get('orderStatus') == 'Filled' and order.get('side') == 'Buy':
+                order_time = datetime.fromtimestamp(int(order.get('createdTime', '0')) / 1000)
+                if order_time > since:
                     executed.append({
                         'order_id': order.get('orderId'),
-                        'price': float(order.get('avgPrice', 0)) or float(order.get('price', 0)),
-                        'quantity': float(order.get('cumExecQty', 0)) or float(order.get('qty', 0)),
-                        'amount_usdt': float(order.get('cumExecValue', 0)) or (float(order.get('cumExecQty', 0)) * float(order.get('avgPrice', 0))),
-                        'executed_at': created_time
+                        'price': float(order.get('avgPrice', order.get('price', 0))),
+                        'quantity': float(order.get('qty', 0)),
+                        'amount_usdt': float(order.get('cumExecValue', 0)),
+                        'executed_at': order_time
                     })
         return executed
     
@@ -1470,25 +1495,6 @@ class DCAStrategy:
                 self.db.update_sell_order_status(order['order_id'], 'completed')
                 self.db.log_action('SELL_COMPLETED', symbol, f"Продано по {format_price(order['target_price'])}")
     
-    async def check_executed_orders(self, symbol: str) -> List[Dict]:
-        """Проверить исполненные ордера на продажу"""
-        last_check = self.db.get_last_order_check_time()
-        executed_orders = await self.bybit.get_executed_orders_since(symbol, last_check)
-        
-        new_orders = []
-        for order in executed_orders:
-            self.db.add_executed_order(
-                order_id=order['order_id'],
-                symbol=symbol,
-                quantity=order['quantity'],
-                price=order['price'],
-                amount_usdt=order['amount_usdt']
-            )
-            new_orders.append(order)
-        
-        self.db.update_last_order_check_time()
-        return new_orders
-    
     async def get_recommended_purchase(self, symbol: str) -> Dict:
         """Получить рекомендацию для ручной покупки (для следующего уровня)"""
         current_price = await self.bybit.get_symbol_price(symbol)
@@ -1527,6 +1533,33 @@ class DCAStrategy:
             'avg_price': avg_price,
             'profit_percent': profit_percent
         }
+    
+    async def check_executed_buy_orders(self, symbol: str) -> List[Dict]:
+        """Проверить исполненные ордера на покупку"""
+        # Получаем последнюю проверку
+        last_check_str = self.db.get_setting('last_order_check_time', '')
+        last_check = datetime.fromisoformat(last_check_str) if last_check_str else datetime.now() - timedelta(hours=24)
+        
+        # Получаем исполненные ордера
+        executed = await self.bybit.get_executed_orders_since(symbol, last_check)
+        
+        # Обновляем время проверки
+        self.db.set_setting('last_order_check_time', datetime.now().isoformat())
+        
+        # Фильтруем только те, о которых еще не уведомляли
+        new_executed = []
+        for order in executed:
+            if not self.db.is_order_notified(order['order_id']):
+                new_executed.append(order)
+                self.db.add_executed_order(
+                    order['order_id'],
+                    symbol,
+                    order['price'],
+                    order['quantity'],
+                    order['amount_usdt']
+                )
+        
+        return new_executed
 
 
 # ==================== FAST DCA BOT ====================
@@ -1537,7 +1570,6 @@ class FastDCABot:
         self.bybit = None
         self.strategy = None
         self.bybit_initialized = False
-        self.pending_order_confirmations = {}  # user_id -> order_data
         
         request_kwargs = {'connect_timeout': 60.0, 'read_timeout': 60.0, 'write_timeout': 60.0, 'pool_timeout': 60.0}
         request = HTTPXRequest(**request_kwargs)
@@ -1546,6 +1578,7 @@ class FastDCABot:
         
         self.scheduler_running = False
         self.authorized_user_id = None
+        self.pending_executed_order = None  # Для хранения ожидающего ордера
         
         self.setup_handlers()
     
@@ -1562,13 +1595,15 @@ class FastDCABot:
     def get_main_keyboard(self):
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         dca_button = "⏹ Остановить Авто DCA" if is_active else "🚀 Запустить Авто DCA"
+        order_execution = self.db.get_order_execution_notify()
+        order_execution_button = "✅ Исполнение по ордерам Вкл" if order_execution else "⏳ Исполнение по ордерам Выкл"
         keyboard = [
             [KeyboardButton("📊 Мой Портфель"), KeyboardButton(dca_button)],
             [KeyboardButton("💰 Ручная покупка (лимит)"), KeyboardButton("📈 Статистика DCA")],
             [KeyboardButton("➕ Добавить покупку вручную"), KeyboardButton("✏️ Редактировать покупки")],
             [KeyboardButton("⚙️ Настройки"), KeyboardButton("📋 Статус бота")],
             [KeyboardButton("📝 Управление ордерами"), KeyboardButton("🪜 Настройка лестницы")],
-            [KeyboardButton("🔔 Уведомления"), KeyboardButton("🏠 Главное меню")],
+            [KeyboardButton(order_execution_button), KeyboardButton("🏠 Главное меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -1577,9 +1612,8 @@ class FastDCABot:
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("💵 Сумма покупки")],
             [KeyboardButton("📊 Процент прибыли"), KeyboardButton("📉 Настройки падения")],
             [KeyboardButton("⏰ Время покупки"), KeyboardButton("🔄 Частота покупки")],
-            [KeyboardButton("🪜 Настройка лестницы"), KeyboardButton("🔔 Настройки уведомлений")],
-            [KeyboardButton("📤 Экспорт базы"), KeyboardButton("📥 Импорт базы")],
-            [KeyboardButton("🔙 Назад в меню")],
+            [KeyboardButton("🪜 Настройка лестницы"), KeyboardButton("📤 Экспорт базы")],
+            [KeyboardButton("📥 Импорт базы"), KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -1598,16 +1632,6 @@ class FastDCABot:
             keyboard.append([KeyboardButton(symbol)])
         keyboard.append([KeyboardButton("✏️ Ввести свой токен")])
         keyboard.append([KeyboardButton("❌ Отмена")])
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    def get_notification_settings_keyboard(self):
-        settings = self.db.get_notification_settings()
-        order_exec_text = "✅ Исполнение по ордерам Вкл" if settings.get('order_execution_enabled', False) else "🔴 Исполнение по ордерам Выкл"
-        keyboard = [
-            [KeyboardButton("📊 Процент для уведомления"), KeyboardButton("⏱ Частота проверки")],
-            [KeyboardButton("🔔 Вкл/Выкл уведомления"), KeyboardButton(order_exec_text)],
-            [KeyboardButton("📋 Текущие настройки"), KeyboardButton("🔙 Назад в меню")],
-        ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     def get_orders_management_keyboard(self):
@@ -1629,14 +1653,7 @@ class FastDCABot:
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
     def get_confirm_keyboard(self):
-        return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, удалить"), KeyboardButton("❌ Нет, отмена")]], resize_keyboard=True)
-    
-    def get_order_confirm_keyboard(self, order_id: str):
-        keyboard = [
-            [InlineKeyboardButton("✅ Да, добавить в статистику", callback_data=f"order_confirm_{order_id}")],
-            [InlineKeyboardButton("❌ Нет, пропустить", callback_data=f"order_skip_{order_id}")],
-        ]
-        return InlineKeyboardMarkup(keyboard)
+        return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, добавить"), KeyboardButton("❌ Нет, пропустить")]], resize_keyboard=True)
     
     def get_purchases_list_keyboard(self, purchases):
         keyboard = []
@@ -1676,6 +1693,177 @@ class FastDCABot:
             f"Главное меню:",
             reply_markup=self.get_main_keyboard()
         )
+    
+    # ============= ИСПОЛНЕНИЕ ПО ОРДЕРАМ =============
+    
+    async def toggle_order_execution(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включить/выключить уведомления об исполнении ордеров"""
+        if not await self._check_user_fast(update):
+            return
+        
+        current = self.db.get_order_execution_notify()
+        new_status = not current
+        self.db.set_order_execution_notify(new_status)
+        
+        status_text = "✅ Включено" if new_status else "⏹ Выключено"
+        await update.message.reply_text(
+            f"📋 *Исполнение по ордерам*: {status_text}\n\n"
+            f"При включенной настройке бот каждые 60 минут проверяет исполненные ордера на покупку\n"
+            f"и предлагает добавить их в статистику.",
+            parse_mode='Markdown',
+            reply_markup=self.get_main_keyboard()
+        )
+    
+    async def check_executed_orders_loop(self):
+        """Проверка исполненных ордеров каждые 60 минут"""
+        logger.info("Executed orders checker loop started")
+        last_check = datetime.now()
+        
+        while self.scheduler_running:
+            try:
+                await asyncio.sleep(60)  # Проверяем каждую минуту, но отправляем сообщения не чаще чем раз в час
+                
+                if not self.db.get_order_execution_notify():
+                    continue
+                
+                if not self.bybit_initialized:
+                    self._init_bybit()
+                
+                if not self.bybit_initialized:
+                    continue
+                
+                # Проверяем не чаще чем раз в 60 минут
+                if (datetime.now() - last_check).total_seconds() < 3600:
+                    continue
+                
+                last_check = datetime.now()
+                
+                symbol = self.db.get_setting('symbol', 'TONUSDT')
+                new_orders = await self.strategy.check_executed_buy_orders(symbol)
+                
+                for order in new_orders:
+                    # Отправляем уведомление об исполненном ордере
+                    msg = (
+                        f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
+                        f"🪙 Токен: `{symbol}`\n"
+                        f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
+                        f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
+                        f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
+                        f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                        f"❗ *Добавить в статистику покупок?*"
+                    )
+                    
+                    # Сохраняем ордер в контексте для последующего ответа
+                    self.pending_executed_order = {
+                        'order_id': order['order_id'],
+                        'symbol': symbol,
+                        'price': order['price'],
+                        'quantity': order['quantity'],
+                        'amount_usdt': order['amount_usdt'],
+                        'executed_at': order['executed_at']
+                    }
+                    
+                    if self.authorized_user_id:
+                        try:
+                            keyboard = InlineKeyboardMarkup([
+                                [
+                                    InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
+                                    InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
+                                ]
+                            ])
+                            await self.application.bot.send_message(
+                                chat_id=self.authorized_user_id,
+                                text=msg,
+                                parse_mode='Markdown',
+                                reply_markup=keyboard
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending order notification: {e}")
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Executed orders checker error: {e}")
+    
+    async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка callback от уведомления об исполнении ордера"""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        
+        if data.startswith("add_order_"):
+            order_id = data.replace("add_order_", "")
+            await self.add_executed_order_to_stats(update, context, order_id)
+        elif data.startswith("skip_order_"):
+            order_id = data.replace("skip_order_", "")
+            await self.skip_executed_order(update, context, order_id)
+    
+    async def add_executed_order_to_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
+        """Добавить исполненный ордер в статистику покупок"""
+        # Получаем ордер из БД
+        conn = sqlite3.connect(self.db.db_file, timeout=5)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM executed_orders WHERE order_id = ?', (order_id,))
+        order = cursor.fetchone()
+        conn.close()
+        
+        if not order:
+            await update.callback_query.edit_message_text("❌ Ордер не найден в базе.")
+            return
+        
+        order_dict = dict(order)
+        
+        # Рассчитываем процент падения от цены старта
+        drop_percent = self.db.get_drop_percent_from_start_price(order_dict['price'], order_dict['symbol'])
+        
+        # Определяем уровень лестницы
+        step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
+        step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
+        
+        # Добавляем покупку в статистику
+        purchase_id = self.db.add_purchase(
+            symbol=order_dict['symbol'],
+            amount_usdt=order_dict['amount_usdt'],
+            price=order_dict['price'],
+            quantity=order_dict['quantity'],
+            multiplier=1.0,
+            drop_percent=drop_percent,
+            step_level=step_level,
+            date=order_dict['executed_at']
+        )
+        
+        if purchase_id:
+            # Отмечаем ордер как добавленный
+            self.db.mark_order_as_added(order_id)
+            
+            # Обновляем сообщение
+            await update.callback_query.edit_message_text(
+                f"✅ *Покупка добавлена в статистику!*\n\n"
+                f"🪙 Токен: `{order_dict['symbol']}`\n"
+                f"💰 Цена: `{format_price(order_dict['price'], 4)}` USDT\n"
+                f"📊 Количество: `{format_quantity(order_dict['quantity'], 6)}`\n"
+                f"💵 Сумма: `{order_dict['amount_usdt']:.2f}` USDT\n"
+                f"📉 Падение: `{drop_percent:.1f}%`\n"
+                f"📊 Уровень: {step_level}\n"
+                f"🆔 ID покупки: `{purchase_id}`",
+                parse_mode='Markdown'
+            )
+            
+            # Логируем действие
+            self.db.log_action('EXECUTED_ORDER_ADDED', order_dict['symbol'], 
+                              f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']}")
+        else:
+            await update.callback_query.edit_message_text("❌ Ошибка при добавлении покупки в статистику.")
+    
+    async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
+        """Пропустить добавление ордера в статистику"""
+        # Отмечаем ордер как добавленный (чтобы больше не уведомлять)
+        self.db.mark_order_as_added(order_id)
+        await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
+    
+    # ============= ОСТАЛЬНЫЕ МЕТОДЫ =============
     
     async def show_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -1838,12 +2026,14 @@ class FastDCABot:
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         invest_amount = float(self.db.get_setting('invest_amount', '1.1'))
         ladder_settings = self.db.get_ladder_settings(symbol)
+        order_execution = self.db.get_order_execution_notify()
         
         message = f"📋 *Статус бота*\n\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
         message += f"🪙 Токен: `{symbol}`\n"
         message += f"💵 Сумма покупки: `{invest_amount}` USDT\n"
         message += f"📈 Цель: `{self.db.get_setting('profit_percent', '5')}%`\n"
+        message += f"📋 Исполнение по ордерам: {'✅ Вкл' if order_execution else '⏹ Выкл'}\n"
         message += f"\n🪜 *Лестница:*\n"
         message += f"Стартовая цена: `{format_price(ladder_settings['start_price'], 4)}` USDT\n"
         message += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
@@ -2093,94 +2283,6 @@ class FastDCABot:
         await update.message.reply_text("🔄 Лестница сброшена!", reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
     
-    # ============= НАСТРОЙКИ УВЕДОМЛЕНИЙ =============
-    
-    async def notification_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return SELECTING_ACTION
-        await update.message.reply_text("🔔 *Настройки уведомлений*", reply_markup=self.get_notification_settings_keyboard(), parse_mode='Markdown')
-        return NOTIFICATION_SETTINGS_MENU
-    
-    async def show_current_notification_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return NOTIFICATION_SETTINGS_MENU
-        settings = self.db.get_notification_settings()
-        status = "✅ Включены" if settings['enabled'] else "❌ Выключены"
-        order_exec_status = "✅ Включено" if settings.get('order_execution_enabled', False) else "❌ Выключено"
-        text = f"📋 *НАСТРОЙКИ УВЕДОМЛЕНИЙ*\n\n📊 Процент: `{settings['alert_percent']}%`\n⏱ Частота: `{settings['alert_interval_minutes']}` мин\n🔔 Уведомления: {status}\n📝 Исполнение по ордерам: {order_exec_status}"
-        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=self.get_notification_settings_keyboard())
-        return NOTIFICATION_SETTINGS_MENU
-    
-    async def toggle_notifications(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return NOTIFICATION_SETTINGS_MENU
-        settings = self.db.get_notification_settings()
-        new_status = not settings['enabled']
-        self.db.update_notification_settings(enabled=new_status)
-        status = "включены" if new_status else "выключены"
-        await update.message.reply_text(f"🔔 Уведомления {status}!", reply_markup=self.get_notification_settings_keyboard())
-        return NOTIFICATION_SETTINGS_MENU
-    
-    async def toggle_order_execution_notifications(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return NOTIFICATION_SETTINGS_MENU
-        settings = self.db.get_notification_settings()
-        new_status = not settings.get('order_execution_enabled', False)
-        self.db.update_notification_settings(order_execution_enabled=new_status)
-        status = "включены" if new_status else "выключены"
-        await update.message.reply_text(f"📝 Уведомления об исполнении ордеров {status}!\n\nБот будет проверять каждые 60 минут исполненные ордера на продажу и предлагать добавить их в статистику.", reply_markup=self.get_notification_settings_keyboard())
-        return NOTIFICATION_SETTINGS_MENU
-    
-    async def set_alert_percent_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return NOTIFICATION_SETTINGS_MENU
-        await update.message.reply_text("📊 Введите процент для уведомления:", reply_markup=self.get_cancel_keyboard())
-        return WAITING_ALERT_PERCENT
-    
-    async def set_alert_percent_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_notification_settings_keyboard())
-            return NOTIFICATION_SETTINGS_MENU
-        try:
-            percent = float(text.replace(',', '.'))
-            if percent <= 0:
-                raise ValueError
-            self.db.update_notification_settings(alert_percent=percent)
-            await update.message.reply_text(f"✅ Процент изменен на {percent}%", reply_markup=self.get_notification_settings_keyboard())
-            return NOTIFICATION_SETTINGS_MENU
-        except ValueError:
-            await update.message.reply_text("❌ Ошибка! Введите число.", reply_markup=self.get_cancel_keyboard())
-            return WAITING_ALERT_PERCENT
-    
-    async def set_alert_interval_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return NOTIFICATION_SETTINGS_MENU
-        await update.message.reply_text("⏱ Введите частоту проверки (минуты):", reply_markup=self.get_cancel_keyboard())
-        return WAITING_ALERT_INTERVAL
-    
-    async def set_alert_interval_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_notification_settings_keyboard())
-            return NOTIFICATION_SETTINGS_MENU
-        try:
-            interval = int(float(text))
-            if interval < 1:
-                raise ValueError
-            self.db.update_notification_settings(alert_interval_minutes=interval)
-            await update.message.reply_text(f"✅ Частота изменена на {interval} минут", reply_markup=self.get_notification_settings_keyboard())
-            return NOTIFICATION_SETTINGS_MENU
-        except ValueError:
-            await update.message.reply_text("❌ Ошибка! Введите целое число.", reply_markup=self.get_cancel_keyboard())
-            return WAITING_ALERT_INTERVAL
-    
-    async def back_to_main_from_notifications(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return SELECTING_ACTION
-        await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
-        return ConversationHandler.END
-    
     # ============= УПРАВЛЕНИЕ ОРДЕРАМИ =============
     
     async def orders_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2298,6 +2400,12 @@ class FastDCABot:
         query = update.callback_query
         await query.answer()
         data = query.data
+        
+        # Обработка callback от уведомлений об исполнении ордеров
+        if data.startswith("add_order_") or data.startswith("skip_order_"):
+            await self.handle_order_execution_callback(update, context)
+            return
+        
         if data == "order_cancel":
             await query.edit_message_text("✅ Отменено")
             return
@@ -2311,12 +2419,6 @@ class FastDCABot:
                 current_price = float(parts[3])
                 qty = float(parts[4]) if len(parts) > 4 else 0
                 await self.process_order_edit_start(update, context, order_id, current_price, qty)
-        elif data.startswith("order_confirm_"):
-            order_id = data.replace("order_confirm_", "")
-            await self.process_order_confirmation(update, context, order_id, confirm=True)
-        elif data.startswith("order_skip_"):
-            order_id = data.replace("order_skip_", "")
-            await self.process_order_confirmation(update, context, order_id, confirm=False)
     
     async def process_order_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         self._init_bybit()
@@ -2337,70 +2439,6 @@ class FastDCABot:
         context.user_data['editing_order_current_price'] = current_price
         await update.callback_query.edit_message_text(f"✏️ Введите новую цену (текущая: {format_price(current_price, 4)}):")
         context.user_data['current_state'] = EDIT_ORDER_PRICE
-    
-    async def process_order_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str, confirm: bool):
-        """Обработка подтверждения добавления исполненного ордера в статистику"""
-        query = update.callback_query
-        await query.answer()
-        
-        # Находим ордер в pending_order_confirmations
-        order_data = None
-        for key, data in self.pending_order_confirmations.items():
-            if data.get('order_id') == order_id:
-                order_data = data
-                break
-        
-        if not order_data:
-            await query.edit_message_text("❌ Ордер не найден или уже обработан.")
-            return
-        
-        if confirm:
-            # Добавляем покупку в статистику
-            symbol = order_data['symbol']
-            price = order_data['price']
-            quantity = order_data['quantity']
-            amount_usdt = price * quantity
-            
-            # Рассчитываем процент падения от цены старта
-            drop_percent = self.db.get_drop_percent_from_start_price(price, symbol)
-            step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
-            step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
-            
-            purchase_id = self.db.add_purchase(
-                symbol=symbol,
-                amount_usdt=amount_usdt,
-                price=price,
-                quantity=quantity,
-                multiplier=1.0,
-                drop_percent=drop_percent,
-                step_level=step_level,
-                date=order_data['executed_at']
-            )
-            
-            if purchase_id:
-                # Обновляем статус ордера в БД
-                self.db.update_sell_order_status(order_id, 'completed')
-                # Отмечаем как обработанный
-                self.db.mark_executed_order_processed(order_id)
-                del self.pending_order_confirmations[query.from_user.id]
-                
-                await query.edit_message_text(
-                    f"✅ *Ордер добавлен в статистику!*\n\n"
-                    f"🪙 {symbol}\n"
-                    f"💰 Цена: `{format_price(price, 4)}` USDT\n"
-                    f"📊 Количество: `{format_quantity(quantity, 6)}`\n"
-                    f"💵 Сумма: `{amount_usdt:.2f}` USDT\n"
-                    f"📉 Падение от цены старта: `{drop_percent:.1f}%`\n"
-                    f"📝 ID покупки: `{purchase_id}`",
-                    parse_mode='Markdown'
-                )
-            else:
-                await query.edit_message_text("❌ Ошибка при добавлении в статистику.")
-        else:
-            # Пропускаем ордер
-            self.db.mark_executed_order_processed(order_id)
-            del self.pending_order_confirmations[query.from_user.id]
-            await query.edit_message_text("⏭ Ордер пропущен. Не добавлен в статистику.")
     
     async def edit_order_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3073,105 +3111,46 @@ class FastDCABot:
     
     async def scheduler_loop(self):
         logger.info("Scheduler loop started")
-        last_executed_check_time = 0
-        check_interval = 60  # минут
-        
         while self.scheduler_running:
             try:
                 await asyncio.sleep(60)
-                
+                if self.db.get_setting('dca_active', 'false') != 'true':
+                    continue
                 if not self.bybit_initialized:
                     self._init_bybit()
                 if not self.bybit_initialized:
                     continue
-                
                 symbol = self.db.get_setting('symbol', 'TONUSDT')
-                
-                # Проверка DCA покупок
-                if self.db.get_setting('dca_active', 'false') == 'true':
-                    profit_percent = float(self.db.get_setting('profit_percent', '5'))
-                    current_price = await self.bybit.get_symbol_price(symbol)
-                    if current_price:
-                        ladder_info = self.db.calculate_ladder_purchase(current_price, symbol)
-                        if ladder_info['should_buy']:
-                            logger.info(f"Executing ladder purchase: {ladder_info}")
-                            result = await self.strategy.execute_ladder_purchase(symbol, profit_percent)
-                            if result['success'] and self.authorized_user_id:
-                                msg = f"🪜 *ПОКУПКА!*\n📉 Падение: {result.get('drop_percent', 0):.1f}%\n💰 Сумма: {result['total_usdt']:.2f} USDT\n💵 Цена: {format_price(result['price'], 4)} USDT"
-                                try:
-                                    await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
-                                except:
-                                    pass
-                
-                # Проверка статуса ордеров
+                profit_percent = float(self.db.get_setting('profit_percent', '5'))
+                current_price = await self.bybit.get_symbol_price(symbol)
+                if current_price:
+                    ladder_info = self.db.calculate_ladder_purchase(current_price, symbol)
+                    if ladder_info['should_buy']:
+                        logger.info(f"Executing ladder purchase: {ladder_info}")
+                        result = await self.strategy.execute_ladder_purchase(symbol, profit_percent)
+                        if result['success'] and self.authorized_user_id:
+                            msg = f"🪜 *ПОКУПКА!*\n📉 Падение: {result.get('drop_percent', 0):.1f}%\n💰 Сумма: {result['total_usdt']:.2f} USDT\n💵 Цена: {format_price(result['price'], 4)} USDT"
+                            try:
+                                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
+                            except:
+                                pass
                 await self.strategy.check_and_update_sell_orders(symbol)
-                
-                # Проверка исполненных ордеров (каждые 60 минут)
-                current_time = time.time()
-                settings = self.db.get_notification_settings()
-                if settings.get('order_execution_enabled', False):
-                    if current_time - last_executed_check_time >= check_interval * 60:
-                        last_executed_check_time = current_time
-                        await self.check_executed_orders_and_notify(symbol)
-                
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
     
-    async def check_executed_orders_and_notify(self, symbol: str):
-        """Проверить исполненные ордера и отправить уведомление"""
-        try:
-            executed_orders = await self.strategy.check_executed_orders(symbol)
-            
-            if executed_orders and self.authorized_user_id:
-                for order in executed_orders:
-                    order_id = order['order_id']
-                    price = order['price']
-                    quantity = order['quantity']
-                    amount_usdt = order['amount_usdt']
-                    
-                    # Сохраняем в pending для подтверждения
-                    self.pending_order_confirmations[self.authorized_user_id] = {
-                        'order_id': order_id,
-                        'symbol': symbol,
-                        'price': price,
-                        'quantity': quantity,
-                        'amount_usdt': amount_usdt,
-                        'executed_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                    
-                    msg = (
-                        f"📝 *Ордер исполнен!*\n\n"
-                        f"🪙 {symbol}\n"
-                        f"💰 Цена: `{format_price(price, 4)}` USDT\n"
-                        f"📊 Количество: `{format_quantity(quantity, 6)}`\n"
-                        f"💵 Сумма: `{amount_usdt:.2f}` USDT\n\n"
-                        f"Хотите добавить эту продажу в статистику покупок?"
-                    )
-                    
-                    try:
-                        await self.application.bot.send_message(
-                            chat_id=self.authorized_user_id,
-                            text=msg,
-                            parse_mode='Markdown',
-                            reply_markup=self.get_order_confirm_keyboard(order_id)
-                        )
-                    except Exception as e:
-                        logger.error(f"Error sending order execution notification: {e}")
-                        
-        except Exception as e:
-            logger.error(f"Error checking executed orders: {e}")
-    
     async def post_init(self, application):
         self.scheduler_running = True
         asyncio.create_task(self.scheduler_loop())
+        asyncio.create_task(self.check_executed_orders_loop())
     
     def setup_handlers(self):
         logger.info("Setting up handlers...")
         
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_callback, pattern='^order_'))
+        self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
         
         # Основные кнопки
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
@@ -3179,6 +3158,7 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
         self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
+        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Исполнение по ордерам Вкл|⏳ Исполнение по ордерам Выкл)$'), self.toggle_order_execution))
         self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
         
         # Conversation для лестницы
@@ -3209,27 +3189,6 @@ class FastDCABot:
         )
         self.application.add_handler(ladder_conv)
         
-        # Conversation для уведомлений
-        notification_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления)$'), self.notification_settings_menu)],
-            states={
-                NOTIFICATION_SETTINGS_MENU: [
-                    MessageHandler(filters.Regex('^(📊 Процент для уведомления)$'), self.set_alert_percent_start),
-                    MessageHandler(filters.Regex('^(⏱ Частота проверки)$'), self.set_alert_interval_start),
-                    MessageHandler(filters.Regex('^(🔔 Вкл/Выкл уведомления)$'), self.toggle_notifications),
-                    MessageHandler(filters.Regex('^(✅ Исполнение по ордерам Вкл|🔴 Исполнение по ордерам Выкл)$'), self.toggle_order_execution_notifications),
-                    MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_current_notification_settings),
-                    MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
-                ],
-                WAITING_ALERT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_alert_percent_save)],
-                WAITING_ALERT_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_alert_interval_save)],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="notification_conversation",
-            persistent=False,
-        )
-        self.application.add_handler(notification_conv)
-        
         # Основной ConversationHandler для настроек
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
@@ -3241,7 +3200,6 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start),
                     MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start),
                     MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start),
-                    MessageHandler(filters.Regex('^(🔔 Настройки уведомлений)$'), self.notification_settings_menu),
                     MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database_handler),
                     MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
