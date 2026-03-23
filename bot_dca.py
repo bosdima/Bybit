@@ -1306,6 +1306,11 @@ class BybitClient:
         sell_orders = [o for o in orders if o.get('side') == 'Sell']
         return {'buy': buy_orders, 'sell': sell_orders}
     
+    async def get_sell_orders(self, symbol: str = None) -> List[Dict]:
+        """Получить открытые ордера на продажу"""
+        orders = await self.get_open_orders(symbol)
+        return [o for o in orders if o.get('side') == 'Sell']
+    
     async def get_order_history(self, symbol: str = None, limit: int = 50) -> List[Dict]:
         """Получить историю ордеров"""
         try:
@@ -1651,8 +1656,9 @@ class FastDCABot:
     def get_cancel_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
-    def get_confirm_keyboard(self):
-        return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, добавить"), KeyboardButton("❌ Нет, пропустить")]], resize_keyboard=True)
+    def get_confirm_delete_keyboard(self):
+        """Клавиатура для подтверждения удаления"""
+        return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, удалить"), KeyboardButton("❌ Нет, отмена")]], resize_keyboard=True)
     
     def get_purchases_list_keyboard(self, purchases):
         keyboard = []
@@ -2295,7 +2301,7 @@ class FastDCABot:
         orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
         sell_count = len(orders_by_side.get('sell', []))
         buy_count = len(orders_by_side.get('buy', []))
-        await update.message.reply_text(f"📝 *Управление ордерами*\n\nТокен: `{symbol}`\n📊 Ордера на продажу: `{sell_count}`\n📊 Ордера на покупку: `{buy_count}`", reply_markup=self.get_orders_management_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text(f"📝 *Управление ордерами*\n\nТокен: `{symbol}`\n🔴 Ордера на продажу: `{sell_count}`\n🟢 Ордера на покупку: `{buy_count}`", reply_markup=self.get_orders_management_keyboard(), parse_mode='Markdown')
         return MANAGE_ORDERS
     
     async def list_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2378,21 +2384,25 @@ class FastDCABot:
             return MANAGE_ORDERS
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         coin = symbol.replace('USDT', '')
-        open_orders = await self.bybit.get_open_orders(symbol)
-        if not open_orders:
-            await update.message.reply_text("❌ Нет открытых ордеров", reply_markup=self.get_orders_management_keyboard())
+        
+        # Получаем только ордера на ПРОДАЖУ, так как их создает DCA бот
+        sell_orders = await self.bybit.get_sell_orders(symbol)
+        
+        if not sell_orders:
+            await update.message.reply_text("❌ Нет ордеров на продажу для изменения цены\n(можно изменять только ордера на продажу)", reply_markup=self.get_orders_management_keyboard())
             return MANAGE_ORDERS
+        
         keyboard = []
-        for i, order in enumerate(open_orders[:20], 1):
+        for i, order in enumerate(sell_orders[:20], 1):
             order_id = order.get('orderId', 'N/A')
             price = float(order.get('price', 0))
             qty = float(order.get('qty', 0))
-            side = order.get('side', 'Unknown')
+            side = order.get('side', 'Sell')
             side_emoji = "🔴" if side == "Sell" else "🟢"
             side_text = "Продажа" if side == "Sell" else "Покупка"
             keyboard.append([InlineKeyboardButton(f"{side_emoji} Изменить #{i} - {side_text} {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)}", callback_data=f"order_edit_{order_id}_{price}_{qty}")])
         keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
-        await update.message.reply_text("✏️ *Выберите ордер для изменения цены:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await update.message.reply_text("✏️ *Выберите ордер на продажу для изменения цены:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return MANAGE_ORDERS
     
     async def handle_order_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2825,7 +2835,7 @@ class FastDCABot:
             return EDIT_DATE
     
     async def delete_purchase_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("⚠️ *Удалить эту покупку?*", reply_markup=self.get_confirm_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("⚠️ *Удалить эту покупку?*", reply_markup=self.get_confirm_delete_keyboard(), parse_mode='Markdown')
         return DELETE_CONFIRM
     
     async def delete_purchase_execute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2838,9 +2848,11 @@ class FastDCABot:
             purchase_id = context.user_data.get('editing_purchase_id')
             if purchase_id and self.db.delete_purchase(purchase_id):
                 await update.message.reply_text("✅ Покупка удалена!", reply_markup=self.get_main_keyboard())
+                return ConversationHandler.END
             else:
                 await update.message.reply_text("❌ Ошибка при удалении", reply_markup=self.get_main_keyboard())
-        return ConversationHandler.END
+                return ConversationHandler.END
+        return EDIT_PURCHASE_SELECT
     
     async def show_purchase_after_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE, purchase_id):
         purchase = self.db.get_purchase_by_id(purchase_id)
