@@ -1662,8 +1662,8 @@ class FastDCABot:
                 date_display = datetime.strptime(p['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
             except:
                 date_display = p['date'][:10] if p['date'] else "N/A"
-            drop_text = f" [{p.get('drop_percent', 0):.0f}%]" if p.get('drop_percent', 0) > 0 else ""
-            btn_text = f"ID{p['id']}: {date_display} - {format_quantity(p['quantity'], 4)} по {format_price(p['price'], 4)}{drop_text}"
+            # Убрали отображение процентов
+            btn_text = f"ID{p['id']}: {date_display} - {format_quantity(p['quantity'], 4)} по {format_price(p['price'], 4)}"
             keyboard.append([KeyboardButton(btn_text)])
         keyboard.append([KeyboardButton("🏠 Главное меню")])
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -2700,8 +2700,8 @@ class FastDCABot:
                 date_display = datetime.strptime(purchase['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
             except:
                 date_display = purchase['date'][:10] if purchase['date'] else "N/A"
-            drop_text = f" (падение {purchase.get('drop_percent', 0):.0f}%)" if purchase.get('drop_percent', 0) > 0 else ""
-            await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`{drop_text}", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
+            # Убрали отображение процентов падения
+            await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
             return EDIT_PURCHASE_SELECT
         except Exception as e:
             await update.message.reply_text("❌ Ошибка выбора", reply_markup=self.get_main_keyboard())
@@ -2852,8 +2852,8 @@ class FastDCABot:
             date_display = datetime.strptime(purchase['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
         except:
             date_display = purchase['date'][:10] if purchase['date'] else "N/A"
-        drop_text = f" (падение {purchase.get('drop_percent', 0):.0f}%)" if purchase.get('drop_percent', 0) > 0 else ""
-        await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`{drop_text}", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
+        # Убрали отображение процентов падения
+        await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
     
     async def cancel_to_edit_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         purchase_id = context.user_data.get('editing_purchase_id')
@@ -2867,8 +2867,20 @@ class FastDCABot:
     async def settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
+        
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        invest_amount = self.db.get_setting('invest_amount', '1.1')
+        profit_percent = self.db.get_setting('profit_percent', '5')
+        schedule_time = self.db.get_setting('schedule_time', '09:00')
+        frequency_hours = self.db.get_setting('frequency_hours', '24')
+        
         await update.message.reply_text(
-            f"⚙️ *Настройки*\n\n🪙 Токен: `{self.db.get_setting('symbol', 'TONUSDT')}`\n💵 Сумма: `{self.db.get_setting('invest_amount', '1.1')}` USDT\n📈 Прибыль: `{self.db.get_setting('profit_percent', '5')}%`\n⏰ Время: `{self.db.get_setting('schedule_time', '09:00')}`\n🔄 Частота: `{self.db.get_setting('frequency_hours', '24')}`ч",
+            f"⚙️ *Настройки*\n\n"
+            f"🪙 Токен: `{symbol}`\n"
+            f"💵 Сумма: `{invest_amount}` USDT\n"
+            f"📈 Прибыль: `{profit_percent}%`\n"
+            f"⏰ Время: `{schedule_time}`\n"
+            f"🔄 Частота: `{frequency_hours}`ч",
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
         )
@@ -3152,7 +3164,8 @@ class FastDCABot:
         self.application.add_handler(CallbackQueryHandler(self.handle_order_callback, pattern='^order_'))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
         
-        # Основные кнопки
+        # Основные кнопки - сначала обрабатываем кнопку настроек отдельно, чтобы она не перехватывалась другими обработчиками
+        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
