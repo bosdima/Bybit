@@ -1039,12 +1039,10 @@ class Database:
                 'initial_price': dca_start_row[2] if dca_start_row else None
             } if dca_start_row else None
             
-            # Исправлено: преобразуем Row в словарь для каждой записи
             cursor.execute('SELECT * FROM ladder_settings')
             ladder_rows = cursor.fetchall()
             ladder_settings = []
             for row in ladder_rows:
-                # Преобразуем кортеж в словарь по индексам столбцов
                 ladder_dict = {
                     'id': row[0],
                     'symbol': row[1],
@@ -1667,7 +1665,6 @@ class FastDCABot:
                 date_display = datetime.strptime(p['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
             except:
                 date_display = p['date'][:10] if p['date'] else "N/A"
-            # Убрали отображение процентов
             btn_text = f"ID{p['id']}: {date_display} - {format_quantity(p['quantity'], 4)} по {format_price(p['price'], 4)}"
             keyboard.append([KeyboardButton(btn_text)])
         keyboard.append([KeyboardButton("🏠 Главное меню")])
@@ -1726,7 +1723,7 @@ class FastDCABot:
         
         while self.scheduler_running:
             try:
-                await asyncio.sleep(60)  # Проверяем каждую минуту, но отправляем сообщения не чаще чем раз в час
+                await asyncio.sleep(60)
                 
                 if not self.db.get_order_execution_notify():
                     continue
@@ -1737,7 +1734,6 @@ class FastDCABot:
                 if not self.bybit_initialized:
                     continue
                 
-                # Проверяем не чаще чем раз в 60 минут
                 if (datetime.now() - last_check).total_seconds() < 3600:
                     continue
                 
@@ -1747,7 +1743,6 @@ class FastDCABot:
                 new_orders = await self.strategy.check_executed_buy_orders(symbol)
                 
                 for order in new_orders:
-                    # Отправляем уведомление об исполненном ордере
                     msg = (
                         f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
                         f"🪙 Токен: `{symbol}`\n"
@@ -1758,7 +1753,6 @@ class FastDCABot:
                         f"❗ *Добавить в статистику покупок?*"
                     )
                     
-                    # Сохраняем ордер в контексте для последующего ответа
                     self.pending_executed_order = {
                         'order_id': order['order_id'],
                         'symbol': symbol,
@@ -1806,7 +1800,6 @@ class FastDCABot:
     
     async def add_executed_order_to_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         """Добавить исполненный ордер в статистику покупок"""
-        # Получаем ордер из БД
         conn = sqlite3.connect(self.db.db_file, timeout=5)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -1820,14 +1813,10 @@ class FastDCABot:
         
         order_dict = dict(order)
         
-        # Рассчитываем процент падения от цены старта
         drop_percent = self.db.get_drop_percent_from_start_price(order_dict['price'], order_dict['symbol'])
-        
-        # Определяем уровень лестницы
         step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
         step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
         
-        # Добавляем покупку в статистику
         purchase_id = self.db.add_purchase(
             symbol=order_dict['symbol'],
             amount_usdt=order_dict['amount_usdt'],
@@ -1840,10 +1829,8 @@ class FastDCABot:
         )
         
         if purchase_id:
-            # Отмечаем ордер как добавленный
             self.db.mark_order_as_added(order_id)
             
-            # Обновляем сообщение
             await update.callback_query.edit_message_text(
                 f"✅ *Покупка добавлена в статистику!*\n\n"
                 f"🪙 Токен: `{order_dict['symbol']}`\n"
@@ -1856,7 +1843,6 @@ class FastDCABot:
                 parse_mode='Markdown'
             )
             
-            # Логируем действие
             self.db.log_action('EXECUTED_ORDER_ADDED', order_dict['symbol'], 
                               f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']}")
         else:
@@ -1864,7 +1850,6 @@ class FastDCABot:
     
     async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         """Пропустить добавление ордера в статистику"""
-        # Отмечаем ордер как добавленный (чтобы больше не уведомлять)
         self.db.mark_order_as_added(order_id)
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
     
@@ -1919,10 +1904,8 @@ class FastDCABot:
                     message += f"Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
                     message += f"{emoji} PnL: `{pnl_percent:+.2f}%` ({pnl_usd:+.2f} USDT)\n\n"
             
-            # Получаем ордера с разделением
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
             
-            # Ордера на продажу
             sell_orders = orders_by_side.get('sell', [])
             if sell_orders:
                 message += f"🔴 *ОРДЕРА НА ПРОДАЖУ ({len(sell_orders)})*\n"
@@ -1937,7 +1920,6 @@ class FastDCABot:
             else:
                 message += f"🔴 *Нет ордеров на продажу*\n\n"
             
-            # Ордера на покупку
             buy_orders = orders_by_side.get('buy', [])
             if buy_orders:
                 message += f"🟢 *ОРДЕРА НА ПОКУПКУ ({len(buy_orders)})*\n"
@@ -1982,7 +1964,6 @@ class FastDCABot:
             pnl = current_value - total_cost
             pnl_percent = (pnl / total_cost * 100) if total_cost > 0 else 0
             
-            # Информация о целевой продаже
             target_info = self.strategy.calculate_target_info(stats, profit_percent)
             
             text = f"📊 *ДЕТАЛЬНАЯ СТАТИСТИКА DCA*\n\n"
@@ -2009,7 +1990,6 @@ class FastDCABot:
                     increase_needed = ((target_info['target_price'] - current_price) / current_price * 100)
                     text += f"Нужен рост: `{increase_needed:+.2f}%` от текущей цены\n"
             
-            # Информация о лестнице - только стартовая цена
             ladder_settings = self.db.get_ladder_settings(symbol)
             if ladder_settings['start_price'] > 0:
                 text += f"\n🪜 *ЛЕСТНИЦА*\n"
@@ -2068,7 +2048,6 @@ class FastDCABot:
                 await update.message.reply_text("❌ Не удалось получить цену")
                 return
             
-            # Берем самую высокую цену покупки как стартовую для лестницы
             highest_price = self.db.get_highest_price(symbol)
             ladder_settings = self.db.get_ladder_settings(symbol)
             
@@ -2124,7 +2103,6 @@ class FastDCABot:
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         ladder = self.db.get_ladder_settings(symbol)
-        # Получаем текущую цену для расчета текущего падения
         current_price = await self.bybit.get_symbol_price(symbol) if self.bybit_initialized else None
         summary = self.db.get_ladder_summary(symbol, current_price)
         
@@ -2246,7 +2224,6 @@ class FastDCABot:
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             ladder = self.db.get_ladder_settings(symbol)
             ladder['base_amount'] = base_amount
-            # Обновляем максимальную сумму (базовая * 3)
             ladder['max_amount'] = base_amount * 3
             self.db.save_ladder_settings(ladder)
             await update.message.reply_text(f"✅ Базовая сумма: {base_amount} USDT\n💰 Максимальная сумма: {base_amount * 3} USDT", reply_markup=self.get_ladder_settings_keyboard())
@@ -2259,7 +2236,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return LADDER_MENU
         await update.message.reply_text("💰 Введите максимальную сумму (USDT):\n*Сумма последнего ордера*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
-        return SET_LADDER_BASE_AMOUNT  # Используем то же состояние, так как это последний шаг
+        return SET_LADDER_BASE_AMOUNT
     
     async def set_ladder_max_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
@@ -2301,23 +2278,27 @@ class FastDCABot:
         orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
         sell_count = len(orders_by_side.get('sell', []))
         buy_count = len(orders_by_side.get('buy', []))
-        await update.message.reply_text(f"📝 *Управление ордерами*\n\nТокен: `{symbol}`\n🔴 Ордера на продажу: `{sell_count}`\n🟢 Ордера на покупку: `{buy_count}`", reply_markup=self.get_orders_management_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text(
+            f"📝 *Управление ордерами*\n\nТокен: `{symbol}`\n🔴 Ордера на продажу: `{sell_count}`\n🟢 Ордера на покупку: `{buy_count}`",
+            reply_markup=self.get_orders_management_keyboard(),
+            parse_mode='Markdown'
+        )
         return MANAGE_ORDERS
     
     async def list_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return ConversationHandler.END
+            return MANAGE_ORDERS
         self._init_bybit()
         if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.")
+            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_orders_management_keyboard())
             return MANAGE_ORDERS
+        
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         coin = symbol.replace('USDT', '')
         orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
         
         message = f"📋 *СПИСОК ОРДЕРОВ*\n\n"
         
-        # Ордера на продажу
         sell_orders = orders_by_side.get('sell', [])
         if sell_orders:
             message += f"🔴 *ОРДЕРА НА ПРОДАЖУ ({len(sell_orders)})*\n"
@@ -2332,7 +2313,6 @@ class FastDCABot:
         else:
             message += f"🔴 *Нет ордеров на продажу*\n\n"
         
-        # Ордера на покупку
         buy_orders = orders_by_side.get('buy', [])
         if buy_orders:
             message += f"🟢 *ОРДЕРА НА ПОКУПКУ ({len(buy_orders)})*\n"
@@ -2346,22 +2326,24 @@ class FastDCABot:
         else:
             message += f"🟢 *Нет ордеров на покупку*"
         
-        await update.message.reply_text(message, parse_mode='Markdown')
+        await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_orders_management_keyboard())
         return MANAGE_ORDERS
     
     async def delete_order_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return ConversationHandler.END
+            return MANAGE_ORDERS
         self._init_bybit()
         if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.")
+            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_orders_management_keyboard())
             return MANAGE_ORDERS
+        
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         coin = symbol.replace('USDT', '')
         open_orders = await self.bybit.get_open_orders(symbol)
         if not open_orders:
             await update.message.reply_text("❌ Нет открытых ордеров", reply_markup=self.get_orders_management_keyboard())
             return MANAGE_ORDERS
+        
         keyboard = []
         for i, order in enumerate(open_orders[:20], 1):
             order_id = order.get('orderId', 'N/A')
@@ -2372,20 +2354,20 @@ class FastDCABot:
             side_text = "Продажа" if side == "Sell" else "Покупка"
             keyboard.append([InlineKeyboardButton(f"{side_emoji} Удалить #{i} - {side_text} {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)}", callback_data=f"order_delete_{order_id}")])
         keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
+        
         await update.message.reply_text("❌ *Выберите ордер для удаления:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return MANAGE_ORDERS
     
     async def edit_order_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return ConversationHandler.END
+            return MANAGE_ORDERS
         self._init_bybit()
         if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.")
+            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_orders_management_keyboard())
             return MANAGE_ORDERS
+        
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         coin = symbol.replace('USDT', '')
-        
-        # Получаем только ордера на ПРОДАЖУ, так как их создает DCA бот
         sell_orders = await self.bybit.get_sell_orders(symbol)
         
         if not sell_orders:
@@ -2397,11 +2379,9 @@ class FastDCABot:
             order_id = order.get('orderId', 'N/A')
             price = float(order.get('price', 0))
             qty = float(order.get('qty', 0))
-            side = order.get('side', 'Sell')
-            side_emoji = "🔴" if side == "Sell" else "🟢"
-            side_text = "Продажа" if side == "Sell" else "Покупка"
-            keyboard.append([InlineKeyboardButton(f"{side_emoji} Изменить #{i} - {side_text} {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)}", callback_data=f"order_edit_{order_id}_{price}_{qty}")])
+            keyboard.append([InlineKeyboardButton(f"🔴 Изменить #{i} - {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)}", callback_data=f"order_edit_{order_id}_{price}_{qty}")])
         keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
+        
         await update.message.reply_text("✏️ *Выберите ордер на продажу для изменения цены:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return MANAGE_ORDERS
     
@@ -2410,7 +2390,6 @@ class FastDCABot:
         await query.answer()
         data = query.data
         
-        # Обработка callback от уведомлений об исполнении ордеров
         if data.startswith("add_order_") or data.startswith("skip_order_"):
             await self.handle_order_execution_callback(update, context)
             return
@@ -2451,7 +2430,7 @@ class FastDCABot:
     
     async def edit_order_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return ConversationHandler.END
+            return MANAGE_ORDERS
         self._init_bybit()
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -2578,17 +2557,13 @@ class FastDCABot:
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         current_price = await self.bybit.get_symbol_price(symbol)
-        
-        # Получаем настройки лестницы
         ladder_settings = self.db.get_ladder_settings(symbol)
         
-        # Рассчитываем текущее падение от цены старта
         drop_from_start = 0
         if ladder_settings['start_price'] > 0 and current_price:
             drop_from_start = ((ladder_settings['start_price'] - current_price) / ladder_settings['start_price']) * 100
             drop_from_start = max(0, drop_from_start)
         
-        # Получаем рекомендацию для ТЕКУЩЕГО падения
         recommendation = self.db.get_recommendation_for_current_drop(drop_from_start, symbol)
         
         msg = f"➕ *Добавление покупки вручную*\n\n"
@@ -2597,7 +2572,6 @@ class FastDCABot:
         if ladder_settings['start_price'] > 0:
             msg += f"📉 Падение от цены старта ({format_price(ladder_settings['start_price'], 4)}): `{drop_from_start:.1f}%`\n\n"
         
-        # Добавляем рекомендацию по мартингейлу для текущего уровня падения
         if recommendation['success']:
             msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
             msg += f"📉 Уровень падения: `{recommendation['drop_percent']:.0f}%`\n"
@@ -2607,7 +2581,6 @@ class FastDCABot:
         msg += f"Введите цену покупки (USDT):"
         
         await update.message.reply_text(msg, reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
-        
         return MANUAL_ADD_PRICE
     
     async def manual_add_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2621,11 +2594,8 @@ class FastDCABot:
                 raise ValueError
             context.user_data['manual_price'] = price
             
-            # Рассчитываем процент падения от цены старта
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             drop_percent = self.db.get_drop_percent_from_start_price(price, symbol)
-            
-            # Получаем рекомендуемую сумму по лестнице для этого процента падения
             recommendation = self.db.get_recommendation_for_current_drop(drop_percent, symbol)
             suggested_amount = recommendation.get('amount_usdt', 1.1) if recommendation['success'] else 1.1
             
@@ -2651,10 +2621,7 @@ class FastDCABot:
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             amount_usdt = price * quantity
             
-            # Рассчитываем процент падения от цены старта
             drop_percent = self.db.get_drop_percent_from_start_price(price, symbol)
-            
-            # Определяем уровень лестницы
             step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
             step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
             
@@ -2709,7 +2676,6 @@ class FastDCABot:
                 date_display = datetime.strptime(purchase['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
             except:
                 date_display = purchase['date'][:10] if purchase['date'] else "N/A"
-            # Убрали отображение процентов падения
             await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
             return EDIT_PURCHASE_SELECT
         except Exception as e:
@@ -2736,7 +2702,6 @@ class FastDCABot:
                 await update.message.reply_text("❌ Покупка не найдена", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
             new_amount_usdt = new_price * purchase['quantity']
-            # Пересчитываем процент падения от цены старта
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             new_drop_percent = self.db.get_drop_percent_from_start_price(new_price, symbol)
             if self.db.update_purchase(purchase_id, price=new_price, amount_usdt=new_amount_usdt, drop_percent=new_drop_percent):
@@ -2863,7 +2828,6 @@ class FastDCABot:
             date_display = datetime.strptime(purchase['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
         except:
             date_display = purchase['date'][:10] if purchase['date'] else "N/A"
-        # Убрали отображение процентов падения
         await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
     
     async def cancel_to_edit_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2911,7 +2875,6 @@ class FastDCABot:
             if amount < 1:
                 raise ValueError
             self.db.set_setting('invest_amount', str(amount))
-            # Обновляем базовую сумму лестницы
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             ladder = self.db.get_ladder_settings(symbol)
             ladder['base_amount'] = amount
@@ -2960,7 +2923,6 @@ class FastDCABot:
                 raise ValueError
             self.db.set_setting('max_drop_percent', str(max_drop))
             self.db.set_setting('max_multiplier', str(max_mult))
-            # Обновляем глубину просадки лестницы
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             ladder = self.db.get_ladder_settings(symbol)
             ladder['max_depth'] = max_drop
@@ -3047,7 +3009,6 @@ class FastDCABot:
         self.db.set_setting('symbol', symbol)
         self.db.set_setting('initial_reference_price', str(price))
         
-        # Берем самую высокую цену покупки как стартовую для лестницы
         highest_price = self.db.get_highest_price(symbol)
         ladder = self.db.get_ladder_settings(symbol)
         
@@ -3175,7 +3136,6 @@ class FastDCABot:
         self.application.add_handler(CallbackQueryHandler(self.handle_order_callback, pattern='^order_'))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
         
-        # Основные кнопки - сначала обрабатываем кнопку настроек отдельно, чтобы она не перехватывалась другими обработчиками
         self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
