@@ -1608,7 +1608,6 @@ class FastDCABot:
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         dca_button = "⏹ Остановить Авто DCA" if is_active else "🚀 Запустить Авто DCA"
         order_execution = self.db.get_order_execution_notify()
-        # Меняем название кнопки в зависимости от состояния
         order_execution_button = "✅ Отслеживание ордеров Вкл" if order_execution else "⏳ Отслеживание ордеров Выкл"
         keyboard = [
             [KeyboardButton("📊 Мой Портфель"), KeyboardButton(dca_button)],
@@ -2073,7 +2072,6 @@ class FastDCABot:
                     
                     if self.authorized_user_id:
                         try:
-                            # Создаем уникальный callback_data для каждого ордера
                             keyboard = InlineKeyboardMarkup([
                                 [
                                     InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
