@@ -2,7 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Исправленная версия - ВСЕ КНОПКИ РАБОТАЮТ
+Исправленная версия - ВСЕ КНОПКИ РАБОТАЮТ + УДАЛЕНИЕ ОРДЕРОВ
 """
 
 import os
@@ -97,7 +97,8 @@ BOT_VERSION = datetime.now().strftime("%y.%m.%d")
     SET_LADDER_BASE_AMOUNT,
     MANUAL_ADD_RECOMMENDATION,
     WAITING_ORDER_CHECK_INTERVAL,
-) = range(32)
+    WAITING_ORDER_ID_TO_CANCEL,  # Новое состояние для ввода ID ордера
+) = range(33)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
@@ -469,6 +470,20 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error updating order status: {e}")
+    
+    def delete_sell_order(self, order_id: str) -> bool:
+        """Удалить ордер из БД по order_id"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM sell_orders WHERE order_id = ?', (order_id,))
+            success = cursor.rowcount > 0
+            conn.commit()
+            conn.close()
+            return success
+        except Exception as e:
+            logger.error(f"Error deleting sell order: {e}")
+            return False
     
     def update_order_price(self, order_id: str, new_price: float, new_profit_percent: float):
         try:
@@ -1418,6 +1433,9 @@ class FastDCABot:
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
+    def get_cancel_keyboard(self):
+        return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    
     def get_settings_keyboard(self):
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("💵 Сумма покупки")],
@@ -1452,9 +1470,6 @@ class FastDCABot:
             [KeyboardButton("🔙 Назад к списку"), KeyboardButton("🏠 Главное меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    def get_cancel_keyboard(self):
-        return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
     def get_confirm_delete_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, удалить"), KeyboardButton("❌ Нет, отмена")]], resize_keyboard=True)
@@ -1627,9 +1642,11 @@ class FastDCABot:
                 reply_markup=self.get_order_management_keyboard(),
                 parse_mode='Markdown'
             )
+            return MANAGE_ORDERS
         except Exception as e:
             logger.error(f"Error in orders_menu: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
+            return ConversationHandler.END
     
     async def show_open_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать текущие открытые ордера"""
@@ -1656,7 +1673,7 @@ class FastDCABot:
                     order_id = order.get('orderId', 'N/A')
                     price = float(order.get('price', 0))
                     qty = float(order.get('qty', 0))
-                    message += f"{i}. `{order_id[:8]}...` - {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)} USDT\n"
+                    message += f"{i}. `{order_id}` - {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)} USDT\n"
                 if len(sell_orders) > 20:
                     message += f"_...и еще {len(sell_orders) - 20}_\n"
                 message += f"\n"
@@ -1670,7 +1687,7 @@ class FastDCABot:
                     order_id = order.get('orderId', 'N/A')
                     price = float(order.get('price', 0))
                     qty = float(order.get('qty', 0))
-                    message += f"{i}. `{order_id[:8]}...` - {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)} USDT\n"
+                    message += f"{i}. `{order_id}` - {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)} USDT\n"
                 if len(buy_orders) > 20:
                     message += f"_...и еще {len(buy_orders) - 20}_\n"
             else:
@@ -1680,6 +1697,134 @@ class FastDCABot:
         except Exception as e:
             logger.error(f"Error showing open orders: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=self.get_order_management_keyboard())
+    
+    async def cancel_order_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало процесса удаления ордера - запрос ID ордера"""
+        if not await self._check_user_fast(update):
+            return
+        
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
+            return
+        
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        
+        # Показываем список открытых ордеров с ID для удобства
+        try:
+            orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
+            
+            message = f"🗑 *УДАЛЕНИЕ ОРДЕРА*\n\n"
+            message += f"🪙 Токен: `{symbol}`\n\n"
+            
+            all_orders = []
+            for order in orders_by_side.get('sell', []):
+                all_orders.append(order)
+            for order in orders_by_side.get('buy', []):
+                all_orders.append(order)
+            
+            if not all_orders:
+                await update.message.reply_text("📭 Нет открытых ордеров для удаления.", reply_markup=self.get_order_management_keyboard())
+                return
+            
+            message += f"📋 *Открытые ордера:*\n\n"
+            for order in all_orders[:20]:
+                side_emoji = "🔴 Продажа" if order.get('side') == 'Sell' else "🟢 Покупка"
+                order_id = order.get('orderId', 'N/A')
+                price = float(order.get('price', 0))
+                qty = float(order.get('qty', 0))
+                message += f"• `{order_id}`\n  {side_emoji} {format_quantity(qty, 6)} @ {format_price(price, 4)} USDT\n\n"
+            
+            message += f"\n✏️ *Введите ID ордера для удаления:*\n"
+            message += f"(ID ордера можно скопировать из списка выше)"
+            
+            await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_cancel_keyboard())
+            return WAITING_ORDER_ID_TO_CANCEL
+            
+        except Exception as e:
+            logger.error(f"Error in cancel_order_start: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=self.get_order_management_keyboard())
+            return MANAGE_ORDERS
+    
+    async def cancel_order_execute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выполнение удаления ордера"""
+        if not await self._check_user_fast(update):
+            return
+        
+        text = update.message.text.strip()
+        if text == "❌ Отмена":
+            await update.message.reply_text("❌ Удаление ордера отменено", reply_markup=self.get_order_management_keyboard())
+            return MANAGE_ORDERS
+        
+        order_id = text.strip()
+        
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
+            return MANAGE_ORDERS
+        
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        
+        try:
+            # Сначала получаем информацию об ордере
+            open_orders = await self.bybit.get_open_orders(symbol)
+            order_to_cancel = None
+            for order in open_orders:
+                if order.get('orderId') == order_id:
+                    order_to_cancel = order
+                    break
+            
+            if not order_to_cancel:
+                await update.message.reply_text(
+                    f"❌ Ордер с ID `{order_id}` не найден среди открытых ордеров.\n\n"
+                    f"Проверьте ID и попробуйте снова, или нажмите Отмена.",
+                    parse_mode='Markdown',
+                    reply_markup=self.get_cancel_keyboard()
+                )
+                return WAITING_ORDER_ID_TO_CANCEL
+            
+            # Отменяем ордер на бирже
+            result = await self.bybit.cancel_order(symbol, order_id)
+            
+            if result['success']:
+                # Удаляем из БД если это sell ордер
+                self.db.delete_sell_order(order_id)
+                self.db.log_action('ORDER_CANCELLED', symbol, f"Ордер {order_id} отменен")
+                
+                side = order_to_cancel.get('side', 'Unknown')
+                price = float(order_to_cancel.get('price', 0))
+                qty = float(order_to_cancel.get('qty', 0))
+                
+                await update.message.reply_text(
+                    f"✅ *Ордер успешно удален!*\n\n"
+                    f"🪙 Токен: `{symbol}`\n"
+                    f"📊 Сторона: `{side}`\n"
+                    f"💰 Цена: `{format_price(price, 4)}` USDT\n"
+                    f"📊 Количество: `{format_quantity(qty, 6)}`\n"
+                    f"🆔 ID: `{order_id}`",
+                    parse_mode='Markdown',
+                    reply_markup=self.get_order_management_keyboard()
+                )
+                return MANAGE_ORDERS
+            else:
+                error_msg = result.get('error', 'Неизвестная ошибка')
+                await update.message.reply_text(
+                    f"❌ *Ошибка при удалении ордера*\n\n"
+                    f"ID: `{order_id}`\n"
+                    f"Ошибка: `{error_msg}`\n\n"
+                    f"Попробуйте снова или нажмите Отмена.",
+                    parse_mode='Markdown',
+                    reply_markup=self.get_cancel_keyboard()
+                )
+                return WAITING_ORDER_ID_TO_CANCEL
+                
+        except Exception as e:
+            logger.error(f"Error in cancel_order_execute: {e}")
+            await update.message.reply_text(
+                f"❌ Ошибка: {str(e)}\n\nПопробуйте снова или нажмите Отмена.",
+                reply_markup=self.get_cancel_keyboard()
+            )
+            return WAITING_ORDER_ID_TO_CANCEL
     
     async def show_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -2836,7 +2981,20 @@ class FastDCABot:
         
         # Обработчики для управления ордерами
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
+        self.application.add_handler(MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
+        
+        # Conversation для удаления ордера
+        cancel_order_conv = ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start)],
+            states={
+                WAITING_ORDER_ID_TO_CANCEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cancel_order_execute)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+            name="cancel_order_conversation",
+            persistent=False,
+        )
+        self.application.add_handler(cancel_order_conv)
         
         # Conversation для настроек
         main_conv = ConversationHandler(
