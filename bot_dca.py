@@ -2,7 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Исправленная версия - ИМПОРТ РАБОТАЕТ
+Исправленная версия - ВСЕ КНОПКИ РАБОТАЮТ
 """
 
 import os
@@ -13,8 +13,6 @@ import json
 import sqlite3
 import re
 import time
-import aiohttp
-import socket
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, List, Optional, Tuple
@@ -119,26 +117,6 @@ def format_quantity(qty: float, decimals: int = 6) -> str:
     return f"{qty:.{decimals}f}"
 
 
-def calculate_ladder_amounts(base_amount: float, max_amount: float, steps_count: int) -> List[float]:
-    amounts = []
-    if steps_count <= 0:
-        return amounts
-    
-    for i in range(steps_count):
-        if steps_count == 1:
-            ratio = 1
-        else:
-            ratio = i / (steps_count - 1) * 3
-        if ratio < 0.1:
-            amount = base_amount
-        else:
-            amount = base_amount * ratio
-        amounts.append(amount)
-    
-    amounts = [min(a, max_amount) for a in amounts]
-    return amounts
-
-
 def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
     if drop_percent <= 0:
         return 0, 0
@@ -175,9 +153,6 @@ def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: floa
 class Database:
     def __init__(self, db_file: str = "dca_bot.db"):
         self.db_file = db_file
-        self.settings_cache = {}
-        self.cache_ttl = 60
-        self.cache_timestamp = 0
         self.init_db()
     
     def init_db(self):
@@ -312,7 +287,7 @@ class Database:
             
             conn.commit()
             conn.close()
-            logger.info(f"Database initialized successfully at {self.db_file}")
+            logger.info(f"Database initialized successfully")
         except Exception as e:
             logger.error(f"DB init error: {e}")
     
@@ -339,43 +314,6 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error setting {key}: {e}")
-    
-    def get_notification_settings(self) -> Dict:
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT enabled, alert_percent, alert_interval_minutes FROM notifications WHERE id = 1')
-            row = cursor.fetchone()
-            conn.close()
-            if row:
-                return {'enabled': bool(row[0]), 'alert_percent': row[1], 'alert_interval_minutes': row[2]}
-            return {'enabled': True, 'alert_percent': 10.0, 'alert_interval_minutes': 30}
-        except Exception as e:
-            logger.error(f"Error getting notification settings: {e}")
-            return {'enabled': True, 'alert_percent': 10.0, 'alert_interval_minutes': 30}
-    
-    def update_notification_settings(self, **kwargs):
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            updates = []
-            values = []
-            if 'enabled' in kwargs:
-                updates.append("enabled = ?")
-                values.append(1 if kwargs['enabled'] else 0)
-            if 'alert_percent' in kwargs:
-                updates.append("alert_percent = ?")
-                values.append(kwargs['alert_percent'])
-            if 'alert_interval_minutes' in kwargs:
-                updates.append("alert_interval_minutes = ?")
-                values.append(kwargs['alert_interval_minutes'])
-            if updates:
-                values.append(1)
-                cursor.execute(f"UPDATE notifications SET {', '.join(updates)}, last_check = CURRENT_TIMESTAMP WHERE id = ?", values)
-                conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.error(f"Error updating notification settings: {e}")
     
     def add_purchase(self, symbol: str, amount_usdt: float, price: float, 
                      quantity: float, multiplier: float = 1.0, drop_percent: float = 0,
@@ -565,19 +503,6 @@ class Database:
         except Exception as e:
             logger.error(f"Error setting dca start: {e}")
     
-    def get_dca_start(self) -> Optional[Dict]:
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM dca_start WHERE id = 1')
-            row = cursor.fetchone()
-            conn.close()
-            return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Error getting dca start: {e}")
-            return None
-    
     def get_ladder_settings(self, symbol: str = None) -> Dict:
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
@@ -663,15 +588,10 @@ class Database:
         last_purchases = sorted([p for p in purchases if p.get('step_level', 0) > 0], key=lambda x: x['date'], reverse=True)
         
         max_drop = 0
-        last_buy_price = settings['start_price']
         
         for p in last_purchases:
             if p.get('drop_percent', 0) > max_drop:
                 max_drop = p.get('drop_percent', 0)
-                last_buy_price = p['price']
-        
-        if max_drop == 0:
-            last_buy_price = settings['start_price']
         
         current_drop = ((settings['start_price'] - current_price) / settings['start_price']) * 100
         
@@ -867,21 +787,17 @@ class Database:
             logger.error(f"Error adding executed order: {e}")
             return False
     
-    def get_unadded_executed_orders(self, symbol: str = None) -> List[Dict]:
+    def is_order_notified(self, order_id: str) -> bool:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            if symbol:
-                cursor.execute('SELECT * FROM executed_orders WHERE symbol = ? AND added_to_stats = 0 ORDER BY executed_at DESC', (symbol,))
-            else:
-                cursor.execute('SELECT * FROM executed_orders WHERE added_to_stats = 0 ORDER BY executed_at DESC')
-            rows = cursor.fetchall()
+            cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ?', (order_id,))
+            exists = cursor.fetchone() is not None
             conn.close()
-            return [dict(row) for row in rows]
+            return exists
         except Exception as e:
-            logger.error(f"Error getting unadded executed orders: {e}")
-            return []
+            logger.error(f"Error checking order notified: {e}")
+            return False
     
     def mark_order_as_added(self, order_id: str) -> bool:
         try:
@@ -894,18 +810,6 @@ class Database:
             return success
         except Exception as e:
             logger.error(f"Error marking order as added: {e}")
-            return False
-    
-    def is_order_notified(self, order_id: str) -> bool:
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ?', (order_id,))
-            exists = cursor.fetchone() is not None
-            conn.close()
-            return exists
-        except Exception as e:
-            logger.error(f"Error checking order notified: {e}")
             return False
     
     def get_order_execution_notify(self) -> bool:
@@ -952,7 +856,7 @@ class Database:
             ladder_rows = cursor.fetchall()
             ladder_settings = []
             for row in ladder_rows:
-                ladder_dict = {
+                ladder_settings.append({
                     'id': row[0],
                     'symbol': row[1],
                     'start_price': row[2],
@@ -963,8 +867,7 @@ class Database:
                     'current_drop_percent': row[7],
                     'last_buy_price': row[8],
                     'created_at': row[9]
-                }
-                ladder_settings.append(ladder_dict)
+                })
             
             cursor.execute('SELECT * FROM executed_orders')
             executed_rows = cursor.fetchall()
@@ -1167,17 +1070,6 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Session init error: {e}")
     
-    async def test_connection(self) -> Tuple[bool, str]:
-        try:
-            if not self.session:
-                self._init_session()
-            response = self.session.get_account_info()
-            if response['retCode'] == 0:
-                return True, "✅ Bybit API подключен"
-            return False, f"❌ Bybit API ошибка: {response['retMsg']}"
-        except Exception as e:
-            return False, f"❌ Bybit API ошибка: {str(e)}"
-    
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
         now = time.time()
         if symbol in self._cache_time and now - self._cache_time.get(symbol, 0) < self._cache_ttl:
@@ -1262,22 +1154,6 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error getting order history: {e}")
             return []
-    
-    async def get_executed_orders_since(self, symbol: str, since: datetime) -> List[Dict]:
-        orders = await self.get_order_history(symbol, limit=100)
-        executed = []
-        for order in orders:
-            if order.get('orderStatus') == 'Filled' and order.get('side') == 'Buy':
-                order_time = datetime.fromtimestamp(int(order.get('createdTime', '0')) / 1000)
-                if order_time > since:
-                    executed.append({
-                        'order_id': order.get('orderId'),
-                        'price': float(order.get('avgPrice', order.get('price', 0))),
-                        'quantity': float(order.get('qty', 0)),
-                        'amount_usdt': float(order.get('cumExecValue', 0)),
-                        'executed_at': order_time
-                    })
-        return executed
     
     async def cancel_order(self, symbol: str, order_id: str) -> Dict:
         try:
@@ -1505,6 +1381,7 @@ class FastDCABot:
         self.scheduler_running = False
         self.authorized_user_id = None
         self.pending_executed_order = None
+        self.import_waiting = False  # Флаг ожидания файла для импорта
         
         self.setup_handlers()
     
@@ -1538,14 +1415,6 @@ class FastDCABot:
             [KeyboardButton("📋 Список открытых ордеров"), KeyboardButton("❌ Удалить ордер")],
             [KeyboardButton("✏️ Изменить цену ордера"), KeyboardButton("⚙️ Настройки отслеживания")],
             [KeyboardButton("🔙 Назад в меню")],
-        ]
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    def get_order_tracking_settings_keyboard(self):
-        interval = self.db.get_order_check_interval()
-        keyboard = [
-            [KeyboardButton(f"🕐 Интервал проверки ({interval} мин)")],
-            [KeyboardButton("🔙 Назад к ордерам")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -1648,58 +1517,129 @@ class FastDCABot:
             reply_markup=self.get_main_keyboard()
         )
     
-    async def order_tracking_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def export_database(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Экспорт базы данных - отдельный обработчик вне ConversationHandler"""
         if not await self._check_user_fast(update):
-            return MANAGE_ORDERS
+            return
         
-        interval = self.db.get_order_check_interval()
-        
-        await update.message.reply_text(
-            f"⚙️ *Настройки отслеживания ордеров*\n\n"
-            f"🕐 Интервал проверки: {interval} минут\n\n"
-            f"Бот проверяет исполненные ордера каждые {interval} минут\n"
-            f"и предлагает добавить их в статистику.\n\n"
-            f"Введите новый интервал в минутах (от 1 до 1440):",
-            parse_mode='Markdown',
-            reply_markup=self.get_cancel_keyboard()
-        )
-        return WAITING_ORDER_CHECK_INTERVAL
+        await update.message.reply_text("⏳ Экспортирую...")
+        success, count, file_path = self.db.export_database()
+        if success:
+            await update.message.reply_text(f"✅ Экспортировано! Записей: {count}", reply_markup=self.get_settings_keyboard())
+            try:
+                with open(file_path, 'rb') as f:
+                    await update.message.reply_document(document=InputFile(f, filename=DB_EXPORT_FILE), caption="💾 Файл базы данных")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка отправки: {e}", reply_markup=self.get_settings_keyboard())
+        else:
+            await update.message.reply_text(f"❌ Ошибка экспорта: {file_path}", reply_markup=self.get_settings_keyboard())
     
-    async def set_order_check_interval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
+    async def import_database_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начать импорт базы данных"""
+        if not await self._check_user_fast(update):
+            return
         
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
-            return ConversationHandler.END
+        self.import_waiting = True
+        await update.message.reply_text(
+            "📥 *ИМПОРТ БАЗЫ*\n\n"
+            "Отправьте файл .json\n"
+            "⚠️ *Все записи будут заменены!*\n\n"
+            "Или нажмите ❌ Отмена для отмены",
+            reply_markup=self.get_cancel_keyboard(),
+            parse_mode='Markdown'
+        )
+    
+    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка отправленных документов (для импорта)"""
+        if not await self._check_user_fast(update):
+            return
+        
+        if not self.import_waiting:
+            await update.message.reply_text("Сначала нажмите кнопку '📥 Импорт базы' в меню настроек")
+            return
+        
+        if not update.message.document:
+            await update.message.reply_text("Пожалуйста, отправьте файл .json", reply_markup=self.get_cancel_keyboard())
+            return
+        
+        if not update.message.document.file_name.endswith('.json'):
+            await update.message.reply_text("❌ Файл должен иметь расширение .json", reply_markup=self.get_cancel_keyboard())
+            return
         
         try:
-            interval = int(text)
-            if interval < 1 or interval > 1440:
-                raise ValueError
+            await update.message.reply_text("⏳ Импортирую...")
+            file = await context.bot.get_file(update.message.document.file_id)
+            temp_file = f"temp_import_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+            await file.download_to_drive(temp_file)
+            success, message = self.db.import_database(temp_file)
             
-            self.db.set_order_check_interval(interval)
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            
+            self.import_waiting = False
+            
+            if success:
+                await update.message.reply_text(f"✅ {message}", reply_markup=self.get_main_keyboard())
+                # Обновляем кэш
+                self.bybit_initialized = False
+                self._init_bybit()
+            else:
+                await update.message.reply_text(f"❌ Ошибка: {message}", reply_markup=self.get_main_keyboard())
+        except Exception as e:
+            logger.error(f"Error in import: {e}")
+            self.import_waiting = False
+            await update.message.reply_text(f"❌ Ошибка при импорте: {str(e)}", reply_markup=self.get_main_keyboard())
+    
+    async def cancel_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена импорта"""
+        if self.import_waiting:
+            self.import_waiting = False
+            await update.message.reply_text("❌ Импорт отменен", reply_markup=self.get_main_keyboard())
+        else:
+            await update.message.reply_text("Нет активного импорта", reply_markup=self.get_main_keyboard())
+    
+    async def orders_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Меню управления ордерами"""
+        if not await self._check_user_fast(update):
+            return
+        
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Bybit API не инициализирован.")
+            return
+        
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        
+        try:
+            orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
+            sell_count = len(orders_by_side.get('sell', []))
+            buy_count = len(orders_by_side.get('buy', []))
             
             await update.message.reply_text(
-                f"✅ Интервал проверки установлен: {interval} минут\n\n"
-                f"Бот будет проверять исполненные ордера каждые {interval} минут.",
-                reply_markup=self.get_main_keyboard()
+                f"📝 *Управление ордерами*\n\n"
+                f"🪙 Токен: `{symbol}`\n"
+                f"🔴 Ордера на продажу: `{sell_count}`\n"
+                f"🟢 Ордера на покупку: `{buy_count}`\n\n"
+                f"Выберите действие:",
+                reply_markup=self.get_order_management_keyboard(),
+                parse_mode='Markdown'
             )
-            return ConversationHandler.END
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Некорректное значение. Введите число от 1 до 1440.",
-                reply_markup=self.get_cancel_keyboard()
-            )
-            return WAITING_ORDER_CHECK_INTERVAL
+        except Exception as e:
+            logger.error(f"Error in orders_menu: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {e}")
     
     async def show_open_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать текущие открытые ордера"""
         if not await self._check_user_fast(update):
-            return MANAGE_ORDERS
+            return
         
         self._init_bybit()
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
+            return
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         coin = symbol.replace('USDT', '')
@@ -1737,325 +1677,9 @@ class FastDCABot:
                 message += f"🟢 *Нет ордеров на покупку*"
             
             await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
-            
         except Exception as e:
             logger.error(f"Error showing open orders: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
-    
-    async def orders_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return ConversationHandler.END
-        
-        self._init_bybit()
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.")
-            return ConversationHandler.END
-        
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        
-        try:
-            orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
-            sell_count = len(orders_by_side.get('sell', []))
-            buy_count = len(orders_by_side.get('buy', []))
-            
-            await update.message.reply_text(
-                f"📝 *Управление ордерами*\n\n"
-                f"🪙 Токен: `{symbol}`\n"
-                f"🔴 Ордера на продажу: `{sell_count}`\n"
-                f"🟢 Ордера на покупку: `{buy_count}`\n\n"
-                f"Выберите действие:",
-                reply_markup=self.get_order_management_keyboard(),
-                parse_mode='Markdown'
-            )
-            return MANAGE_ORDERS
-        except Exception as e:
-            logger.error(f"Error in orders_menu: {e}")
-            await update.message.reply_text(f"❌ Ошибка: {e}")
-            return ConversationHandler.END
-    
-    async def delete_order_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return MANAGE_ORDERS
-        
-        self._init_bybit()
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
-        
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        coin = symbol.replace('USDT', '')
-        open_orders = await self.bybit.get_open_orders(symbol)
-        
-        if not open_orders:
-            await update.message.reply_text("❌ Нет открытых ордеров", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
-        
-        keyboard = []
-        for i, order in enumerate(open_orders[:20], 1):
-            order_id = order.get('orderId', 'N/A')
-            price = float(order.get('price', 0))
-            qty = float(order.get('qty', 0))
-            side = order.get('side', 'Unknown')
-            side_emoji = "🔴" if side == "Sell" else "🟢"
-            side_text = "Продажа" if side == "Sell" else "Покупка"
-            keyboard.append([InlineKeyboardButton(f"{side_emoji} Удалить #{i} - {side_text} {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)}", callback_data=f"order_delete_{order_id}")])
-        keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
-        
-        await update.message.reply_text("❌ *Выберите ордер для удаления:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return MANAGE_ORDERS
-    
-    async def edit_order_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return MANAGE_ORDERS
-        
-        self._init_bybit()
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
-        
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        coin = symbol.replace('USDT', '')
-        sell_orders = await self.bybit.get_sell_orders(symbol)
-        
-        if not sell_orders:
-            await update.message.reply_text("❌ Нет ордеров на продажу для изменения цены\n(можно изменять только ордера на продажу)", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
-        
-        keyboard = []
-        for i, order in enumerate(sell_orders[:20], 1):
-            order_id = order.get('orderId', 'N/A')
-            price = float(order.get('price', 0))
-            qty = float(order.get('qty', 0))
-            keyboard.append([InlineKeyboardButton(f"🔴 Изменить #{i} - {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)}", callback_data=f"order_edit_{order_id}_{price}_{qty}")])
-        keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
-        
-        await update.message.reply_text("✏️ *Выберите ордер на продажу для изменения цены:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return MANAGE_ORDERS
-    
-    async def handle_order_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        data = query.data
-        
-        if data.startswith("add_order_") or data.startswith("skip_order_"):
-            await self.handle_order_execution_callback(update, context)
-            return
-        
-        if data == "order_cancel":
-            await query.edit_message_text("✅ Отменено")
-            return
-        
-        if data.startswith("order_delete_"):
-            order_id = data.replace("order_delete_", "")
-            await self.process_order_delete(update, context, order_id)
-        elif data.startswith("order_edit_"):
-            parts = data.split("_")
-            if len(parts) >= 4:
-                order_id = parts[2]
-                current_price = float(parts[3])
-                qty = float(parts[4]) if len(parts) > 4 else 0
-                await self.process_order_edit_start(update, context, order_id, current_price, qty)
-    
-    async def process_order_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
-        self._init_bybit()
-        if not self.bybit_initialized:
-            await update.callback_query.edit_message_text("❌ Bybit API не инициализирован.")
-            return
-        
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        result = await self.bybit.cancel_order(symbol, order_id)
-        
-        if result['success']:
-            self.db.update_sell_order_status(order_id, 'cancelled')
-            await update.callback_query.edit_message_text("✅ Ордер удален!")
-        else:
-            await update.callback_query.edit_message_text(f"❌ Ошибка: {result.get('error', 'Unknown')}")
-    
-    async def process_order_edit_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str, current_price: float, qty: float):
-        context.user_data['editing_order_id'] = order_id
-        context.user_data['editing_order_qty'] = qty
-        context.user_data['editing_order_current_price'] = current_price
-        await update.callback_query.edit_message_text(f"✏️ Введите новую цену (текущая: {format_price(current_price, 4)}):")
-        context.user_data['current_state'] = EDIT_ORDER_PRICE
-    
-    async def edit_order_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return MANAGE_ORDERS
-        
-        self._init_bybit()
-        text = update.message.text.strip()
-        
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
-        
-        try:
-            new_price = float(text)
-            order_id = context.user_data.get('editing_order_id')
-            old_price = context.user_data.get('editing_order_current_price', 0)
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
-            
-            if not order_id:
-                await update.message.reply_text("❌ Ошибка", reply_markup=self.get_order_management_keyboard())
-                return MANAGE_ORDERS
-            
-            result = await self.bybit.amend_order_price(symbol, order_id, new_price)
-            
-            if result['success']:
-                self.db.update_order_price(order_id, new_price, 0)
-                await update.message.reply_text(f"✅ Цена изменена: {format_price(old_price, 4)} -> {format_price(new_price, 4)}", reply_markup=self.get_order_management_keyboard())
-            else:
-                await update.message.reply_text(f"❌ Ошибка: {result.get('error', 'Unknown')}", reply_markup=self.get_order_management_keyboard())
-        
-        except ValueError:
-            await update.message.reply_text("❌ Некорректная цена", reply_markup=self.get_order_management_keyboard())
-            return EDIT_ORDER_PRICE
-        
-        context.user_data.pop('editing_order_id', None)
-        return MANAGE_ORDERS
-    
-    async def check_executed_orders_loop(self):
-        logger.info("Executed orders checker loop started")
-        last_check = datetime.now()
-        
-        while self.scheduler_running:
-            try:
-                interval_minutes = self.db.get_order_check_interval()
-                await asyncio.sleep(interval_minutes * 60)
-                
-                if not self.db.get_order_execution_notify():
-                    continue
-                
-                if not self.bybit_initialized:
-                    self._init_bybit()
-                
-                if not self.bybit_initialized:
-                    continue
-                
-                if (datetime.now() - last_check).total_seconds() < interval_minutes * 60:
-                    continue
-                
-                last_check = datetime.now()
-                
-                symbol = self.db.get_setting('symbol', 'TONUSDT')
-                new_orders = await self.strategy.check_executed_buy_orders(symbol)
-                
-                for order in new_orders:
-                    if self.db.is_order_notified(order['order_id']):
-                        continue
-                    
-                    msg = (
-                        f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
-                        f"🪙 Токен: `{symbol}`\n"
-                        f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
-                        f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
-                        f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
-                        f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                        f"❗ *Добавить в статистику покупок?*"
-                    )
-                    
-                    self.pending_executed_order = {
-                        'order_id': order['order_id'],
-                        'symbol': symbol,
-                        'price': order['price'],
-                        'quantity': order['quantity'],
-                        'amount_usdt': order['amount_usdt'],
-                        'executed_at': order['executed_at']
-                    }
-                    
-                    if self.authorized_user_id:
-                        try:
-                            keyboard = InlineKeyboardMarkup([
-                                [
-                                    InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
-                                    InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
-                                ]
-                            ])
-                            await self.application.bot.send_message(
-                                chat_id=self.authorized_user_id,
-                                text=msg,
-                                parse_mode='Markdown',
-                                reply_markup=keyboard
-                            )
-                        except Exception as e:
-                            logger.error(f"Error sending order notification: {e}")
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Executed orders checker error: {e}")
-    
-    async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        
-        if data.startswith("add_order_"):
-            order_id = data.replace("add_order_", "")
-            await self.add_executed_order_to_stats(update, context, order_id)
-        elif data.startswith("skip_order_"):
-            order_id = data.replace("skip_order_", "")
-            await self.skip_executed_order(update, context, order_id)
-    
-    async def add_executed_order_to_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM executed_orders WHERE order_id = ?', (order_id,))
-        order = cursor.fetchone()
-        conn.close()
-        
-        if not order:
-            await update.callback_query.edit_message_text("❌ Ордер не найден в базе.")
-            return
-        
-        order_dict = dict(order)
-        
-        if order_dict.get('added_to_stats', 0) == 1:
-            await update.callback_query.edit_message_text("ℹ️ Этот ордер уже был добавлен в статистику.")
-            return
-        
-        drop_percent = self.db.get_drop_percent_from_start_price(order_dict['price'], order_dict['symbol'])
-        step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
-        step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
-        
-        purchase_id = self.db.add_purchase(
-            symbol=order_dict['symbol'],
-            amount_usdt=order_dict['amount_usdt'],
-            price=order_dict['price'],
-            quantity=order_dict['quantity'],
-            multiplier=1.0,
-            drop_percent=drop_percent,
-            step_level=step_level,
-            date=order_dict['executed_at']
-        )
-        
-        if purchase_id:
-            self.db.mark_order_as_added(order_id)
-            
-            await update.callback_query.edit_message_text(
-                f"✅ *Покупка добавлена в статистику!*\n\n"
-                f"🪙 Токен: `{order_dict['symbol']}`\n"
-                f"💰 Цена: `{format_price(order_dict['price'], 4)}` USDT\n"
-                f"📊 Количество: `{format_quantity(order_dict['quantity'], 6)}`\n"
-                f"💵 Сумма: `{order_dict['amount_usdt']:.2f}` USDT\n"
-                f"📉 Падение: `{drop_percent:.1f}%`\n"
-                f"📊 Уровень: {step_level}\n"
-                f"🆔 ID покупки: `{purchase_id}`",
-                parse_mode='Markdown'
-            )
-            
-            self.db.log_action('EXECUTED_ORDER_ADDED', order_dict['symbol'], 
-                              f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']}")
-        else:
-            await update.callback_query.edit_message_text("❌ Ошибка при добавлении покупки в статистику.")
-    
-    async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
-        self.db.mark_order_as_added(order_id)
-        await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
     
     async def show_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -2107,7 +1731,6 @@ class FastDCABot:
                     message += f"{emoji} PnL: `{pnl_percent:+.2f}%` ({pnl_usd:+.2f} USDT)\n\n"
             
             await update.message.reply_text(message, parse_mode='Markdown')
-            
         except Exception as e:
             logger.error(f"Error in show_portfolio: {e}")
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
@@ -2172,7 +1795,6 @@ class FastDCABot:
                 text += f"Максимальная сумма: `{ladder_settings['max_amount']}` USDT"
             
             await update.message.reply_text(text, parse_mode='Markdown')
-            
         except Exception as e:
             logger.error(f"Error in show_dca_stats_detailed: {e}")
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
@@ -2252,6 +1874,194 @@ class FastDCABot:
                 f"📉 Макс. просадка: {MAX_DROP_DEPTH}%",
                 reply_markup=self.get_main_keyboard()
             )
+    
+    # ============= НАСТРОЙКИ =============
+    
+    async def settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_user_fast(update):
+            return
+        
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        invest_amount = self.db.get_setting('invest_amount', '1.1')
+        profit_percent = self.db.get_setting('profit_percent', '5')
+        schedule_time = self.db.get_setting('schedule_time', '09:00')
+        frequency_hours = self.db.get_setting('frequency_hours', '24')
+        
+        await update.message.reply_text(
+            f"⚙️ *Настройки*\n\n"
+            f"🪙 Токен: `{symbol}`\n"
+            f"💵 Сумма: `{invest_amount}` USDT\n"
+            f"📈 Прибыль: `{profit_percent}%`\n"
+            f"⏰ Время: `{schedule_time}`\n"
+            f"🔄 Частота: `{frequency_hours}`ч\n\n"
+            f"Выберите параметр для изменения:",
+            reply_markup=self.get_settings_keyboard(),
+            parse_mode='Markdown'
+        )
+        return SELECTING_ACTION
+    
+    async def set_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"💵 Введите сумму (текущая: {self.db.get_setting('invest_amount', '1.1')}):\n*Это базовая сумма для лестницы*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        return SET_AMOUNT
+    
+    async def set_amount_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        try:
+            amount = float(text)
+            if amount < 1:
+                raise ValueError
+            self.db.set_setting('invest_amount', str(amount))
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            ladder = self.db.get_ladder_settings(symbol)
+            ladder['base_amount'] = amount
+            ladder['max_amount'] = amount * 3
+            self.db.save_ladder_settings(ladder)
+            await update.message.reply_text(f"✅ Сумма изменена на {amount} USDT\n🪜 Базовая сумма лестницы обновлена", reply_markup=self.get_settings_keyboard())
+        except ValueError:
+            await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_settings_keyboard())
+        return SELECTING_ACTION
+    
+    async def set_profit_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"📊 Введите процент прибыли (текущий: {self.db.get_setting('profit_percent', '5')}%):", reply_markup=self.get_cancel_keyboard())
+        return SET_PROFIT_PERCENT
+    
+    async def set_profit_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        try:
+            percent = float(text)
+            if percent < 0.1:
+                raise ValueError
+            self.db.set_setting('profit_percent', str(percent))
+            await update.message.reply_text(f"✅ Процент изменен на {percent}%", reply_markup=self.get_settings_keyboard())
+        except ValueError:
+            await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_settings_keyboard())
+        return SELECTING_ACTION
+    
+    async def set_drop_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"📉 Введите макс. падение % и множитель (текущие: {self.db.get_setting('max_drop_percent', '60')}% x{self.db.get_setting('max_multiplier', '3')}):\nНапример: 60 3", reply_markup=self.get_cancel_keyboard())
+        return SET_MAX_DROP
+    
+    async def set_drop_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        try:
+            parts = text.split()
+            if len(parts) != 2:
+                raise ValueError
+            max_drop = float(parts[0])
+            max_mult = float(parts[1])
+            if max_drop < 10 or max_drop > 90 or max_mult < 1.5 or max_mult > 10:
+                raise ValueError
+            self.db.set_setting('max_drop_percent', str(max_drop))
+            self.db.set_setting('max_multiplier', str(max_mult))
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            ladder = self.db.get_ladder_settings(symbol)
+            ladder['max_depth'] = max_drop
+            self.db.save_ladder_settings(ladder)
+            await update.message.reply_text(f"✅ Настройки обновлены: {max_drop}% x{max_mult}\n🪜 Глубина просадки лестницы обновлена", reply_markup=self.get_settings_keyboard())
+        except Exception:
+            await update.message.reply_text("❌ Ошибка формата. Используйте: 60 3", reply_markup=self.get_settings_keyboard())
+        return SELECTING_ACTION
+    
+    async def set_time_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '09:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
+        return SET_SCHEDULE_TIME
+    
+    async def set_time_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        time_str = update.message.text.strip()
+        if time_str in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        try:
+            datetime.strptime(time_str, "%H:%M")
+            self.db.set_setting('schedule_time', time_str)
+            await update.message.reply_text(f"✅ Время изменено на {time_str}", reply_markup=self.get_settings_keyboard())
+        except ValueError:
+            await update.message.reply_text("❌ Некорректный формат. Используйте ЧЧ:ММ", reply_markup=self.get_settings_keyboard())
+        return SELECTING_ACTION
+    
+    async def set_frequency_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"🔄 Введите частоту в часах (текущая: {self.db.get_setting('frequency_hours', '24')}):", reply_markup=self.get_cancel_keyboard())
+        return SET_FREQUENCY_HOURS
+    
+    async def set_frequency_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        try:
+            hours = int(text)
+            if hours < 1 or hours > 720:
+                raise ValueError
+            self.db.set_setting('frequency_hours', str(hours))
+            await update.message.reply_text(f"✅ Частота изменена на {hours} часов", reply_markup=self.get_settings_keyboard())
+        except ValueError:
+            await update.message.reply_text("❌ Введите число от 1 до 720", reply_markup=self.get_settings_keyboard())
+        return SELECTING_ACTION
+    
+    async def set_symbol_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_user_fast(update):
+            return SELECTING_ACTION
+        await update.message.reply_text(f"🪙 Выберите токен или введите свой\nТекущий: {self.db.get_setting('symbol', 'TONUSDT')}", reply_markup=self.get_symbol_selection_keyboard())
+        return SELECTING_SYMBOL
+    
+    async def process_symbol_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if text == "❌ Отмена":
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        if text == "✏️ Ввести свой токен":
+            await update.message.reply_text("✏️ Введите символ токена (например: TONUSDT):", reply_markup=self.get_cancel_keyboard())
+            return SET_SYMBOL_MANUAL
+        if text in POPULAR_SYMBOLS:
+            return await self._validate_and_set_symbol(update, text)
+        else:
+            await update.message.reply_text("❌ Неверный выбор.", reply_markup=self.get_symbol_selection_keyboard())
+            return SELECTING_SYMBOL
+    
+    async def set_symbol_manual(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        symbol = update.message.text.upper().strip()
+        if symbol in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        return await self._validate_and_set_symbol(update, symbol)
+    
+    async def _validate_and_set_symbol(self, update: Update, symbol: str) -> int:
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        price = await self.bybit.get_symbol_price(symbol)
+        if not price:
+            await update.message.reply_text(f"❌ Символ {symbol} не найден.", reply_markup=self.get_symbol_selection_keyboard())
+            return SELECTING_SYMBOL
+        self.db.set_setting('symbol', symbol)
+        self.db.set_setting('initial_reference_price', str(price))
+        
+        highest_price = self.db.get_highest_price(symbol)
+        ladder = self.db.get_ladder_settings(symbol)
+        
+        if highest_price > 0:
+            ladder['start_price'] = highest_price
+            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT\n🪜 Стартовая цена лестницы: {format_price(highest_price, 4)} USDT (по самой высокой цене покупки)")
+        elif ladder['start_price'] <= 0:
+            ladder['start_price'] = price
+            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT\n🪜 Стартовая цена лестницы: {format_price(price, 4)} USDT")
+        else:
+            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT")
+        
+        ladder['last_buy_price'] = ladder['start_price']
+        self.db.save_ladder_settings(ladder)
+        
+        return SELECTING_ACTION
     
     async def ladder_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -2813,266 +2623,15 @@ class FastDCABot:
         else:
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
     
-    async def settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return ConversationHandler.END
-        
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        invest_amount = self.db.get_setting('invest_amount', '1.1')
-        profit_percent = self.db.get_setting('profit_percent', '5')
-        schedule_time = self.db.get_setting('schedule_time', '09:00')
-        frequency_hours = self.db.get_setting('frequency_hours', '24')
-        
-        await update.message.reply_text(
-            f"⚙️ *Настройки*\n\n"
-            f"🪙 Токен: `{symbol}`\n"
-            f"💵 Сумма: `{invest_amount}` USDT\n"
-            f"📈 Прибыль: `{profit_percent}%`\n"
-            f"⏰ Время: `{schedule_time}`\n"
-            f"🔄 Частота: `{frequency_hours}`ч",
-            reply_markup=self.get_settings_keyboard(),
-            parse_mode='Markdown'
-        )
-        return SELECTING_ACTION
-    
-    async def set_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"💵 Введите сумму (текущая: {self.db.get_setting('invest_amount', '1.1')}):\n*Это базовая сумма для лестницы*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
-        return SET_AMOUNT
-    
-    async def set_amount_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            amount = float(text)
-            if amount < 1:
-                raise ValueError
-            self.db.set_setting('invest_amount', str(amount))
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
-            ladder = self.db.get_ladder_settings(symbol)
-            ladder['base_amount'] = amount
-            ladder['max_amount'] = amount * 3
-            self.db.save_ladder_settings(ladder)
-            await update.message.reply_text(f"✅ Сумма изменена на {amount} USDT\n🪜 Базовая сумма лестницы обновлена", reply_markup=self.get_settings_keyboard())
-        except ValueError:
-            await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def set_profit_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"📊 Введите процент прибыли (текущий: {self.db.get_setting('profit_percent', '5')}%):", reply_markup=self.get_cancel_keyboard())
-        return SET_PROFIT_PERCENT
-    
-    async def set_profit_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            percent = float(text)
-            if percent < 0.1:
-                raise ValueError
-            self.db.set_setting('profit_percent', str(percent))
-            await update.message.reply_text(f"✅ Процент изменен на {percent}%", reply_markup=self.get_settings_keyboard())
-        except ValueError:
-            await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def set_drop_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"📉 Введите макс. падение % и множитель (текущие: {self.db.get_setting('max_drop_percent', '60')}% x{self.db.get_setting('max_multiplier', '3')}):\nНапример: 60 3", reply_markup=self.get_cancel_keyboard())
-        return SET_MAX_DROP
-    
-    async def set_drop_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            parts = text.split()
-            if len(parts) != 2:
-                raise ValueError
-            max_drop = float(parts[0])
-            max_mult = float(parts[1])
-            if max_drop < 10 or max_drop > 90 or max_mult < 1.5 or max_mult > 10:
-                raise ValueError
-            self.db.set_setting('max_drop_percent', str(max_drop))
-            self.db.set_setting('max_multiplier', str(max_mult))
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
-            ladder = self.db.get_ladder_settings(symbol)
-            ladder['max_depth'] = max_drop
-            self.db.save_ladder_settings(ladder)
-            await update.message.reply_text(f"✅ Настройки обновлены: {max_drop}% x{max_mult}\n🪜 Глубина просадки лестницы обновлена", reply_markup=self.get_settings_keyboard())
-        except Exception:
-            await update.message.reply_text("❌ Ошибка формата. Используйте: 60 3", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def set_time_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '09:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
-        return SET_SCHEDULE_TIME
-    
-    async def set_time_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        time_str = update.message.text.strip()
-        if time_str in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            datetime.strptime(time_str, "%H:%M")
-            self.db.set_setting('schedule_time', time_str)
-            await update.message.reply_text(f"✅ Время изменено на {time_str}", reply_markup=self.get_settings_keyboard())
-        except ValueError:
-            await update.message.reply_text("❌ Некорректный формат. Используйте ЧЧ:ММ", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def set_frequency_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"🔄 Введите частоту в часах (текущая: {self.db.get_setting('frequency_hours', '24')}):", reply_markup=self.get_cancel_keyboard())
-        return SET_FREQUENCY_HOURS
-    
-    async def set_frequency_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            hours = int(text)
-            if hours < 1 or hours > 720:
-                raise ValueError
-            self.db.set_setting('frequency_hours', str(hours))
-            await update.message.reply_text(f"✅ Частота изменена на {hours} часов", reply_markup=self.get_settings_keyboard())
-        except ValueError:
-            await update.message.reply_text("❌ Введите число от 1 до 720", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def set_symbol_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return SELECTING_ACTION
-        await update.message.reply_text(f"🪙 Выберите токен или введите свой\nТекущий: {self.db.get_setting('symbol', 'TONUSDT')}", reply_markup=self.get_symbol_selection_keyboard())
-        return SELECTING_SYMBOL
-    
-    async def process_symbol_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        if text == "✏️ Ввести свой токен":
-            await update.message.reply_text("✏️ Введите символ токена (например: TONUSDT):", reply_markup=self.get_cancel_keyboard())
-            return SET_SYMBOL_MANUAL
-        if text in POPULAR_SYMBOLS:
-            return await self._validate_and_set_symbol(update, text)
-        else:
-            await update.message.reply_text("❌ Неверный выбор.", reply_markup=self.get_symbol_selection_keyboard())
-            return SELECTING_SYMBOL
-    
-    async def set_symbol_manual(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        symbol = update.message.text.upper().strip()
-        if symbol in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        return await self._validate_and_set_symbol(update, symbol)
-    
-    async def _validate_and_set_symbol(self, update: Update, symbol: str) -> int:
-        self._init_bybit()
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        price = await self.bybit.get_symbol_price(symbol)
-        if not price:
-            await update.message.reply_text(f"❌ Символ {symbol} не найден.", reply_markup=self.get_symbol_selection_keyboard())
-            return SELECTING_SYMBOL
-        self.db.set_setting('symbol', symbol)
-        self.db.set_setting('initial_reference_price', str(price))
-        
-        highest_price = self.db.get_highest_price(symbol)
-        ladder = self.db.get_ladder_settings(symbol)
-        
-        if highest_price > 0:
-            ladder['start_price'] = highest_price
-            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT\n🪜 Стартовая цена лестницы: {format_price(highest_price, 4)} USDT (по самой высокой цене покупки)")
-        elif ladder['start_price'] <= 0:
-            ladder['start_price'] = price
-            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT\n🪜 Стартовая цена лестницы: {format_price(price, 4)} USDT")
-        else:
-            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT")
-        
-        ladder['last_buy_price'] = ladder['start_price']
-        self.db.save_ladder_settings(ladder)
-        
-        return SELECTING_ACTION
-    
-    async def export_database_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return SELECTING_ACTION
-        await update.message.reply_text("⏳ Экспортирую...")
-        success, count, file_path = self.db.export_database()
-        if success:
-            await update.message.reply_text(f"✅ Экспортировано! Записей: {count}", reply_markup=self.get_settings_keyboard())
-            try:
-                with open(file_path, 'rb') as f:
-                    await update.message.reply_document(document=InputFile(f, filename=DB_EXPORT_FILE), caption="💾 Файл базы данных")
-            except Exception as e:
-                await update.message.reply_text(f"❌ Ошибка отправки: {e}", reply_markup=self.get_settings_keyboard())
-        else:
-            await update.message.reply_text(f"❌ Ошибка экспорта: {file_path}", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def import_database_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return ConversationHandler.END
-        await update.message.reply_text("📥 *ИМПОРТ БАЗЫ*\n\nОтправьте файл .json\n⚠️ *Все записи будут заменены!*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
-        return WAITING_IMPORT_FILE
-    
-    async def import_database_receive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return ConversationHandler.END
-        
-        # Проверяем, является ли сообщение текстовым с отменой
-        if update.message.text and update.message.text.strip() == "❌ Отмена":
-            await update.message.reply_text("❌ Импорт отменен", reply_markup=self.get_main_keyboard())
-            return ConversationHandler.END
-        
-        # Проверяем, что это документ и он имеет расширение .json
-        if not update.message.document:
-            await update.message.reply_text("❌ Пожалуйста, отправьте файл .json", reply_markup=self.get_cancel_keyboard())
-            return WAITING_IMPORT_FILE
-        
-        if not update.message.document.file_name.endswith('.json'):
-            await update.message.reply_text("❌ Файл должен иметь расширение .json", reply_markup=self.get_cancel_keyboard())
-            return WAITING_IMPORT_FILE
-        
-        try:
-            await update.message.reply_text("⏳ Импортирую...")
-            file = await context.bot.get_file(update.message.document.file_id)
-            temp_file = f"temp_import_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
-            await file.download_to_drive(temp_file)
-            success, message = self.db.import_database(temp_file)
-            
-            # Удаляем временный файл
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-            
-            if success:
-                await update.message.reply_text(f"✅ {message}", reply_markup=self.get_main_keyboard())
-                # Обновляем кэш настроек
-                self.bybit_initialized = False
-                self._init_bybit()
-            else:
-                await update.message.reply_text(f"❌ Ошибка: {message}", reply_markup=self.get_main_keyboard())
-            return ConversationHandler.END
-            
-        except Exception as e:
-            logger.error(f"Error in import: {e}")
-            await update.message.reply_text(f"❌ Ошибка при импорте: {str(e)}", reply_markup=self.get_main_keyboard())
-            return ConversationHandler.END
-    
     async def back_to_main(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
+        self.import_waiting = False
         await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
         return ConversationHandler.END
     
     async def cancel_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
+        self.import_waiting = False
         await update.message.reply_text("Действие отменено", reply_markup=self.get_main_keyboard())
         return ConversationHandler.END
     
@@ -3112,6 +2671,138 @@ class FastDCABot:
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
     
+    async def check_executed_orders_loop(self):
+        logger.info("Executed orders checker loop started")
+        last_check = datetime.now()
+        
+        while self.scheduler_running:
+            try:
+                interval_minutes = self.db.get_order_check_interval()
+                await asyncio.sleep(interval_minutes * 60)
+                
+                if not self.db.get_order_execution_notify():
+                    continue
+                
+                if not self.bybit_initialized:
+                    self._init_bybit()
+                
+                if not self.bybit_initialized:
+                    continue
+                
+                if (datetime.now() - last_check).total_seconds() < interval_minutes * 60:
+                    continue
+                
+                last_check = datetime.now()
+                
+                symbol = self.db.get_setting('symbol', 'TONUSDT')
+                new_orders = await self.strategy.check_executed_buy_orders(symbol)
+                
+                for order in new_orders:
+                    if self.db.is_order_notified(order['order_id']):
+                        continue
+                    
+                    msg = (
+                        f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
+                        f"🪙 Токен: `{symbol}`\n"
+                        f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
+                        f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
+                        f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
+                        f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                        f"❗ *Добавить в статистику покупок?*"
+                    )
+                    
+                    if self.authorized_user_id:
+                        try:
+                            keyboard = InlineKeyboardMarkup([
+                                [
+                                    InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
+                                    InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
+                                ]
+                            ])
+                            await self.application.bot.send_message(
+                                chat_id=self.authorized_user_id,
+                                text=msg,
+                                parse_mode='Markdown',
+                                reply_markup=keyboard
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending order notification: {e}")
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Executed orders checker error: {e}")
+    
+    async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        
+        if data.startswith("add_order_"):
+            order_id = data.replace("add_order_", "")
+            await self.add_executed_order_to_stats(update, context, order_id)
+        elif data.startswith("skip_order_"):
+            order_id = data.replace("skip_order_", "")
+            await self.skip_executed_order(update, context, order_id)
+    
+    async def add_executed_order_to_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
+        conn = sqlite3.connect(self.db.db_file, timeout=5)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM executed_orders WHERE order_id = ?', (order_id,))
+        order = cursor.fetchone()
+        conn.close()
+        
+        if not order:
+            await update.callback_query.edit_message_text("❌ Ордер не найден в базе.")
+            return
+        
+        order_dict = dict(order)
+        
+        if order_dict.get('added_to_stats', 0) == 1:
+            await update.callback_query.edit_message_text("ℹ️ Этот ордер уже был добавлен в статистику.")
+            return
+        
+        drop_percent = self.db.get_drop_percent_from_start_price(order_dict['price'], order_dict['symbol'])
+        step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
+        step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
+        
+        purchase_id = self.db.add_purchase(
+            symbol=order_dict['symbol'],
+            amount_usdt=order_dict['amount_usdt'],
+            price=order_dict['price'],
+            quantity=order_dict['quantity'],
+            multiplier=1.0,
+            drop_percent=drop_percent,
+            step_level=step_level,
+            date=order_dict['executed_at']
+        )
+        
+        if purchase_id:
+            self.db.mark_order_as_added(order_id)
+            
+            await update.callback_query.edit_message_text(
+                f"✅ *Покупка добавлена в статистику!*\n\n"
+                f"🪙 Токен: `{order_dict['symbol']}`\n"
+                f"💰 Цена: `{format_price(order_dict['price'], 4)}` USDT\n"
+                f"📊 Количество: `{format_quantity(order_dict['quantity'], 6)}`\n"
+                f"💵 Сумма: `{order_dict['amount_usdt']:.2f}` USDT\n"
+                f"📉 Падение: `{drop_percent:.1f}%`\n"
+                f"📊 Уровень: {step_level}\n"
+                f"🆔 ID покупки: `{purchase_id}`",
+                parse_mode='Markdown'
+            )
+            
+            self.db.log_action('EXECUTED_ORDER_ADDED', order_dict['symbol'], 
+                              f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']}")
+        else:
+            await update.callback_query.edit_message_text("❌ Ошибка при добавлении покупки в статистику.")
+    
+    async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
+        self.db.mark_order_as_added(order_id)
+        await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
+    
     async def post_init(self, application):
         self.scheduler_running = True
         asyncio.create_task(self.scheduler_loop())
@@ -3121,9 +2812,9 @@ class FastDCABot:
         logger.info("Setting up handlers...")
         
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
-        self.application.add_handler(CallbackQueryHandler(self.handle_order_callback, pattern='^order_'))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
         
+        # Обработчики для кнопок главного меню
         self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
@@ -3133,25 +2824,47 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
         self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
         
-        # Conversation для управления ордерами
-        orders_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu)],
+        # Обработчики для кнопок экспорта/импорта (вне ConversationHandler)
+        self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start))
+        
+        # Обработчик для отмены импорта
+        self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.cancel_import))
+        
+        # Обработчик для документов (импорт)
+        self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
+        
+        # Обработчики для управления ордерами
+        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
+        self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
+        
+        # Conversation для настроек
+        main_conv = ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
-                MANAGE_ORDERS: [
-                    MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders),
-                    MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.delete_order_start),
-                    MessageHandler(filters.Regex('^(✏️ Изменить цену ордера)$'), self.edit_order_start),
-                    MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.order_tracking_settings),
+                SELECTING_ACTION: [
+                    MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start),
+                    MessageHandler(filters.Regex('^(💵 Сумма покупки)$'), self.set_amount_start),
+                    MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start),
+                    MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start),
+                    MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start),
+                    MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start),
+                    MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
                 ],
-                EDIT_ORDER_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_order_done)],
-                WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_order_check_interval)],
+                SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
+                SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)],
+                SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done)],
+                SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)],
+                SET_MAX_DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_drop_done)],
+                SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done)],
+                SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done)],
             },
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="orders_conversation",
+            name="main_conversation",
             persistent=False,
         )
-        self.application.add_handler(orders_conv)
+        self.application.add_handler(main_conv)
         
         # Conversation для лестницы
         ladder_conv = ConversationHandler(
@@ -3180,40 +2893,6 @@ class FastDCABot:
             persistent=False,
         )
         self.application.add_handler(ladder_conv)
-        
-        # Основной ConversationHandler для настроек
-        main_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
-            states={
-                SELECTING_ACTION: [
-                    MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start),
-                    MessageHandler(filters.Regex('^(💵 Сумма покупки)$'), self.set_amount_start),
-                    MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start),
-                    MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start),
-                    MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start),
-                    MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start),
-                    MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu),
-                    MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database_handler),
-                    MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start),
-                    MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
-                ],
-                SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
-                SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)],
-                SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done)],
-                SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)],
-                SET_MAX_DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_drop_done)],
-                SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done)],
-                SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done)],
-                WAITING_IMPORT_FILE: [
-                    MessageHandler(filters.Document.ALL, self.import_database_receive),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.import_database_receive),
-                ],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="main_conversation",
-            persistent=False,
-        )
-        self.application.add_handler(main_conv)
         
         # Ручная покупка
         manual_limit_conv = ConversationHandler(
