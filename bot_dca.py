@@ -1169,6 +1169,27 @@ class BybitClient:
             logger.error(f"Error getting order history: {e}")
             return []
     
+    async def get_executed_orders_since(self, symbol: str, since: datetime) -> List[Dict]:
+        try:
+            orders = await self.get_order_history(symbol, limit=100)
+            executed = []
+            for order in orders:
+                if order.get('orderStatus') == 'Filled' and order.get('side') == 'Buy':
+                    order_time = datetime.fromisoformat(order.get('createdTime', '').replace('Z', '+00:00'))
+                    if order_time > since:
+                        executed.append({
+                            'order_id': order.get('orderId'),
+                            'symbol': order.get('symbol'),
+                            'price': float(order.get('avgPrice', 0)),
+                            'quantity': float(order.get('qty', 0)),
+                            'amount_usdt': float(order.get('cumExecValue', 0)),
+                            'executed_at': order_time
+                        })
+            return executed
+        except Exception as e:
+            logger.error(f"Error getting executed orders: {e}")
+            return []
+    
     async def cancel_order(self, symbol: str, order_id: str) -> Dict:
         try:
             if not self.session:
@@ -2517,10 +2538,14 @@ class FastDCABot:
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
+        
         try:
-            price = float(text.replace(',', '.'))
+            # Удаляем запятые и пробелы, заменяем запятую на точку
+            price_str = text.replace(',', '.').strip()
+            price = float(price_str)
             if price <= 0:
-                raise ValueError
+                raise ValueError("Цена должна быть положительной")
+            
             context.user_data['manual_price'] = price
             
             symbol = self.db.get_setting('symbol', 'TONUSDT')
@@ -2528,10 +2553,22 @@ class FastDCABot:
             recommendation = self.db.get_recommendation_for_current_drop(drop_percent, symbol)
             suggested_amount = recommendation.get('amount_usdt', 1.1) if recommendation['success'] else 1.1
             
-            await update.message.reply_text(f"✅ Цена {format_price(price, 4)} USDT\n📉 Падение от цены старта: `{drop_percent:.1f}%`\n\n💰 Введите количество монет:\n*Рекомендуемая сумма:* {suggested_amount:.2f} USDT", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+            await update.message.reply_text(
+                f"✅ Цена {format_price(price, 4)} USDT\n"
+                f"📉 Падение от цены старта: `{drop_percent:.1f}%`\n\n"
+                f"💰 Введите количество монет (в {symbol.replace('USDT', '')}):\n"
+                f"*Рекомендуемая сумма:* {suggested_amount:.2f} USDT\n"
+                f"*Минимальное количество:* 0.000001",
+                reply_markup=self.get_cancel_keyboard(),
+                parse_mode='Markdown'
+            )
             return MANUAL_ADD_AMOUNT
-        except ValueError:
-            await update.message.reply_text("❌ Ошибка! Введите число.", reply_markup=self.get_cancel_keyboard())
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ Ошибка! Введите корректную цену.\n"
+                f"Пример: 2.35 или 2,35",
+                reply_markup=self.get_cancel_keyboard()
+            )
             return MANUAL_ADD_PRICE
     
     async def manual_add_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2539,14 +2576,19 @@ class FastDCABot:
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
+        
         try:
-            quantity = float(text.replace(',', '.'))
+            # Удаляем запятые и пробелы, заменяем запятую на точку
+            quantity_str = text.replace(',', '.').strip()
+            quantity = float(quantity_str)
             if quantity <= 0:
-                raise ValueError
+                raise ValueError("Количество должно быть положительным")
+            
             price = context.user_data.get('manual_price')
             if not price:
-                await update.message.reply_text("❌ Ошибка", reply_markup=self.get_main_keyboard())
+                await update.message.reply_text("❌ Ошибка: цена не найдена. Попробуйте заново.", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
+            
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             amount_usdt = price * quantity
             
@@ -2554,18 +2596,36 @@ class FastDCABot:
             step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
             step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
             
-            purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=amount_usdt, price=price, quantity=quantity, multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            purchase_id = self.db.add_purchase(
+                symbol=symbol,
+                amount_usdt=amount_usdt,
+                price=price,
+                quantity=quantity,
+                multiplier=1.0,
+                drop_percent=drop_percent,
+                step_level=step_level,
+                date=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
             
             if purchase_id:
-                msg = f"✅ *Покупка добавлена!*\n\nID: `{purchase_id}`\nЦена: `{format_price(price, 4)}` USDT\nКоличество: `{format_quantity(quantity, 6)}`\nСумма: `{amount_usdt:.2f}` USDT"
+                msg = f"✅ *Покупка добавлена!*\n\n"
+                msg += f"🆔 ID: `{purchase_id}`\n"
+                msg += f"💰 Цена: `{format_price(price, 4)}` USDT\n"
+                msg += f"📊 Количество: `{format_quantity(quantity, 6)}`\n"
+                msg += f"💵 Сумма: `{amount_usdt:.2f}` USDT"
                 if drop_percent > 0:
                     msg += f"\n📉 Падение: `{drop_percent:.1f}%` от цены старта"
                 await update.message.reply_text(msg, reply_markup=self.get_main_keyboard(), parse_mode='Markdown')
             else:
-                await update.message.reply_text("❌ Ошибка сохранения", reply_markup=self.get_main_keyboard())
+                await update.message.reply_text("❌ Ошибка сохранения в базу данных", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
-        except ValueError:
-            await update.message.reply_text("❌ Ошибка! Введите число.", reply_markup=self.get_cancel_keyboard())
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ Ошибка! Введите корректное количество.\n"
+                f"Пример: 10.5 или 10,5\n\n"
+                f"Ошибка: {str(e)}",
+                reply_markup=self.get_cancel_keyboard()
+            )
             return MANUAL_ADD_AMOUNT
     
     async def edit_purchases_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
