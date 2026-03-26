@@ -97,7 +97,7 @@ BOT_VERSION = datetime.now().strftime("%y.%m.%d")
     SET_LADDER_BASE_AMOUNT,
     MANUAL_ADD_RECOMMENDATION,
     WAITING_ORDER_CHECK_INTERVAL,
-    WAITING_ORDER_ID_TO_CANCEL,  # Новое состояние для ввода ID ордера
+    WAITING_ORDER_ID_TO_CANCEL,
 ) = range(33)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
@@ -472,7 +472,6 @@ class Database:
             logger.error(f"Error updating order status: {e}")
     
     def delete_sell_order(self, order_id: str) -> bool:
-        """Удалить ордер из БД по order_id"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
@@ -1396,7 +1395,7 @@ class FastDCABot:
         self.scheduler_running = False
         self.authorized_user_id = None
         self.pending_executed_order = None
-        self.import_waiting = False  # Флаг ожидания файла для импорта
+        self.import_waiting = False
         
         self.setup_handlers()
     
@@ -1533,7 +1532,6 @@ class FastDCABot:
         )
     
     async def export_database(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Экспорт базы данных - отдельный обработчик вне ConversationHandler"""
         if not await self._check_user_fast(update):
             return
         
@@ -1550,7 +1548,6 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка экспорта: {file_path}", reply_markup=self.get_settings_keyboard())
     
     async def import_database_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начать импорт базы данных"""
         if not await self._check_user_fast(update):
             return
         
@@ -1565,7 +1562,6 @@ class FastDCABot:
         )
     
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка отправленных документов (для импорта)"""
         if not await self._check_user_fast(update):
             return
         
@@ -1598,7 +1594,6 @@ class FastDCABot:
             
             if success:
                 await update.message.reply_text(f"✅ {message}", reply_markup=self.get_main_keyboard())
-                # Обновляем кэш
                 self.bybit_initialized = False
                 self._init_bybit()
             else:
@@ -1609,7 +1604,6 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка при импорте: {str(e)}", reply_markup=self.get_main_keyboard())
     
     async def cancel_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отмена импорта"""
         if self.import_waiting:
             self.import_waiting = False
             await update.message.reply_text("❌ Импорт отменен", reply_markup=self.get_main_keyboard())
@@ -1617,14 +1611,13 @@ class FastDCABot:
             await update.message.reply_text("Нет активного импорта", reply_markup=self.get_main_keyboard())
     
     async def orders_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Меню управления ордерами"""
         if not await self._check_user_fast(update):
-            return
+            return ConversationHandler.END
         
         self._init_bybit()
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
-            return
+            return ConversationHandler.END
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         
@@ -1649,7 +1642,6 @@ class FastDCABot:
             return ConversationHandler.END
     
     async def show_open_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать текущие открытые ордера"""
         if not await self._check_user_fast(update):
             return
         
@@ -1699,23 +1691,19 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=self.get_order_management_keyboard())
     
     async def cancel_order_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начало процесса удаления ордера - запрос ID ордера"""
         if not await self._check_user_fast(update):
-            return
+            return ConversationHandler.END
         
         self._init_bybit()
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
-            return
+            return ConversationHandler.END
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
+        coin = symbol.replace('USDT', '')
         
-        # Показываем список открытых ордеров с ID для удобства
         try:
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
-            
-            message = f"🗑 *УДАЛЕНИЕ ОРДЕРА*\n\n"
-            message += f"🪙 Токен: `{symbol}`\n\n"
             
             all_orders = []
             for order in orders_by_side.get('sell', []):
@@ -1725,69 +1713,78 @@ class FastDCABot:
             
             if not all_orders:
                 await update.message.reply_text("📭 Нет открытых ордеров для удаления.", reply_markup=self.get_order_management_keyboard())
-                return
+                return ConversationHandler.END
             
-            message += f"📋 *Открытые ордера:*\n\n"
+            # Создаем клавиатуру с кнопками для каждого ордера
+            keyboard = []
             for order in all_orders[:20]:
-                side_emoji = "🔴 Продажа" if order.get('side') == 'Sell' else "🟢 Покупка"
+                side_emoji = "🔴" if order.get('side') == 'Sell' else "🟢"
                 order_id = order.get('orderId', 'N/A')
                 price = float(order.get('price', 0))
                 qty = float(order.get('qty', 0))
-                message += f"• `{order_id}`\n  {side_emoji} {format_quantity(qty, 6)} @ {format_price(price, 4)} USDT\n\n"
+                btn_text = f"{side_emoji} {order_id[:12]}... - {format_quantity(qty, 4)} @ {format_price(price, 2)}"
+                keyboard.append([KeyboardButton(btn_text)])
             
-            message += f"\n✏️ *Введите ID ордера для удаления:*\n"
-            message += f"(ID ордера можно скопировать из списка выше)"
+            keyboard.append([KeyboardButton("❌ Отмена")])
             
-            await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_cancel_keyboard())
+            cancel_keyboard = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            message = f"🗑 *УДАЛЕНИЕ ОРДЕРА*\n\n"
+            message += f"🪙 Токен: `{symbol}`\n\n"
+            message += f"Выберите ордер для удаления:"
+            
+            await update.message.reply_text(message, parse_mode='Markdown', reply_markup=cancel_keyboard)
             return WAITING_ORDER_ID_TO_CANCEL
             
         except Exception as e:
             logger.error(f"Error in cancel_order_start: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
+            return ConversationHandler.END
     
     async def cancel_order_execute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Выполнение удаления ордера"""
         if not await self._check_user_fast(update):
-            return
+            return ConversationHandler.END
         
         text = update.message.text.strip()
+        
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Удаление ордера отменено", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
-        
-        order_id = text.strip()
+            return ConversationHandler.END
         
         self._init_bybit()
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
+            return ConversationHandler.END
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         
         try:
-            # Сначала получаем информацию об ордере
+            # Получаем все открытые ордера
             open_orders = await self.bybit.get_open_orders(symbol)
+            
+            # Ищем ордер по тексту кнопки (извлекаем ID)
             order_to_cancel = None
             for order in open_orders:
-                if order.get('orderId') == order_id:
+                order_id = order.get('orderId', '')
+                # Проверяем, содержится ли ID в тексте кнопки
+                if order_id in text or text.startswith(order_id[:12]):
                     order_to_cancel = order
                     break
             
             if not order_to_cancel:
                 await update.message.reply_text(
-                    f"❌ Ордер с ID `{order_id}` не найден среди открытых ордеров.\n\n"
-                    f"Проверьте ID и попробуйте снова, или нажмите Отмена.",
-                    parse_mode='Markdown',
-                    reply_markup=self.get_cancel_keyboard()
+                    f"❌ Ордер не найден.\n\n"
+                    f"Пожалуйста, выберите ордер из списка кнопок.",
+                    reply_markup=self.get_order_management_keyboard()
                 )
-                return WAITING_ORDER_ID_TO_CANCEL
+                return ConversationHandler.END
+            
+            order_id = order_to_cancel.get('orderId')
             
             # Отменяем ордер на бирже
             result = await self.bybit.cancel_order(symbol, order_id)
             
             if result['success']:
-                # Удаляем из БД если это sell ордер
                 self.db.delete_sell_order(order_id)
                 self.db.log_action('ORDER_CANCELLED', symbol, f"Ордер {order_id} отменен")
                 
@@ -1805,26 +1802,25 @@ class FastDCABot:
                     parse_mode='Markdown',
                     reply_markup=self.get_order_management_keyboard()
                 )
-                return MANAGE_ORDERS
+                return ConversationHandler.END
             else:
                 error_msg = result.get('error', 'Неизвестная ошибка')
                 await update.message.reply_text(
                     f"❌ *Ошибка при удалении ордера*\n\n"
                     f"ID: `{order_id}`\n"
-                    f"Ошибка: `{error_msg}`\n\n"
-                    f"Попробуйте снова или нажмите Отмена.",
+                    f"Ошибка: `{error_msg}`",
                     parse_mode='Markdown',
-                    reply_markup=self.get_cancel_keyboard()
+                    reply_markup=self.get_order_management_keyboard()
                 )
-                return WAITING_ORDER_ID_TO_CANCEL
+                return ConversationHandler.END
                 
         except Exception as e:
             logger.error(f"Error in cancel_order_execute: {e}")
             await update.message.reply_text(
-                f"❌ Ошибка: {str(e)}\n\nПопробуйте снова или нажмите Отмена.",
-                reply_markup=self.get_cancel_keyboard()
+                f"❌ Ошибка: {str(e)}",
+                reply_markup=self.get_order_management_keyboard()
             )
-            return WAITING_ORDER_ID_TO_CANCEL
+            return ConversationHandler.END
     
     async def show_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -2969,7 +2965,7 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
         self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
         
-        # Обработчики для кнопок экспорта/импорта (вне ConversationHandler)
+        # Обработчики для кнопок экспорта/импорта
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database))
         self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start))
         
@@ -2981,7 +2977,6 @@ class FastDCABot:
         
         # Обработчики для управления ордерами
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
-        self.application.add_handler(MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
         
         # Conversation для удаления ордера
