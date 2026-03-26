@@ -1721,7 +1721,6 @@ class FastDCABot:
             return ConversationHandler.END
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
-        coin = symbol.replace('USDT', '')
         
         try:
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
@@ -1736,14 +1735,16 @@ class FastDCABot:
                 await update.message.reply_text("📭 Нет открытых ордеров для удаления.", reply_markup=self.get_order_management_keyboard())
                 return ConversationHandler.END
             
-            # Создаем клавиатуру с кнопками для каждого ордера
+            # Сохраняем список ордеров в context.user_data
+            context.user_data['cancel_orders'] = all_orders
+            
+            # Создаем клавиатуру с порядковыми номерами
             keyboard = []
-            for order in all_orders[:20]:
+            for idx, order in enumerate(all_orders[:20], 1):
                 side_emoji = "🔴" if order.get('side') == 'Sell' else "🟢"
-                order_id = order.get('orderId', 'N/A')
                 price = float(order.get('price', 0))
                 qty = float(order.get('qty', 0))
-                btn_text = f"{side_emoji} {order_id[:12]}... - {format_quantity(qty, 4)} @ {format_price(price, 2)}"
+                btn_text = f"{idx}. {side_emoji} {format_quantity(qty, 4)} @ {format_price(price, 2)} USDT"
                 keyboard.append([KeyboardButton(btn_text)])
             
             keyboard.append([KeyboardButton("❌ Отмена")])
@@ -1752,7 +1753,7 @@ class FastDCABot:
             
             message = f"🗑 *УДАЛЕНИЕ ОРДЕРА*\n\n"
             message += f"🪙 Токен: `{symbol}`\n\n"
-            message += f"Выберите ордер для удаления:"
+            message += f"Выберите ордер для удаления (введите номер):"
             
             await update.message.reply_text(message, parse_mode='Markdown', reply_markup=cancel_keyboard)
             return WAITING_ORDER_ID_TO_CANCEL
@@ -1780,26 +1781,37 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         
         try:
-            # Получаем все открытые ордера
-            open_orders = await self.bybit.get_open_orders(symbol)
+            # Получаем сохраненный список ордеров
+            all_orders = context.user_data.get('cancel_orders', [])
             
-            # Ищем ордер по тексту кнопки (извлекаем ID)
-            order_to_cancel = None
-            for order in open_orders:
-                order_id = order.get('orderId', '')
-                # Проверяем, содержится ли ID в тексте кнопки
-                if order_id in text or text.startswith(order_id[:12]):
-                    order_to_cancel = order
-                    break
-            
-            if not order_to_cancel:
+            if not all_orders:
                 await update.message.reply_text(
-                    f"❌ Ордер не найден.\n\n"
-                    f"Пожалуйста, выберите ордер из списка кнопок.",
+                    "❌ Список ордеров не найден. Пожалуйста, начните заново.",
                     reply_markup=self.get_order_management_keyboard()
                 )
                 return ConversationHandler.END
             
+            # Извлекаем номер из текста (первое число)
+            import re
+            match = re.search(r'^(\d+)', text)
+            if not match:
+                await update.message.reply_text(
+                    f"❌ Пожалуйста, введите номер ордера (1-{len(all_orders)}).\n\n"
+                    f"Например: 1",
+                    reply_markup=self.get_order_management_keyboard()
+                )
+                return ConversationHandler.END
+            
+            order_num = int(match.group(1))
+            
+            if order_num < 1 or order_num > len(all_orders):
+                await update.message.reply_text(
+                    f"❌ Неверный номер. Введите число от 1 до {len(all_orders)}.",
+                    reply_markup=self.get_order_management_keyboard()
+                )
+                return ConversationHandler.END
+            
+            order_to_cancel = all_orders[order_num - 1]
             order_id = order_to_cancel.get('orderId')
             
             # Отменяем ордер на бирже
@@ -1828,6 +1840,7 @@ class FastDCABot:
                 error_msg = result.get('error', 'Неизвестная ошибка')
                 await update.message.reply_text(
                     f"❌ *Ошибка при удалении ордера*\n\n"
+                    f"Номер: {order_num}\n"
                     f"ID: `{order_id}`\n"
                     f"Ошибка: `{error_msg}`",
                     parse_mode='Markdown',
