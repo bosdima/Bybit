@@ -2,7 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Исправленная версия - РАБОТАЕТ ОТСЛЕЖИВАНИЕ ОРДЕРОВ
+Исправленная версия - РАБОТАЮТ ВСЕ КНОПКИ + ОТСЛЕЖИВАНИЕ ОРДЕРОВ
 """
 
 import os
@@ -281,7 +281,7 @@ class Database:
                 ('ladder_start_price', '0'),
                 ('order_execution_notify', 'false'),
                 ('order_check_interval_minutes', '60'),
-                ('last_order_check_time', ''),  # Добавляем начальное значение
+                ('last_order_check_time', ''),
             ]
             
             for key, value in defaults:
@@ -1163,7 +1163,6 @@ class BybitClient:
         return [o for o in orders if o.get('side') == 'Sell']
     
     async def get_order_history(self, symbol: str = None, limit: int = 100) -> List[Dict]:
-        """Получение истории ордеров"""
         try:
             if not self.session:
                 self._init_session()
@@ -1173,30 +1172,21 @@ class BybitClient:
             response = self.session.get_order_history(**params)
             if response['retCode'] == 0:
                 return response['result']['list']
-            logger.warning(f"Error getting order history: {response.get('retMsg', 'Unknown error')}")
             return []
         except Exception as e:
             logger.error(f"Error getting order history: {e}")
             return []
     
     async def get_executed_orders_since(self, symbol: str, since: datetime) -> List[Dict]:
-        """Получение исполненных ордеров на покупку с указанного времени"""
         try:
-            # Получаем историю ордеров за последние 24 часа (увеличиваем лимит)
             orders = await self.get_order_history(symbol, limit=200)
             executed = []
-            
             for order in orders:
-                # Проверяем статус ордера - Filled (исполнен)
-                # И сторона - Buy (покупка)
                 if order.get('orderStatus') == 'Filled' and order.get('side') == 'Buy':
-                    # Получаем время создания ордера
                     created_time_str = order.get('createdTime', '')
                     if created_time_str:
                         try:
-                            # Преобразуем строку времени в datetime
                             created_time = datetime.fromisoformat(created_time_str.replace('Z', '+00:00'))
-                            # Сравниваем с указанным временем
                             if created_time > since:
                                 executed.append({
                                     'order_id': order.get('orderId'),
@@ -1206,12 +1196,9 @@ class BybitClient:
                                     'amount_usdt': float(order.get('cumExecValue', 0)),
                                     'executed_at': created_time
                                 })
-                                logger.info(f"Found executed order: {order.get('orderId')} at {created_time}")
                         except Exception as e:
                             logger.error(f"Error parsing order time: {e}")
                             continue
-            
-            logger.info(f"Found {len(executed)} new executed orders since {since}")
             return executed
         except Exception as e:
             logger.error(f"Error getting executed orders: {e}")
@@ -1406,8 +1393,6 @@ class DCAStrategy:
         }
     
     async def check_executed_buy_orders(self, symbol: str) -> List[Dict]:
-        """Проверка исполненных ордеров на покупку"""
-        # Получаем время последней проверки
         last_check_str = self.db.get_setting('last_order_check_time', '')
         
         if last_check_str:
@@ -1416,18 +1401,12 @@ class DCAStrategy:
             except:
                 last_check = datetime.now() - timedelta(hours=24)
         else:
-            # Если нет сохраненного времени, проверяем за последние 24 часа
             last_check = datetime.now() - timedelta(hours=24)
         
-        logger.info(f"Checking executed orders since {last_check}")
-        
-        # Получаем исполненные ордера
         executed = await self.bybit.get_executed_orders_since(symbol, last_check)
         
-        # Обновляем время последней проверки
         self.db.set_setting('last_order_check_time', datetime.now().isoformat())
         
-        # Фильтруем только новые ордера
         new_executed = []
         for order in executed:
             if not self.db.is_order_notified(order['order_id']):
@@ -1439,7 +1418,6 @@ class DCAStrategy:
                     order['quantity'],
                     order['amount_usdt']
                 )
-                logger.info(f"New executed order detected: {order['order_id']}")
         
         return new_executed
     
@@ -3054,7 +3032,6 @@ class FastDCABot:
                 logger.error(f"Scheduler error: {e}")
     
     async def check_executed_orders_loop(self):
-        """Цикл проверки исполненных ордеров"""
         logger.info("Executed orders checker loop started")
         
         while self.scheduler_running:
@@ -3062,36 +3039,28 @@ class FastDCABot:
                 interval_minutes = self.db.get_order_check_interval()
                 await asyncio.sleep(interval_minutes * 60)
                 
-                # Проверяем, включено ли отслеживание
                 if not self.db.get_order_execution_notify():
-                    logger.debug("Order execution tracking is disabled")
                     continue
                 
-                # Инициализируем Bybit если нужно
                 if not self.bybit_initialized:
                     self._init_bybit()
                 
                 if not self.bybit_initialized:
-                    logger.warning("Bybit not initialized, skipping check")
                     continue
                 
                 symbol = self.db.get_setting('symbol', 'TONUSDT')
                 logger.info(f"Checking for new executed orders for {symbol}")
                 
                 try:
-                    # Получаем новые исполненные ордера
                     new_orders = await self.strategy.check_executed_buy_orders(symbol)
                     
                     if new_orders:
                         logger.info(f"Found {len(new_orders)} new executed orders")
                         
                         for order in new_orders:
-                            # Проверяем, не уведомляли ли уже об этом ордере
                             if self.db.is_order_notified(order['order_id']):
-                                logger.debug(f"Order {order['order_id']} already notified")
                                 continue
                             
-                            # Формируем сообщение
                             msg = (
                                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
                                 f"🪙 Токен: `{symbol}`\n"
@@ -3102,7 +3071,6 @@ class FastDCABot:
                                 f"❗ *Добавить в статистику покупок?*"
                             )
                             
-                            # Создаем inline кнопки
                             keyboard = InlineKeyboardMarkup([
                                 [
                                     InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
@@ -3110,7 +3078,6 @@ class FastDCABot:
                                 ]
                             ])
                             
-                            # Отправляем сообщение
                             if self.authorized_user_id:
                                 try:
                                     await self.application.bot.send_message(
@@ -3122,8 +3089,6 @@ class FastDCABot:
                                     logger.info(f"Sent notification for order {order['order_id']}")
                                 except Exception as e:
                                     logger.error(f"Error sending order notification: {e}")
-                            else:
-                                logger.warning("No authorized user ID set")
                     else:
                         logger.debug("No new executed orders found")
                         
@@ -3200,14 +3165,12 @@ class FastDCABot:
             self.db.log_action('EXECUTED_ORDER_ADDED', order_dict['symbol'], 
                               f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']}")
             
-            # После добавления покупки отправляем рекомендацию по продаже
             await self.send_sell_recommendation_from_callback(update, context)
             
         else:
             await update.callback_query.edit_message_text("❌ Ошибка при добавлении покупки в статистику.")
     
     async def send_sell_recommendation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отправляет рекомендацию по продаже из callback"""
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         profit_percent = float(self.db.get_setting('profit_percent', '5'))
         
@@ -3254,7 +3217,6 @@ class FastDCABot:
         )
     
     async def confirm_sell_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Подтверждение создания ордера на продажу"""
         text = update.message.text.strip()
         
         if text == "❌ Нет, отмена":
