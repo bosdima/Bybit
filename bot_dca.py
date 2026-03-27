@@ -2,7 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Исправленная версия - ВСЕ КНОПКИ РАБОТАЮТ + УДАЛЕНИЕ ОРДЕРОВ + РЕКОМЕНДАЦИЯ ПО ПРОДАЖЕ
+Исправленная версия - ВСЕ КНОПКИ РАБОТАЮТ
 """
 
 import os
@@ -1408,7 +1408,6 @@ class DCAStrategy:
         return new_executed
     
     async def place_full_sell_order(self, symbol: str, profit_percent: float) -> Dict:
-        """Выставляет ордер на продажу всего актива по цене с целевой прибылью (округленной вверх)"""
         try:
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
@@ -3289,43 +3288,31 @@ class FastDCABot:
         )
         self.application.add_handler(tracking_conv)
         
-        # Обработчики для кнопок главного меню
-        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu))
-        self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
-        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
-        self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
-        
-        # Обработчики для кнопок экспорта/импорта
-        self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start))
-        
-        # Обработчик для отмены импорта
-        self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.cancel_import))
-        
-        # Обработчик для документов (импорт)
-        self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
-        
-        # Обработчики для управления ордерами
-        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
-        self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
-        
-        # Conversation для удаления ордера
-        cancel_order_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start)],
+        # Conversation для редактирования покупок - ДОЛЖЕН БЫТЬ ЗАРЕГИСТРИРОВАН ДО ОСНОВНОГО CONVERSATION
+        edit_purchases_conv = ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
             states={
-                WAITING_ORDER_ID_TO_CANCEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cancel_order_execute)],
+                EDIT_PURCHASE_SELECT: [
+                    MessageHandler(filters.Regex('^(💰 Изменить цену)$'), self.edit_price_start),
+                    MessageHandler(filters.Regex('^(📊 Изменить количество)$'), self.edit_amount_start),
+                    MessageHandler(filters.Regex('^(📅 Изменить дату)$'), self.edit_date_start),
+                    MessageHandler(filters.Regex('^(❌ Удалить покупку)$'), self.delete_purchase_confirm),
+                    MessageHandler(filters.Regex('^(🔙 Назад к списку)$'), self.edit_purchases_list),
+                    MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_purchase_selected),
+                ],
+                EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_price_save)],
+                EDIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_amount_save)],
+                EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_date_save)],
+                DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.delete_purchase_execute)],
             },
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="cancel_order_conversation",
+            name="edit_purchases_conversation",
             persistent=False,
         )
-        self.application.add_handler(cancel_order_conv)
+        self.application.add_handler(edit_purchases_conv)
         
-        # Conversation для настроек
+        # Conversation для настроек (основной)
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
@@ -3407,30 +3394,42 @@ class FastDCABot:
         )
         self.application.add_handler(manual_add_conv)
         
-        # Редактирование покупок
-        edit_purchases_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
+        # Conversation для удаления ордера
+        cancel_order_conv = ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start)],
             states={
-                EDIT_PURCHASE_SELECT: [
-                    MessageHandler(filters.Regex('^(💰 Изменить цену)$'), self.edit_price_start),
-                    MessageHandler(filters.Regex('^(📊 Изменить количество)$'), self.edit_amount_start),
-                    MessageHandler(filters.Regex('^(📅 Изменить дату)$'), self.edit_date_start),
-                    MessageHandler(filters.Regex('^(❌ Удалить покупку)$'), self.delete_purchase_confirm),
-                    MessageHandler(filters.Regex('^(🔙 Назад к списку)$'), self.edit_purchases_list),
-                    MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_purchase_selected),
-                ],
-                EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_price_save)],
-                EDIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_amount_save)],
-                EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_date_save)],
-                DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.delete_purchase_execute)],
+                WAITING_ORDER_ID_TO_CANCEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cancel_order_execute)],
             },
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="edit_purchases_conversation",
+            name="cancel_order_conversation",
             persistent=False,
         )
-        self.application.add_handler(edit_purchases_conv)
+        self.application.add_handler(cancel_order_conv)
         
+        # Обработчики для кнопок главного меню (НЕ ConversationHandler)
+        self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
+        self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
+        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
+        self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
+        
+        # Обработчики для кнопок экспорта/импорта
+        self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start))
+        
+        # Обработчик для отмены импорта
+        self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.cancel_import))
+        
+        # Обработчик для документов (импорт)
+        self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
+        
+        # Обработчики для управления ордерами
+        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
+        self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
+        
+        # Обработчик для неизвестных сообщений
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         
         logger.info("Handlers setup completed")
