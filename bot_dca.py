@@ -2,7 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-ПОЛНОСТЬЮ РАБОЧАЯ ВЕРСИЯ - ВСЕ КНОПКИ + ОТСЛЕЖИВАНИЕ ОРДЕРОВ
+ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЕТ ОТСЛЕЖИВАНИЕ ОРДЕРОВ
 """
 
 import os
@@ -279,8 +279,8 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '3.3'),
                 ('ladder_start_price', '0'),
-                ('order_execution_notify', 'true'),  # Включено по умолчанию
-                ('order_check_interval_minutes', '5'),  # Проверка каждые 5 минут
+                ('order_execution_notify', 'true'),
+                ('order_check_interval_minutes', '5'),
                 ('last_order_check_time', ''),
             ]
             
@@ -810,7 +810,6 @@ class Database:
             return False
     
     def is_order_notified(self, order_id: str) -> bool:
-        """Проверяет, был ли ордер уже обработан (добавлен или пропущен)"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
@@ -836,7 +835,6 @@ class Database:
             return False
     
     def mark_order_as_skipped(self, order_id: str) -> bool:
-        """Отмечает ордер как пропущенный (добавляет в executed_orders если его нет)"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
@@ -1196,35 +1194,27 @@ class BybitClient:
             return []
     
     async def get_executed_orders_since(self, symbol: str, since: datetime) -> List[Dict]:
-        """Получает исполненные ордера на покупку с указанного времени"""
         try:
             orders = await self.get_order_history(symbol, limit=200)
             executed = []
             
             for order in orders:
-                # Проверяем статус и сторону ордера
                 if order.get('orderStatus') in ['Filled', 'PartiallyFilled'] and order.get('side') == 'Buy':
                     created_time_str = order.get('createdTime', '')
                     if created_time_str:
                         try:
-                            # Bybit возвращает timestamp в миллисекундах
                             created_time_ms = int(created_time_str)
                             created_time = datetime.fromtimestamp(created_time_ms / 1000)
                             
-                            # Проверяем, что ордер создан после указанного времени
                             if created_time > since:
-                                # Получаем среднюю цену
                                 avg_price = float(order.get('avgPrice', 0))
                                 if avg_price == 0:
-                                    # Если avgPrice нет, используем цену из ордера
                                     avg_price = float(order.get('price', 0))
                                 
-                                # Получаем количество
                                 qty = float(order.get('qty', 0))
                                 if qty == 0 and order.get('cumExecQty'):
                                     qty = float(order.get('cumExecQty', 0))
                                 
-                                # Получаем сумму
                                 amount_usdt = float(order.get('cumExecValue', 0))
                                 if amount_usdt == 0:
                                     amount_usdt = avg_price * qty
@@ -1436,33 +1426,26 @@ class DCAStrategy:
         }
     
     async def check_executed_buy_orders(self, symbol: str) -> List[Dict]:
-        """Проверяет новые исполненные ордера на покупку"""
         last_check_str = self.db.get_setting('last_order_check_time', '')
         
-        # Устанавливаем время последней проверки
         if last_check_str:
             try:
                 last_check = datetime.fromisoformat(last_check_str)
             except:
-                # Если формат неверный, проверяем за последние 24 часа
-                last_check = datetime.now() - timedelta(hours=24)
+                last_check = datetime.now() - timedelta(days=7)
         else:
-            # Если нет записи, проверяем за последние 7 дней
             last_check = datetime.now() - timedelta(days=7)
         
         logger.info(f"Checking executed orders since {last_check.strftime('%Y-%m-%d %H:%M:%S')}")
         
         executed = await self.bybit.get_executed_orders_since(symbol, last_check)
         
-        # Сохраняем время текущей проверки
         self.db.set_setting('last_order_check_time', datetime.now().isoformat())
         
         new_executed = []
         for order in executed:
-            # Проверяем, был ли ордер уже обработан
             if not self.db.is_order_notified(order['order_id']):
                 new_executed.append(order)
-                # Добавляем в таблицу для отслеживания
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
@@ -1579,6 +1562,14 @@ class FastDCABot:
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
+    def get_tracking_settings_keyboard(self):
+        keyboard = [
+            [KeyboardButton("✅ Включить отслеживание"), KeyboardButton("⏹ Выключить отслеживание")],
+            [KeyboardButton("⏱ Изменить интервал проверки")],
+            [KeyboardButton("🔙 Назад в меню")]
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
     def get_cancel_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
@@ -1685,6 +1676,7 @@ class FastDCABot:
         )
     
     async def tracking_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик кнопки настроек отслеживания"""
         if not await self._check_user_fast(update):
             return
         
@@ -1698,11 +1690,7 @@ class FastDCABot:
             f"📋 Статус: {status_text}\n"
             f"🕐 Интервал проверки: `{current_interval}` минут\n\n"
             f"Выберите действие:",
-            reply_markup=ReplyKeyboardMarkup([
-                [KeyboardButton("✅ Включить отслеживание"), KeyboardButton("⏹ Выключить отслеживание")],
-                [KeyboardButton("⏱ Изменить интервал проверки")],
-                [KeyboardButton("🔙 Назад в меню")]
-            ], resize_keyboard=True),
+            reply_markup=self.get_tracking_settings_keyboard(),
             parse_mode='Markdown'
         )
         return NOTIFICATION_SETTINGS_MENU
@@ -3086,10 +3074,8 @@ class FastDCABot:
                 logger.error(f"Scheduler error: {e}")
     
     async def check_executed_orders_loop(self):
-        """Цикл проверки исполненных ордеров"""
         logger.info("Executed orders checker loop started")
         
-        # Первая проверка через 10 секунд после запуска
         await asyncio.sleep(10)
         
         while self.scheduler_running:
@@ -3117,7 +3103,6 @@ class FastDCABot:
                         logger.info(f"Found {len(new_orders)} new executed orders")
                         
                         for order in new_orders:
-                            # Проверяем, не был ли ордер уже обработан
                             if self.db.is_order_notified(order['order_id']):
                                 continue
                             
@@ -3161,7 +3146,6 @@ class FastDCABot:
             except Exception as e:
                 logger.error(f"Executed orders checker error: {e}")
             
-            # Ждем следующий интервал
             await asyncio.sleep(self.db.get_order_check_interval() * 60)
     
     async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3338,11 +3322,9 @@ class FastDCABot:
     def setup_handlers(self):
         logger.info("Setting up handlers...")
         
-        # Базовые обработчики
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
         
-        # Conversation для подтверждения продажи
         sell_conv = ConversationHandler(
             entry_points=[],
             states={
@@ -3354,7 +3336,6 @@ class FastDCABot:
         )
         self.application.add_handler(sell_conv)
         
-        # Conversation для настроек отслеживания
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
             states={
@@ -3372,7 +3353,6 @@ class FastDCABot:
         )
         self.application.add_handler(tracking_conv)
         
-        # Conversation для редактирования покупок
         edit_purchases_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
             states={
@@ -3396,7 +3376,6 @@ class FastDCABot:
         )
         self.application.add_handler(edit_purchases_conv)
         
-        # Conversation для настроек (основной)
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
@@ -3424,7 +3403,6 @@ class FastDCABot:
         )
         self.application.add_handler(main_conv)
         
-        # Conversation для лестницы
         ladder_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu)],
             states={
@@ -3452,7 +3430,6 @@ class FastDCABot:
         )
         self.application.add_handler(ladder_conv)
         
-        # Ручная покупка
         manual_limit_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(💰 Ручная покупка \(лимит\))$'), self.manual_buy_start)],
             states={
@@ -3465,7 +3442,6 @@ class FastDCABot:
         )
         self.application.add_handler(manual_limit_conv)
         
-        # Ручное добавление покупки
         manual_add_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(➕ Добавить покупку вручную)$'), self.manual_add_start)],
             states={
@@ -3478,7 +3454,6 @@ class FastDCABot:
         )
         self.application.add_handler(manual_add_conv)
         
-        # Conversation для удаления ордера
         cancel_order_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start)],
             states={
@@ -3490,7 +3465,6 @@ class FastDCABot:
         )
         self.application.add_handler(cancel_order_conv)
         
-        # Обработчики для кнопок главного меню (НЕ ConversationHandler)
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
@@ -3499,21 +3473,16 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
         self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
         
-        # Обработчики для кнопок экспорта/импорта
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database))
         self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start))
         
-        # Обработчик для отмены импорта
         self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.cancel_import))
         
-        # Обработчик для документов (импорт)
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         
-        # Обработчики для управления ордерами
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
         
-        # Обработчик для неизвестных сообщений (всегда последний)
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         
         logger.info("Handlers setup completed")
