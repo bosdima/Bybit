@@ -279,8 +279,8 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '3.3'),
                 ('ladder_start_price', '0'),
-                ('order_execution_notify', 'false'),
-                ('order_check_interval_minutes', '60'),
+                ('order_execution_notify', 'true'),  # Включено по умолчанию
+                ('order_check_interval_minutes', '5'),  # Проверка каждые 5 минут
                 ('last_order_check_time', ''),
             ]
             
@@ -810,10 +810,11 @@ class Database:
             return False
     
     def is_order_notified(self, order_id: str) -> bool:
+        """Проверяет, был ли ордер уже обработан (добавлен или пропущен)"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ?', (order_id,))
+            cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ? AND added_to_stats = 1', (order_id,))
             exists = cursor.fetchone() is not None
             conn.close()
             return exists
@@ -834,14 +835,31 @@ class Database:
             logger.error(f"Error marking order as added: {e}")
             return False
     
+    def mark_order_as_skipped(self, order_id: str) -> bool:
+        """Отмечает ордер как пропущенный (добавляет в executed_orders если его нет)"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR IGNORE INTO executed_orders (order_id, added_to_stats)
+                VALUES (?, 1)
+            ''', (order_id,))
+            success = cursor.rowcount > 0
+            conn.commit()
+            conn.close()
+            return success
+        except Exception as e:
+            logger.error(f"Error marking order as skipped: {e}")
+            return False
+    
     def get_order_execution_notify(self) -> bool:
-        return self.get_setting('order_execution_notify', 'false') == 'true'
+        return self.get_setting('order_execution_notify', 'true') == 'true'
     
     def set_order_execution_notify(self, enabled: bool):
         self.set_setting('order_execution_notify', 'true' if enabled else 'false')
     
     def get_order_check_interval(self) -> int:
-        return int(self.get_setting('order_check_interval_minutes', '60'))
+        return int(self.get_setting('order_check_interval_minutes', '5'))
     
     def set_order_check_interval(self, minutes: int):
         self.set_setting('order_check_interval_minutes', str(minutes))
@@ -1178,26 +1196,51 @@ class BybitClient:
             return []
     
     async def get_executed_orders_since(self, symbol: str, since: datetime) -> List[Dict]:
+        """Получает исполненные ордера на покупку с указанного времени"""
         try:
             orders = await self.get_order_history(symbol, limit=200)
             executed = []
+            
             for order in orders:
-                if order.get('orderStatus') == 'Filled' and order.get('side') == 'Buy':
+                # Проверяем статус и сторону ордера
+                if order.get('orderStatus') in ['Filled', 'PartiallyFilled'] and order.get('side') == 'Buy':
                     created_time_str = order.get('createdTime', '')
                     if created_time_str:
                         try:
-                            created_time = datetime.fromisoformat(created_time_str.replace('Z', '+00:00'))
+                            # Bybit возвращает timestamp в миллисекундах
+                            created_time_ms = int(created_time_str)
+                            created_time = datetime.fromtimestamp(created_time_ms / 1000)
+                            
+                            # Проверяем, что ордер создан после указанного времени
                             if created_time > since:
+                                # Получаем среднюю цену
+                                avg_price = float(order.get('avgPrice', 0))
+                                if avg_price == 0:
+                                    # Если avgPrice нет, используем цену из ордера
+                                    avg_price = float(order.get('price', 0))
+                                
+                                # Получаем количество
+                                qty = float(order.get('qty', 0))
+                                if qty == 0 and order.get('cumExecQty'):
+                                    qty = float(order.get('cumExecQty', 0))
+                                
+                                # Получаем сумму
+                                amount_usdt = float(order.get('cumExecValue', 0))
+                                if amount_usdt == 0:
+                                    amount_usdt = avg_price * qty
+                                
                                 executed.append({
                                     'order_id': order.get('orderId'),
                                     'symbol': order.get('symbol'),
-                                    'price': float(order.get('avgPrice', 0)),
-                                    'quantity': float(order.get('qty', 0)),
-                                    'amount_usdt': float(order.get('cumExecValue', 0)),
-                                    'executed_at': created_time
+                                    'price': avg_price,
+                                    'quantity': qty,
+                                    'amount_usdt': amount_usdt,
+                                    'executed_at': created_time,
+                                    'order_status': order.get('orderStatus')
                                 })
+                                logger.info(f"Found executed order: {order.get('orderId')} at {avg_price} USDT, qty {qty}")
                         except Exception as e:
-                            logger.error(f"Error parsing order time: {e}")
+                            logger.error(f"Error parsing order time for {order.get('orderId')}: {e}")
                             continue
             return executed
         except Exception as e:
@@ -1393,24 +1436,33 @@ class DCAStrategy:
         }
     
     async def check_executed_buy_orders(self, symbol: str) -> List[Dict]:
+        """Проверяет новые исполненные ордера на покупку"""
         last_check_str = self.db.get_setting('last_order_check_time', '')
         
+        # Устанавливаем время последней проверки
         if last_check_str:
             try:
                 last_check = datetime.fromisoformat(last_check_str)
             except:
+                # Если формат неверный, проверяем за последние 24 часа
                 last_check = datetime.now() - timedelta(hours=24)
         else:
-            last_check = datetime.now() - timedelta(hours=24)
+            # Если нет записи, проверяем за последние 7 дней
+            last_check = datetime.now() - timedelta(days=7)
+        
+        logger.info(f"Checking executed orders since {last_check.strftime('%Y-%m-%d %H:%M:%S')}")
         
         executed = await self.bybit.get_executed_orders_since(symbol, last_check)
         
+        # Сохраняем время текущей проверки
         self.db.set_setting('last_order_check_time', datetime.now().isoformat())
         
         new_executed = []
         for order in executed:
+            # Проверяем, был ли ордер уже обработан
             if not self.db.is_order_notified(order['order_id']):
                 new_executed.append(order)
+                # Добавляем в таблицу для отслеживания
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
@@ -1418,6 +1470,7 @@ class DCAStrategy:
                     order['quantity'],
                     order['amount_usdt']
                 )
+                logger.info(f"New executed order found: {order['order_id']} at {order['price']}")
         
         return new_executed
     
@@ -1656,8 +1709,9 @@ class FastDCABot:
     
     async def set_tracking_interval_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            f"⏱ Введите интервал проверки в минутах (от 5 до 1440):\n"
-            f"*Текущий интервал: {self.db.get_order_check_interval()} минут*",
+            f"⏱ Введите интервал проверки в минутах (от 1 до 1440):\n"
+            f"*Текущий интервал: {self.db.get_order_check_interval()} минут*\n\n"
+            f"Рекомендуется: 5-10 минут",
             reply_markup=self.get_cancel_keyboard(),
             parse_mode='Markdown'
         )
@@ -1671,7 +1725,7 @@ class FastDCABot:
         
         try:
             minutes = int(text)
-            if minutes < 5 or minutes > 1440:
+            if minutes < 1 or minutes > 1440:
                 raise ValueError
             
             self.db.set_order_check_interval(minutes)
@@ -1682,7 +1736,7 @@ class FastDCABot:
             return MANAGE_ORDERS
         except ValueError:
             await update.message.reply_text(
-                "❌ Некорректное значение. Введите число от 5 до 1440.",
+                "❌ Некорректное значение. Введите число от 1 до 1440.",
                 reply_markup=self.get_cancel_keyboard()
             )
             return WAITING_ORDER_CHECK_INTERVAL
@@ -3032,20 +3086,25 @@ class FastDCABot:
                 logger.error(f"Scheduler error: {e}")
     
     async def check_executed_orders_loop(self):
+        """Цикл проверки исполненных ордеров"""
         logger.info("Executed orders checker loop started")
+        
+        # Первая проверка через 10 секунд после запуска
+        await asyncio.sleep(10)
         
         while self.scheduler_running:
             try:
                 interval_minutes = self.db.get_order_check_interval()
-                await asyncio.sleep(interval_minutes * 60)
                 
                 if not self.db.get_order_execution_notify():
+                    await asyncio.sleep(interval_minutes * 60)
                     continue
                 
                 if not self.bybit_initialized:
                     self._init_bybit()
                 
                 if not self.bybit_initialized:
+                    await asyncio.sleep(interval_minutes * 60)
                     continue
                 
                 symbol = self.db.get_setting('symbol', 'TONUSDT')
@@ -3058,6 +3117,7 @@ class FastDCABot:
                         logger.info(f"Found {len(new_orders)} new executed orders")
                         
                         for order in new_orders:
+                            # Проверяем, не был ли ордер уже обработан
                             if self.db.is_order_notified(order['order_id']):
                                 continue
                             
@@ -3100,6 +3160,9 @@ class FastDCABot:
                 break
             except Exception as e:
                 logger.error(f"Executed orders checker error: {e}")
+            
+            # Ждем следующий интервал
+            await asyncio.sleep(self.db.get_order_check_interval() * 60)
     
     async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -3263,13 +3326,14 @@ class FastDCABot:
         return ConversationHandler.END
     
     async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
-        self.db.mark_order_as_added(order_id)
+        self.db.mark_order_as_skipped(order_id)
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
     
     async def post_init(self, application):
         self.scheduler_running = True
         asyncio.create_task(self.scheduler_loop())
         asyncio.create_task(self.check_executed_orders_loop())
+        logger.info("Bot initialized, scheduler loops started")
     
     def setup_handlers(self):
         logger.info("Setting up handlers...")
