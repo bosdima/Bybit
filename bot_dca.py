@@ -793,14 +793,20 @@ class Database:
         drop_percent = ((settings['start_price'] - price) / settings['start_price']) * 100
         return max(0, drop_percent)
     
-    def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float) -> bool:
+    def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float, executed_at: str = None) -> bool:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, added_to_stats)
-                VALUES (?, ?, ?, ?, ?, 0)
-            ''', (order_id, symbol, price, quantity, amount_usdt))
+            if executed_at:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                ''', (order_id, symbol, price, quantity, amount_usdt, executed_at))
+            else:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, added_to_stats)
+                    VALUES (?, ?, ?, ?, ?, 0)
+                ''', (order_id, symbol, price, quantity, amount_usdt))
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
@@ -926,7 +932,7 @@ class Database:
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '1.5',
+                'version': '1.6',
                 'purchases': purchases,
                 'sell_orders': sell_orders,
                 'settings': settings,
@@ -1178,13 +1184,15 @@ class BybitClient:
         orders = await self.get_open_orders(symbol)
         return [o for o in orders if o.get('side') == 'Sell']
     
-    async def get_order_history(self, symbol: str = None, limit: int = 100) -> List[Dict]:
+    async def get_order_history(self, symbol: str = None, limit: int = 200) -> List[Dict]:
+        """Получение истории ордеров за последние 30 дней"""
         try:
             if not self.session:
                 self._init_session()
             params = {"category": "spot", "limit": limit}
             if symbol:
                 params['symbol'] = symbol
+            
             response = self.session.get_order_history(**params)
             if response['retCode'] == 0:
                 return response['result']['list']
@@ -1194,12 +1202,13 @@ class BybitClient:
             return []
     
     async def get_executed_orders_since(self, symbol: str, since: datetime) -> List[Dict]:
+        """Получение исполненных ордеров с указанной даты"""
         try:
             orders = await self.get_order_history(symbol, limit=200)
             executed = []
             
             for order in orders:
-                if order.get('orderStatus') in ['Filled', 'PartiallyFilled'] and order.get('side') == 'Buy':
+                if order.get('orderStatus') in ['Filled'] and order.get('side') == 'Buy':
                     created_time_str = order.get('createdTime', '')
                     if created_time_str:
                         try:
@@ -1211,24 +1220,25 @@ class BybitClient:
                                 if avg_price == 0:
                                     avg_price = float(order.get('price', 0))
                                 
-                                qty = float(order.get('qty', 0))
-                                if qty == 0 and order.get('cumExecQty'):
-                                    qty = float(order.get('cumExecQty', 0))
+                                qty = float(order.get('cumExecQty', 0))
+                                if qty == 0:
+                                    qty = float(order.get('qty', 0))
                                 
                                 amount_usdt = float(order.get('cumExecValue', 0))
-                                if amount_usdt == 0:
+                                if amount_usdt == 0 and avg_price > 0:
                                     amount_usdt = avg_price * qty
                                 
-                                executed.append({
-                                    'order_id': order.get('orderId'),
-                                    'symbol': order.get('symbol'),
-                                    'price': avg_price,
-                                    'quantity': qty,
-                                    'amount_usdt': amount_usdt,
-                                    'executed_at': created_time,
-                                    'order_status': order.get('orderStatus')
-                                })
-                                logger.info(f"Found executed order: {order.get('orderId')} at {avg_price} USDT, qty {qty}")
+                                if qty > 0 and avg_price > 0:
+                                    executed.append({
+                                        'order_id': order.get('orderId'),
+                                        'symbol': order.get('symbol'),
+                                        'price': avg_price,
+                                        'quantity': qty,
+                                        'amount_usdt': amount_usdt,
+                                        'executed_at': created_time,
+                                        'order_status': order.get('orderStatus')
+                                    })
+                                    logger.info(f"Found executed order: {order.get('orderId')} at {avg_price} USDT, qty {qty}, date {created_time}")
                         except Exception as e:
                             logger.error(f"Error parsing order time for {order.get('orderId')}: {e}")
                             continue
@@ -1426,34 +1436,47 @@ class DCAStrategy:
         }
     
     async def check_executed_buy_orders(self, symbol: str) -> List[Dict]:
+        """Проверка исполненных ордеров за последние 30 дней"""
         last_check_str = self.db.get_setting('last_order_check_time', '')
+        
+        # Проверяем за последние 30 дней, чтобы не пропустить старые ордера
+        default_check = datetime.now() - timedelta(days=30)
         
         if last_check_str:
             try:
                 last_check = datetime.fromisoformat(last_check_str)
+                # Если последняя проверка была больше 7 дней назад, проверяем за 30 дней
+                if (datetime.now() - last_check).days > 7:
+                    last_check = datetime.now() - timedelta(days=30)
+                    logger.info(f"Last check was old, resetting to 30 days ago")
             except:
-                last_check = datetime.now() - timedelta(days=7)
+                last_check = default_check
         else:
-            last_check = datetime.now() - timedelta(days=7)
+            last_check = default_check
+            logger.info(f"No last check time, checking last 30 days")
         
         logger.info(f"Checking executed orders since {last_check.strftime('%Y-%m-%d %H:%M:%S')}")
         
         executed = await self.bybit.get_executed_orders_since(symbol, last_check)
         
+        # Сохраняем время проверки
         self.db.set_setting('last_order_check_time', datetime.now().isoformat())
         
         new_executed = []
         for order in executed:
             if not self.db.is_order_notified(order['order_id']):
-                new_executed.append(order)
+                # Сохраняем с точной датой исполнения
+                executed_at_str = order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
                     order['price'],
                     order['quantity'],
-                    order['amount_usdt']
+                    order['amount_usdt'],
+                    executed_at_str
                 )
-                logger.info(f"New executed order found: {order['order_id']} at {order['price']}")
+                new_executed.append(order)
+                logger.info(f"New executed order found: {order['order_id']} at {order['price']} on {executed_at_str}")
         
         return new_executed
     
@@ -1557,7 +1580,6 @@ class FastDCABot:
     def get_order_management_keyboard(self):
         keyboard = [
             [KeyboardButton("📋 Список открытых ордеров"), KeyboardButton("❌ Удалить ордер")],
-            [KeyboardButton("✏️ Изменить цену ордера"), KeyboardButton("⚙️ Настройки отслеживания")],
             [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -1584,8 +1606,9 @@ class FastDCABot:
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("💵 Сумма покупки")],
             [KeyboardButton("📊 Процент прибыли"), KeyboardButton("📉 Настройки падения")],
             [KeyboardButton("⏰ Время покупки"), KeyboardButton("🔄 Частота покупки")],
-            [KeyboardButton("🪜 Настройка лестницы"), KeyboardButton("📤 Экспорт базы")],
-            [KeyboardButton("📥 Импорт базы"), KeyboardButton("🔙 Назад в меню")],
+            [KeyboardButton("🪜 Настройка лестницы"), KeyboardButton("⚙️ Настройки отслеживания")],
+            [KeyboardButton("📤 Экспорт базы"), KeyboardButton("📥 Импорт базы")],
+            [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -1677,7 +1700,7 @@ class FastDCABot:
     
     async def tracking_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
-            return
+            return ConversationHandler.END
         
         current_status = self.db.get_order_execution_notify()
         current_interval = self.db.get_order_check_interval()
@@ -1707,8 +1730,8 @@ class FastDCABot:
     async def set_tracking_interval_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_order_management_keyboard())
-            return MANAGE_ORDERS
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
+            return ConversationHandler.END
         
         try:
             minutes = int(text)
@@ -1718,9 +1741,9 @@ class FastDCABot:
             self.db.set_order_check_interval(minutes)
             await update.message.reply_text(
                 f"✅ Интервал проверки изменен на {minutes} минут",
-                reply_markup=self.get_order_management_keyboard()
+                reply_markup=self.get_main_keyboard()
             )
-            return MANAGE_ORDERS
+            return ConversationHandler.END
         except ValueError:
             await update.message.reply_text(
                 "❌ Некорректное значение. Введите число от 1 до 1440.",
@@ -1732,17 +1755,17 @@ class FastDCABot:
         self.db.set_order_execution_notify(True)
         await update.message.reply_text(
             "✅ Отслеживание ордеров включено",
-            reply_markup=self.get_order_management_keyboard()
+            reply_markup=self.get_main_keyboard()
         )
-        return MANAGE_ORDERS
+        return ConversationHandler.END
     
     async def toggle_tracking_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.db.set_order_execution_notify(False)
         await update.message.reply_text(
             "⏹ Отслеживание ордеров выключено",
-            reply_markup=self.get_order_management_keyboard()
+            reply_markup=self.get_main_keyboard()
         )
-        return MANAGE_ORDERS
+        return ConversationHandler.END
     
     async def export_database(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3191,6 +3214,20 @@ class FastDCABot:
             await update.callback_query.edit_message_text("ℹ️ Этот ордер уже был добавлен в статистику.")
             return
         
+        # Используем дату исполнения ордера из базы
+        executed_at = order_dict.get('executed_at')
+        if executed_at:
+            try:
+                if isinstance(executed_at, str):
+                    date_obj = datetime.strptime(executed_at, "%Y-%m-%d %H:%M:%S")
+                else:
+                    date_obj = executed_at
+                purchase_date = date_obj.strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                purchase_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            purchase_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         drop_percent = self.db.get_drop_percent_from_start_price(order_dict['price'], order_dict['symbol'])
         step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
         step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
@@ -3203,7 +3240,7 @@ class FastDCABot:
             multiplier=1.0,
             drop_percent=drop_percent,
             step_level=step_level,
-            date=order_dict['executed_at']
+            date=purchase_date  # Используем дату исполнения ордера
         )
         
         if purchase_id:
@@ -3215,6 +3252,7 @@ class FastDCABot:
                 f"💰 Цена: `{format_price(order_dict['price'], 4)}` USDT\n"
                 f"📊 Количество: `{format_quantity(order_dict['quantity'], 6)}`\n"
                 f"💵 Сумма: `{order_dict['amount_usdt']:.2f}` USDT\n"
+                f"📅 Дата: `{purchase_date}`\n"
                 f"📉 Падение: `{drop_percent:.1f}%`\n"
                 f"📊 Уровень: {step_level}\n"
                 f"🆔 ID покупки: `{purchase_id}`",
@@ -3222,7 +3260,7 @@ class FastDCABot:
             )
             
             self.db.log_action('EXECUTED_ORDER_ADDED', order_dict['symbol'], 
-                              f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']}")
+                              f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']} от {purchase_date}")
             
             await self.send_sell_recommendation_from_callback(update, context)
             
@@ -3399,6 +3437,9 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start),
                     MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start),
                     MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu),
+                    MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
+                    MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database),
+                    MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
                 ],
                 SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
@@ -3484,9 +3525,6 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
         self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
-        
-        self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start))
         
         self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.cancel_import))
         
