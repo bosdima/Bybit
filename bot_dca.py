@@ -2,7 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЕТ ОТСЛЕЖИВАНИЕ ОРДЕРОВ
+ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЮТ ВСЕ КНОПКИ
 """
 
 import os
@@ -2428,6 +2428,7 @@ class FastDCABot:
         return SELECTING_ACTION
     
     async def ladder_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик для входа в меню настроек лестницы"""
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         
@@ -2445,6 +2446,7 @@ class FastDCABot:
         return LADDER_MENU
     
     async def show_ladder_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать текущие настройки лестницы"""
         if not await self._check_user_fast(update):
             return LADDER_MENU
         
@@ -2478,12 +2480,14 @@ class FastDCABot:
         return LADDER_MENU
     
     async def set_ladder_start_price_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запросить новую стартовую цену"""
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text("💰 Введите новую стартовую цену (USDT):", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("💰 Введите новую стартовую цену (USDT):\n\nПример: 2.35", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_START_PRICE
     
     async def set_ladder_start_price_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранить новую стартовую цену"""
         text = update.message.text.strip()
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_ladder_settings_keyboard())
@@ -2500,16 +2504,18 @@ class FastDCABot:
             await update.message.reply_text(f"✅ Стартовая цена установлена: {format_price(start_price, 4)} USDT", reply_markup=self.get_ladder_settings_keyboard())
             return LADDER_MENU
         except ValueError:
-            await update.message.reply_text("❌ Некорректная цена.", reply_markup=self.get_cancel_keyboard())
+            await update.message.reply_text("❌ Некорректная цена. Введите положительное число.", reply_markup=self.get_cancel_keyboard())
             return SET_LADDER_START_PRICE
     
     async def set_ladder_step_percent_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запросить новый шаг падения"""
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text("📊 Введите шаг падения в процентах (1-5%):\n*Рекомендуется 3%*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("📊 Введите шаг падения в процентах (1-5%):\n*Рекомендуется 3%*\n\nПример: 3", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_STEP_PERCENT
     
     async def set_ladder_step_percent_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранить новый шаг падения"""
         text = update.message.text.strip()
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_ladder_settings_keyboard())
@@ -2529,12 +2535,14 @@ class FastDCABot:
             return SET_LADDER_STEP_PERCENT
     
     async def set_ladder_max_depth_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запросить глубину просадки"""
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text("📉 Введите глубину просадки в процентах (50-90%):\n*Рекомендуется 80%*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("📉 Введите глубину просадки в процентах (30-95%):\n*Рекомендуется 80%*\n\nПример: 80", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_DEPTH
     
     async def set_ladder_max_depth_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранить глубину просадки"""
         text = update.message.text.strip()
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_ladder_settings_keyboard())
@@ -2554,12 +2562,14 @@ class FastDCABot:
             return SET_LADDER_DEPTH
     
     async def set_ladder_base_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запросить базовую сумму"""
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text("💵 Введите базовую сумму (мин 1 USDT):\n*Сумма первого ордера*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("💵 Введите базовую сумму (мин 1 USDT):\n*Сумма первого ордера*\n\nПример: 1.1", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_BASE_AMOUNT
     
     async def set_ladder_base_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранить базовую сумму"""
         text = update.message.text.strip()
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_ladder_settings_keyboard())
@@ -2580,12 +2590,14 @@ class FastDCABot:
             return SET_LADDER_BASE_AMOUNT
     
     async def set_ladder_max_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запросить максимальную сумму"""
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text("💰 Введите максимальную сумму (USDT):\n*Сумма последнего ордера*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("💰 Введите максимальную сумму (USDT):\n*Сумма последнего ордера*\n\nПример: 3.3", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_BASE_AMOUNT
     
     async def set_ladder_max_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранить максимальную сумму"""
         text = update.message.text.strip()
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_ladder_settings_keyboard())
@@ -2605,6 +2617,7 @@ class FastDCABot:
             return SET_LADDER_BASE_AMOUNT
     
     async def reset_ladder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сбросить лестницу"""
         if not await self._check_user_fast(update):
             return LADDER_MENU
         symbol = self.db.get_setting('symbol', 'TONUSDT')
