@@ -61,8 +61,8 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-# Версия бота
-BOT_VERSION = datetime.now().strftime("%y.%m.%d")
+# Версия бота - исправлена на правильный формат
+BOT_VERSION = "1.8 (30.03.2026)"
 
 # Состояния для ConversationHandler
 (
@@ -1938,6 +1938,35 @@ class FastDCABot:
             reply_markup=self.get_main_keyboard()
         )
     
+    async def handle_settings_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик для кнопки Настройки"""
+        if not await self._check_user_fast(update):
+            return
+        
+        # Очищаем любые активные разговоры
+        if context.user_data:
+            context.user_data.clear()
+        self.import_waiting = False
+        
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        invest_amount = self.db.get_setting('invest_amount', '1.1')
+        profit_percent = self.db.get_setting('profit_percent', '5')
+        schedule_time = self.db.get_setting('schedule_time', '09:00')
+        frequency_hours = self.db.get_setting('frequency_hours', '24')
+        
+        await update.message.reply_text(
+            f"⚙️ *Настройки*\n\n"
+            f"🪙 Токен: `{symbol}`\n"
+            f"💵 Сумма: `{invest_amount}` USDT\n"
+            f"📈 Прибыль: `{profit_percent}%`\n"
+            f"⏰ Время: `{schedule_time}`\n"
+            f"🔄 Частота: `{frequency_hours}`ч\n\n"
+            f"Выберите параметр для изменения:",
+            reply_markup=self.get_settings_keyboard(),
+            parse_mode='Markdown'
+        )
+        return SELECTING_ACTION
+    
     async def toggle_order_execution(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -3659,6 +3688,9 @@ class FastDCABot:
         
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
+        
+        # Обработчик для кнопки Настройки (прямой, без ConversationHandler)
+        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.handle_settings_button))
         
         sell_conv = ConversationHandler(
             entry_points=[],
