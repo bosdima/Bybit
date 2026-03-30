@@ -248,20 +248,42 @@ class Database:
                 )
             ''')
             
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS executed_orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_id TEXT NOT NULL UNIQUE,
-                    symbol TEXT NOT NULL,
-                    price REAL NOT NULL,
-                    quantity REAL NOT NULL,
-                    amount_usdt REAL NOT NULL,
-                    executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    added_to_stats BOOLEAN DEFAULT 0,
-                    skipped BOOLEAN DEFAULT 0,
-                    notified_at TIMESTAMP
-                )
-            ''')
+            # Проверяем существование таблицы executed_orders
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='executed_orders'")
+            table_exists = cursor.fetchone()
+            
+            if not table_exists:
+                # Создаем новую таблицу
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS executed_orders (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        order_id TEXT NOT NULL UNIQUE,
+                        symbol TEXT NOT NULL,
+                        price REAL NOT NULL,
+                        quantity REAL NOT NULL,
+                        amount_usdt REAL NOT NULL,
+                        executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        added_to_stats BOOLEAN DEFAULT 0,
+                        skipped BOOLEAN DEFAULT 0,
+                        notified_at TIMESTAMP
+                    )
+                ''')
+            else:
+                # Проверяем наличие колонок и добавляем отсутствующие
+                cursor.execute("PRAGMA table_info(executed_orders)")
+                columns = [col[1] for col in cursor.fetchall()]
+                
+                if 'skipped' not in columns:
+                    cursor.execute("ALTER TABLE executed_orders ADD COLUMN skipped BOOLEAN DEFAULT 0")
+                    logger.info("Added 'skipped' column to executed_orders")
+                
+                if 'notified_at' not in columns:
+                    cursor.execute("ALTER TABLE executed_orders ADD COLUMN notified_at TIMESTAMP")
+                    logger.info("Added 'notified_at' column to executed_orders")
+                
+                if 'added_to_stats' not in columns:
+                    cursor.execute("ALTER TABLE executed_orders ADD COLUMN added_to_stats BOOLEAN DEFAULT 0")
+                    logger.info("Added 'added_to_stats' column to executed_orders")
             
             defaults = [
                 ('symbol', 'TONUSDT'),
@@ -929,18 +951,33 @@ class Database:
             executed_rows = cursor.fetchall()
             executed_orders = []
             for row in executed_rows:
-                executed_orders.append({
-                    'id': row[0],
-                    'order_id': row[1],
-                    'symbol': row[2],
-                    'price': row[3],
-                    'quantity': row[4],
-                    'amount_usdt': row[5],
-                    'executed_at': row[6],
-                    'added_to_stats': row[7],
-                    'skipped': row[8],
-                    'notified_at': row[9]
-                })
+                # Определяем количество колонок
+                if len(row) >= 10:
+                    executed_orders.append({
+                        'id': row[0],
+                        'order_id': row[1],
+                        'symbol': row[2],
+                        'price': row[3],
+                        'quantity': row[4],
+                        'amount_usdt': row[5],
+                        'executed_at': row[6],
+                        'added_to_stats': row[7],
+                        'skipped': row[8] if len(row) > 8 else 0,
+                        'notified_at': row[9] if len(row) > 9 else None
+                    })
+                else:
+                    executed_orders.append({
+                        'id': row[0],
+                        'order_id': row[1],
+                        'symbol': row[2],
+                        'price': row[3],
+                        'quantity': row[4],
+                        'amount_usdt': row[5],
+                        'executed_at': row[6],
+                        'added_to_stats': row[7] if len(row) > 7 else 0,
+                        'skipped': 0,
+                        'notified_at': None
+                    })
             
             conn.close()
             
@@ -1475,13 +1512,20 @@ class DCAStrategy:
         # Также проверяем по order_id в executed_orders
         conn = sqlite3.connect(self.db.db_file, timeout=5)
         cursor = conn.cursor()
-        cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
-        executed_records = cursor.fetchall()
+        try:
+            cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
+            executed_records = cursor.fetchall()
+        except Exception as e:
+            logger.warning(f"Error querying executed_orders: {e}")
+            executed_records = []
         conn.close()
         
         processed_order_ids = set()
         for record in executed_records:
-            if record[1] == 1 or record[2] == 1:  # added_to_stats or skipped
+            # record может иметь разную длину в зависимости от версии БД
+            added_to_stats = record[1] if len(record) > 1 else 0
+            skipped = record[2] if len(record) > 2 else 0
+            if added_to_stats == 1 or skipped == 1:
                 processed_order_ids.add(record[0])
         
         missing_orders = []
@@ -1651,13 +1695,19 @@ class DCAStrategy:
         
         conn = sqlite3.connect(self.db.db_file, timeout=5)
         cursor = conn.cursor()
-        cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
-        executed_records = cursor.fetchall()
+        try:
+            cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
+            executed_records = cursor.fetchall()
+        except Exception as e:
+            logger.warning(f"Error querying executed_orders: {e}")
+            executed_records = []
         conn.close()
         
         processed_order_ids = set()
         for record in executed_records:
-            if record[1] == 1 or record[2] == 1:
+            added_to_stats = record[1] if len(record) > 1 else 0
+            skipped = record[2] if len(record) > 2 else 0
+            if added_to_stats == 1 or skipped == 1:
                 processed_order_ids.add(record[0])
         
         missing_orders = []
