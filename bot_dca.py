@@ -1588,7 +1588,8 @@ class FastDCABot:
         keyboard = [
             [KeyboardButton("✅ Включить отслеживание"), KeyboardButton("⏹ Выключить отслеживание")],
             [KeyboardButton("⏱ Изменить интервал проверки")],
-            [KeyboardButton("🔙 Назад в меню")]
+            [KeyboardButton("🔙 Назад в настройки")],
+            [KeyboardButton("🏠 Главное меню")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -1730,7 +1731,10 @@ class FastDCABot:
     async def set_tracking_interval_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
+            await update.message.reply_text(
+                "❌ Отменено",
+                reply_markup=self.get_settings_keyboard()
+            )
             return ConversationHandler.END
         
         try:
@@ -1741,7 +1745,7 @@ class FastDCABot:
             self.db.set_order_check_interval(minutes)
             await update.message.reply_text(
                 f"✅ Интервал проверки изменен на {minutes} минут",
-                reply_markup=self.get_main_keyboard()
+                reply_markup=self.get_settings_keyboard()
             )
             return ConversationHandler.END
         except ValueError:
@@ -1755,7 +1759,7 @@ class FastDCABot:
         self.db.set_order_execution_notify(True)
         await update.message.reply_text(
             "✅ Отслеживание ордеров включено",
-            reply_markup=self.get_main_keyboard()
+            reply_markup=self.get_settings_keyboard()
         )
         return ConversationHandler.END
     
@@ -1763,7 +1767,15 @@ class FastDCABot:
         self.db.set_order_execution_notify(False)
         await update.message.reply_text(
             "⏹ Отслеживание ордеров выключено",
-            reply_markup=self.get_main_keyboard()
+            reply_markup=self.get_settings_keyboard()
+        )
+        return ConversationHandler.END
+    
+    async def back_to_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "⚙️ *Настройки*",
+            reply_markup=self.get_settings_keyboard(),
+            parse_mode='Markdown'
         )
         return ConversationHandler.END
     
@@ -3393,7 +3405,8 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(✅ Включить отслеживание)$'), self.toggle_tracking_on),
                     MessageHandler(filters.Regex('^(⏹ Выключить отслеживание)$'), self.toggle_tracking_off),
                     MessageHandler(filters.Regex('^(⏱ Изменить интервал проверки)$'), self.set_tracking_interval_start),
-                    MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
+                    MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
+                    MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
                 ],
                 WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_tracking_interval_done)],
             },
