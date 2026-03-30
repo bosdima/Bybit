@@ -257,7 +257,9 @@ class Database:
                     quantity REAL NOT NULL,
                     amount_usdt REAL NOT NULL,
                     executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    added_to_stats BOOLEAN DEFAULT 0
+                    added_to_stats BOOLEAN DEFAULT 0,
+                    skipped BOOLEAN DEFAULT 0,
+                    notified_at TIMESTAMP
                 )
             ''')
             
@@ -282,7 +284,7 @@ class Database:
                 ('order_execution_notify', 'true'),
                 ('order_check_interval_minutes', '5'),
                 ('last_order_check_time', ''),
-                ('last_auto_check_time', ''),
+                ('last_full_check_time', ''),
             ]
             
             for key, value in defaults:
@@ -800,13 +802,13 @@ class Database:
             cursor = conn.cursor()
             if executed_at:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats)
-                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                    INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats, skipped, notified_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL)
                 ''', (order_id, symbol, price, quantity, amount_usdt, executed_at))
             else:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, added_to_stats)
-                    VALUES (?, ?, ?, ?, ?, 0)
+                    INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, added_to_stats, skipped, notified_at)
+                    VALUES (?, ?, ?, ?, ?, 0, 0, NULL)
                 ''', (order_id, symbol, price, quantity, amount_usdt))
             success = cursor.rowcount > 0
             conn.commit()
@@ -820,7 +822,7 @@ class Database:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ? AND added_to_stats = 1', (order_id,))
+            cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ? AND (added_to_stats = 1 OR skipped = 1)', (order_id,))
             exists = cursor.fetchone() is not None
             conn.close()
             return exists
@@ -832,7 +834,7 @@ class Database:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
-            cursor.execute('UPDATE executed_orders SET added_to_stats = 1 WHERE order_id = ?', (order_id,))
+            cursor.execute('UPDATE executed_orders SET added_to_stats = 1, notified_at = CURRENT_TIMESTAMP WHERE order_id = ?', (order_id,))
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
@@ -845,10 +847,7 @@ class Database:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR IGNORE INTO executed_orders (order_id, added_to_stats)
-                VALUES (?, 1)
-            ''', (order_id,))
+            cursor.execute('UPDATE executed_orders SET skipped = 1, notified_at = CURRENT_TIMESTAMP WHERE order_id = ?', (order_id,))
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
@@ -869,8 +868,8 @@ class Database:
     def set_order_check_interval(self, minutes: int):
         self.set_setting('order_check_interval_minutes', str(minutes))
     
-    def get_last_auto_check_time(self) -> Optional[datetime]:
-        time_str = self.get_setting('last_auto_check_time', '')
+    def get_last_full_check_time(self) -> Optional[datetime]:
+        time_str = self.get_setting('last_full_check_time', '')
         if time_str:
             try:
                 return datetime.fromisoformat(time_str)
@@ -878,8 +877,8 @@ class Database:
                 return None
         return None
     
-    def set_last_auto_check_time(self, check_time: datetime):
-        self.set_setting('last_auto_check_time', check_time.isoformat())
+    def set_last_full_check_time(self, check_time: datetime):
+        self.set_setting('last_full_check_time', check_time.isoformat())
     
     def export_database(self) -> Tuple[bool, int, str]:
         try:
@@ -938,14 +937,16 @@ class Database:
                     'quantity': row[4],
                     'amount_usdt': row[5],
                     'executed_at': row[6],
-                    'added_to_stats': row[7]
+                    'added_to_stats': row[7],
+                    'skipped': row[8],
+                    'notified_at': row[9]
                 })
             
             conn.close()
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '1.7',
+                'version': '1.8',
                 'purchases': purchases,
                 'sell_orders': sell_orders,
                 'settings': settings,
@@ -1083,8 +1084,8 @@ class Database:
                 try:
                     cursor.execute('''
                         INSERT OR IGNORE INTO executed_orders 
-                        (id, order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats, skipped, notified_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         executed.get('id'),
                         executed.get('order_id'),
@@ -1093,7 +1094,9 @@ class Database:
                         executed.get('quantity', 0),
                         executed.get('amount_usdt', 0),
                         executed.get('executed_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                        executed.get('added_to_stats', 0)
+                        executed.get('added_to_stats', 0),
+                        executed.get('skipped', 0),
+                        executed.get('notified_at')
                     ))
                 except Exception as e:
                     logger.warning(f"Error importing executed order: {e}")
@@ -1214,9 +1217,10 @@ class BybitClient:
             logger.error(f"Error getting order history: {e}")
             return []
     
-    async def get_executed_orders_since(self, symbol: str, since: datetime) -> List[Dict]:
-        """Получение исполненных ордеров с указанной даты"""
+    async def get_all_executed_orders(self, symbol: str, days: int = 30) -> List[Dict]:
+        """Получение всех исполненных ордеров за указанное количество дней"""
         try:
+            check_date = datetime.now() - timedelta(days=days)
             orders = await self.get_order_history(symbol, limit=200)
             executed = []
             
@@ -1228,7 +1232,7 @@ class BybitClient:
                             created_time_ms = int(created_time_str)
                             created_time = datetime.fromtimestamp(created_time_ms / 1000)
                             
-                            if created_time > since:
+                            if created_time > check_date:
                                 avg_price = float(order.get('avgPrice', 0))
                                 if avg_price == 0:
                                     avg_price = float(order.get('price', 0))
@@ -1448,124 +1452,234 @@ class DCAStrategy:
             'profit_percent': profit_percent
         }
     
-    async def check_executed_buy_orders(self, symbol: str, check_from_last: bool = True) -> List[Dict]:
-        """Проверка исполненных ордеров за последние 30 дней"""
-        if check_from_last:
-            last_check_str = self.db.get_setting('last_order_check_time', '')
-            if last_check_str:
-                try:
-                    last_check = datetime.fromisoformat(last_check_str)
-                    # Если последняя проверка была больше 7 дней назад, проверяем за 30 дней
-                    if (datetime.now() - last_check).days > 7:
-                        last_check = datetime.now() - timedelta(days=30)
-                        logger.info(f"Last check was old, resetting to 30 days ago")
-                except:
-                    last_check = datetime.now() - timedelta(days=30)
-            else:
-                last_check = datetime.now() - timedelta(days=30)
-                logger.info(f"No last check time, checking last 30 days")
-        else:
-            last_check = datetime.now() - timedelta(days=90)
+    async def check_and_notify_missing_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Полная проверка всех ордеров за последние 30 дней и уведомление о пропущенных"""
+        logger.info(f"Performing full check for missing orders for {symbol}")
         
-        logger.info(f"Checking executed orders since {last_check.strftime('%Y-%m-%d %H:%M:%S')}")
+        # Получаем все ордера с биржи за последние 30 дней
+        all_orders = await self.bybit.get_all_executed_orders(symbol, days=30)
+        logger.info(f"Found {len(all_orders)} total executed orders from exchange")
         
-        executed = await self.bybit.get_executed_orders_since(symbol, last_check)
+        # Получаем уже добавленные покупки из статистики
+        purchases = self.db.get_purchases(symbol)
         
-        # Сохраняем время проверки
-        self.db.set_setting('last_order_check_time', datetime.now().isoformat())
+        # Создаем множество для быстрого поиска уже добавленных ордеров
+        # Сравниваем по цене и количеству (так как order_id может не совпадать)
+        added_orders = set()
+        for p in purchases:
+            # Создаем ключ из цены и количества с округлением
+            price_key = round(p['price'], 4)
+            qty_key = round(p['quantity'], 6)
+            added_orders.add(f"{price_key}_{qty_key}")
         
-        new_executed = []
-        for order in executed:
-            if not self.db.is_order_notified(order['order_id']):
-                # Сохраняем с точной датой исполнения
-                executed_at_str = order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
+        # Также проверяем по order_id в executed_orders
+        conn = sqlite3.connect(self.db.db_file, timeout=5)
+        cursor = conn.cursor()
+        cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
+        executed_records = cursor.fetchall()
+        conn.close()
+        
+        processed_order_ids = set()
+        for record in executed_records:
+            if record[1] == 1 or record[2] == 1:  # added_to_stats or skipped
+                processed_order_ids.add(record[0])
+        
+        missing_orders = []
+        
+        for order in all_orders:
+            # Проверяем по order_id
+            if order['order_id'] in processed_order_ids:
+                continue
+            
+            # Проверяем по цене и количеству
+            price_key = round(order['price'], 4)
+            qty_key = round(order['quantity'], 6)
+            if f"{price_key}_{qty_key}" in added_orders:
+                # Отмечаем как обработанный в базе
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
                     order['price'],
                     order['quantity'],
                     order['amount_usdt'],
-                    executed_at_str
+                    order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
+                )
+                self.db.mark_order_as_added(order['order_id'])
+                continue
+            
+            # Если ордер не найден в статистике, добавляем в список пропущенных
+            # Сохраняем в базу
+            self.db.add_executed_order(
+                order['order_id'],
+                symbol,
+                order['price'],
+                order['quantity'],
+                order['amount_usdt'],
+                order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
+            )
+            missing_orders.append(order)
+            logger.info(f"Missing order found: {order['order_id']} at {order['price']} on {order['executed_at']}")
+        
+        # Отправляем уведомления о пропущенных ордерах
+        notified_count = 0
+        for order in missing_orders:
+            msg = (
+                f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
+                f"🪙 Токен: `{symbol}`\n"
+                f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
+                f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
+                f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
+                f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                f"❗ *Добавить в статистику покупок?*"
+            )
+            
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
+                    InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
+                ]
+            ])
+            
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=msg,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+                notified_count += 1
+                logger.info(f"Sent notification for missing order {order['order_id']}")
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
+        
+        # Сохраняем время последней полной проверки
+        self.db.set_last_full_check_time(datetime.now())
+        
+        return missing_orders
+    
+    async def auto_check_and_notify(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Автоматическая проверка и отправка уведомлений (вызывается по таймеру)"""
+        last_check = self.db.get_last_full_check_time()
+        
+        # Проверяем, нужно ли делать полную проверку
+        # Если последняя проверка была больше 24 часов назад или ее не было, делаем полную проверку
+        if last_check is None or (datetime.now() - last_check).total_seconds() > 24 * 3600:
+            logger.info("Performing full check for missing orders")
+            return await self.check_and_notify_missing_orders(symbol, user_id, bot)
+        else:
+            # Иначе просто проверяем новые ордера с последней проверки
+            logger.info("Performing incremental check for new orders")
+            return await self.check_new_orders(symbol, user_id, bot)
+    
+    async def check_new_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Проверка новых ордеров с последней проверки"""
+        last_check_str = self.db.get_setting('last_order_check_time', '')
+        
+        if last_check_str:
+            try:
+                last_check = datetime.fromisoformat(last_check_str)
+            except:
+                last_check = datetime.now() - timedelta(days=7)
+        else:
+            last_check = datetime.now() - timedelta(days=30)
+        
+        logger.info(f"Checking new orders since {last_check.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        executed = await self.bybit.get_all_executed_orders(symbol, days=30)
+        
+        self.db.set_setting('last_order_check_time', datetime.now().isoformat())
+        
+        new_executed = []
+        for order in executed:
+            if order['executed_at'] > last_check and not self.db.is_order_notified(order['order_id']):
+                self.db.add_executed_order(
+                    order['order_id'],
+                    symbol,
+                    order['price'],
+                    order['quantity'],
+                    order['amount_usdt'],
+                    order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
                 )
                 new_executed.append(order)
-                logger.info(f"New executed order found: {order['order_id']} at {order['price']} on {executed_at_str}")
+                logger.info(f"New order found: {order['order_id']} at {order['price']} on {order['executed_at']}")
+        
+        notified_count = 0
+        for order in new_executed:
+            msg = (
+                f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
+                f"🪙 Токен: `{symbol}`\n"
+                f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
+                f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
+                f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
+                f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                f"❗ *Добавить в статистику покупок?*"
+            )
+            
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
+                    InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
+                ]
+            ])
+            
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=msg,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+                notified_count += 1
+                logger.info(f"Sent notification for new order {order['order_id']}")
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
         
         return new_executed
     
-    async def auto_check_and_notify(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        """Автоматическая проверка и отправка уведомлений"""
-        new_orders = await self.check_executed_buy_orders(symbol, check_from_last=True)
-        
-        if new_orders:
-            logger.info(f"Auto check found {len(new_orders)} new executed orders")
-            
-            for order in new_orders:
-                if self.db.is_order_notified(order['order_id']):
-                    continue
-                
-                msg = (
-                    f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
-                    f"🪙 Токен: `{symbol}`\n"
-                    f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
-                    f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
-                    f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
-                    f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                    f"❗ *Добавить в статистику покупок?*"
-                )
-                
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
-                        InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
-                    ]
-                ])
-                
-                try:
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=msg,
-                        parse_mode='Markdown',
-                        reply_markup=keyboard
-                    )
-                    logger.info(f"Auto notification sent for order {order['order_id']}")
-                except Exception as e:
-                    logger.error(f"Error sending auto notification: {e}")
-        
-        return new_orders
-    
     async def force_check_executed_orders(self, symbol: str) -> Dict:
-        """Принудительная проверка исполненных ордеров (для теста)"""
-        check_date = datetime.now() - timedelta(days=90)
+        """Принудительная проверка всех исполненных ордеров (для теста)"""
+        all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
         
-        logger.info(f"Force checking executed orders since {check_date.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        executed = await self.bybit.get_executed_orders_since(symbol, check_date)
-        
-        # Получаем существующие покупки
         purchases = self.db.get_purchases(symbol)
+        
+        # Создаем множество для быстрого поиска уже добавленных ордеров
+        added_orders = set()
+        for p in purchases:
+            price_key = round(p['price'], 4)
+            qty_key = round(p['quantity'], 6)
+            added_orders.add(f"{price_key}_{qty_key}")
+        
+        conn = sqlite3.connect(self.db.db_file, timeout=5)
+        cursor = conn.cursor()
+        cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
+        executed_records = cursor.fetchall()
+        conn.close()
+        
+        processed_order_ids = set()
+        for record in executed_records:
+            if record[1] == 1 or record[2] == 1:
+                processed_order_ids.add(record[0])
         
         missing_orders = []
         already_added = []
         
-        for order in executed:
-            if self.db.is_order_notified(order['order_id']):
+        for order in all_orders:
+            if order['order_id'] in processed_order_ids:
+                already_added.append(order)
+                continue
+            
+            price_key = round(order['price'], 4)
+            qty_key = round(order['quantity'], 6)
+            if f"{price_key}_{qty_key}" in added_orders:
                 already_added.append(order)
             else:
-                # Проверяем, есть ли такая покупка в статистике
-                found = False
-                for p in purchases:
-                    if abs(p['price'] - order['price']) < 0.01 and abs(p['quantity'] - order['quantity']) < 0.001:
-                        found = True
-                        break
-                
-                if not found:
-                    missing_orders.append(order)
+                missing_orders.append(order)
         
         return {
-            'total_found': len(executed),
+            'total_found': len(all_orders),
             'already_added': len(already_added),
             'missing': missing_orders,
-            'check_date': check_date
+            'check_date': datetime.now() - timedelta(days=90)
         }
     
     async def place_full_sell_order(self, symbol: str, profit_percent: float) -> Dict:
@@ -1637,7 +1751,6 @@ class FastDCABot:
         self.scheduler_running = False
         self.authorized_user_id = None
         self.pending_executed_order = None
-        self.last_auto_check_time = None
         
         self.setup_handlers()
     
