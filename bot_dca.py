@@ -932,7 +932,7 @@ class Database:
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '1.6',
+                'version': '1.7',
                 'purchases': purchases,
                 'sell_orders': sell_orders,
                 'settings': settings,
@@ -1480,6 +1480,46 @@ class DCAStrategy:
         
         return new_executed
     
+    async def force_check_executed_orders(self, symbol: str) -> Dict:
+        """Принудительная проверка исполненных ордеров (для теста)"""
+        # Проверяем за последние 90 дней для теста
+        check_date = datetime.now() - timedelta(days=90)
+        
+        logger.info(f"Force checking executed orders since {check_date.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        executed = await self.bybit.get_executed_orders_since(symbol, check_date)
+        
+        # Получаем существующие покупки
+        purchases = self.db.get_purchases(symbol)
+        purchase_order_ids = set()
+        for p in purchases:
+            # Здесь нет прямой связи, поэтому нужно сопоставлять по цене и количеству
+            pass
+        
+        missing_orders = []
+        already_added = []
+        
+        for order in executed:
+            if self.db.is_order_notified(order['order_id']):
+                already_added.append(order)
+            else:
+                # Проверяем, есть ли такая покупка в статистике
+                found = False
+                for p in purchases:
+                    if abs(p['price'] - order['price']) < 0.01 and abs(p['quantity'] - order['quantity']) < 0.001:
+                        found = True
+                        break
+                
+                if not found:
+                    missing_orders.append(order)
+        
+        return {
+            'total_found': len(executed),
+            'already_added': len(already_added),
+            'missing': missing_orders,
+            'check_date': check_date
+        }
+    
     async def place_full_sell_order(self, symbol: str, profit_percent: float) -> Dict:
         try:
             stats = self.db.get_dca_stats(symbol)
@@ -1549,6 +1589,7 @@ class FastDCABot:
         self.scheduler_running = False
         self.authorized_user_id = None
         self.pending_executed_order = None
+        self.last_notification_time = {}  # Для отслеживания времени последнего уведомления
         
         self.setup_handlers()
     
@@ -1585,9 +1626,16 @@ class FastDCABot:
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     def get_tracking_settings_keyboard(self):
+        current_status = self.db.get_order_execution_notify()
+        if current_status:
+            tracking_button = "✅ Отслеживание включено"
+        else:
+            tracking_button = "❌ Отслеживание выключено"
+        
         keyboard = [
-            [KeyboardButton("✅ Включить отслеживание"), KeyboardButton("⏹ Выключить отслеживание")],
+            [KeyboardButton(tracking_button)],
             [KeyboardButton("⏱ Изменить интервал проверки")],
+            [KeyboardButton("🔍 Тест отслеживания")],
             [KeyboardButton("🔙 Назад в настройки")],
             [KeyboardButton("🏠 Главное меню")]
         ]
@@ -1718,6 +1766,20 @@ class FastDCABot:
         )
         return NOTIFICATION_SETTINGS_MENU
     
+    async def toggle_tracking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Переключение отслеживания (включить/выключить)"""
+        current = self.db.get_order_execution_notify()
+        new_status = not current
+        self.db.set_order_execution_notify(new_status)
+        
+        status_text = "✅ Включено" if new_status else "⏹ Выключено"
+        
+        await update.message.reply_text(
+            f"📋 Отслеживание ордеров: {status_text}",
+            reply_markup=self.get_tracking_settings_keyboard()
+        )
+        return NOTIFICATION_SETTINGS_MENU
+    
     async def set_tracking_interval_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏱ Введите интервал проверки в минутах (от 1 до 1440):\n"
@@ -1733,9 +1795,9 @@ class FastDCABot:
         if text == "❌ Отмена":
             await update.message.reply_text(
                 "❌ Отменено",
-                reply_markup=self.get_settings_keyboard()
+                reply_markup=self.get_tracking_settings_keyboard()
             )
-            return ConversationHandler.END
+            return NOTIFICATION_SETTINGS_MENU
         
         try:
             minutes = int(text)
@@ -1745,9 +1807,9 @@ class FastDCABot:
             self.db.set_order_check_interval(minutes)
             await update.message.reply_text(
                 f"✅ Интервал проверки изменен на {minutes} минут",
-                reply_markup=self.get_settings_keyboard()
+                reply_markup=self.get_tracking_settings_keyboard()
             )
-            return ConversationHandler.END
+            return NOTIFICATION_SETTINGS_MENU
         except ValueError:
             await update.message.reply_text(
                 "❌ Некорректное значение. Введите число от 1 до 1440.",
@@ -1755,21 +1817,50 @@ class FastDCABot:
             )
             return WAITING_ORDER_CHECK_INTERVAL
     
-    async def toggle_tracking_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.db.set_order_execution_notify(True)
-        await update.message.reply_text(
-            "✅ Отслеживание ордеров включено",
-            reply_markup=self.get_settings_keyboard()
-        )
-        return ConversationHandler.END
-    
-    async def toggle_tracking_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.db.set_order_execution_notify(False)
-        await update.message.reply_text(
-            "⏹ Отслеживание ордеров выключено",
-            reply_markup=self.get_settings_keyboard()
-        )
-        return ConversationHandler.END
+    async def test_tracking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Тестовая проверка отслеживания"""
+        if not await self._check_user_fast(update):
+            return NOTIFICATION_SETTINGS_MENU
+        
+        await update.message.reply_text("🔍 *Запускаю тест отслеживания...*\n\nЭто может занять некоторое время...", parse_mode='Markdown')
+        
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_tracking_settings_keyboard())
+            return NOTIFICATION_SETTINGS_MENU
+        
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        
+        try:
+            result = await self.strategy.force_check_executed_orders(symbol)
+            
+            message = f"📊 *РЕЗУЛЬТАТ ТЕСТА ОТСЛЕЖИВАНИЯ*\n\n"
+            message += f"🪙 Токен: `{symbol}`\n"
+            message += f"📅 Проверка за последние 90 дней\n\n"
+            message += f"📋 Всего найдено ордеров: `{result['total_found']}`\n"
+            message += f"✅ Уже добавлено в статистику: `{result['already_added']}`\n"
+            message += f"❌ Отсутствуют в статистике: `{len(result['missing'])}`\n\n"
+            
+            if result['missing']:
+                message += f"*Ордера, которых нет в статистике:*\n"
+                for i, order in enumerate(result['missing'][:10], 1):
+                    message += f"{i}. {format_price(order['price'], 4)} USDT | {format_quantity(order['quantity'], 6)} | {order['amount_usdt']:.2f} USDT\n"
+                    message += f"   📅 {order['executed_at'].strftime('%d.%m.%Y %H:%M')}\n"
+                if len(result['missing']) > 10:
+                    message += f"\n_...и еще {len(result['missing']) - 10} ордеров_"
+                
+                message += f"\n\n💡 *Рекомендация:*\n"
+                message += f"Включите автоматическое отслеживание, чтобы бот сам предлагал добавить эти ордера."
+            else:
+                message += f"✨ *Отлично!* Все ордера уже добавлены в статистику."
+            
+            await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_tracking_settings_keyboard())
+            
+        except Exception as e:
+            logger.error(f"Error in test tracking: {e}")
+            await update.message.reply_text(f"❌ Ошибка при тестировании: {str(e)}", reply_markup=self.get_tracking_settings_keyboard())
+        
+        return NOTIFICATION_SETTINGS_MENU
     
     async def back_to_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
@@ -3402,9 +3493,9 @@ class FastDCABot:
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
             states={
                 NOTIFICATION_SETTINGS_MENU: [
-                    MessageHandler(filters.Regex('^(✅ Включить отслеживание)$'), self.toggle_tracking_on),
-                    MessageHandler(filters.Regex('^(⏹ Выключить отслеживание)$'), self.toggle_tracking_off),
+                    MessageHandler(filters.Regex('^(✅ Отслеживание включено|❌ Отслеживание выключено)$'), self.toggle_tracking),
                     MessageHandler(filters.Regex('^(⏱ Изменить интервал проверки)$'), self.set_tracking_interval_start),
+                    MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
                     MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
                     MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
                 ],
