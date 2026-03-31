@@ -61,7 +61,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-# Версия бота - исправлена на правильный формат
+# Версия бота
 BOT_VERSION = "1.8 (31.03.2026)"
 
 # Состояния для ConversationHandler
@@ -1986,6 +1986,11 @@ class FastDCABot:
             
             await update.message.reply_text("⏳ Выставляю ордер на продажу...")
             
+            self._init_bybit()
+            if not self.bybit_initialized:
+                await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_main_keyboard())
+                return
+            
             result = await self.strategy.place_full_sell_order(
                 sell_data['symbol'],
                 sell_data['profit_percent']
@@ -3697,17 +3702,6 @@ class FastDCABot:
         
         # Обработчик для кнопки подтверждения продажи
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
-        
-        sell_conv = ConversationHandler(
-            entry_points=[],
-            states={
-                WAITING_SELL_CONFIRMATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.confirm_sell_order)],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="sell_confirmation_conversation",
-            persistent=False,
-        )
-        self.application.add_handler(sell_conv)
         
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
