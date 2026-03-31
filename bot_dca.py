@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
@@ -62,7 +62,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота - исправлена на правильный формат
-BOT_VERSION = "1.8 (30.03.2026)"
+BOT_VERSION = "1.8 (31.03.2026)"
 
 # Состояния для ConversationHandler
 (
@@ -1967,6 +1967,53 @@ class FastDCABot:
         )
         return SELECTING_ACTION
     
+    async def handle_sell_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик для кнопки подтверждения продажи"""
+        if not await self._check_user_fast(update):
+            return
+        
+        text = update.message.text.strip()
+        
+        if text == "❌ Нет, отмена":
+            await update.message.reply_text("❌ Продажа отменена", reply_markup=self.get_main_keyboard())
+            return
+        
+        if text == "✅ Да, выставить ордер на продажу":
+            sell_data = context.user_data.get('pending_sell_data')
+            if not sell_data:
+                await update.message.reply_text("❌ Данные о продаже не найдены", reply_markup=self.get_main_keyboard())
+                return
+            
+            await update.message.reply_text("⏳ Выставляю ордер на продажу...")
+            
+            result = await self.strategy.place_full_sell_order(
+                sell_data['symbol'],
+                sell_data['profit_percent']
+            )
+            
+            if result['success']:
+                msg = (
+                    f"✅ *Ордер на продажу успешно создан!*\n\n"
+                    f"🪙 Токен: `{sell_data['symbol']}`\n"
+                    f"📊 Количество: `{format_quantity(result['quantity'], 6)}`\n"
+                    f"💰 Цена: `{format_price(result['price'], 4)}` USDT\n"
+                    f"📈 Целевая прибыль: `{result['profit_percent']}%`\n"
+                    f"🆔 ID ордера: `{result['order_id']}`\n\n"
+                    f"✅ Ордер успешно выставлен!"
+                )
+                await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=self.get_main_keyboard())
+                self.db.log_action('SELL_ORDER_PLACED', sell_data['symbol'], 
+                                   f"Ордер на продажу {result['quantity']:.6f} по {result['price']:.4f} USDT")
+            else:
+                await update.message.reply_text(
+                    f"❌ *Ошибка при создании ордера на продажу*\n\n"
+                    f"Ошибка: `{result['error']}`",
+                    parse_mode='Markdown',
+                    reply_markup=self.get_main_keyboard()
+                )
+            
+            context.user_data.pop('pending_sell_data', None)
+    
     async def toggle_order_execution(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -3582,6 +3629,7 @@ class FastDCABot:
             self.db.log_action('EXECUTED_ORDER_ADDED', order_dict['symbol'], 
                               f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']} от {purchase_date}")
             
+            # После добавления покупки показываем рекомендацию по продаже
             await self.send_sell_recommendation_from_callback(update, context)
             
         else:
@@ -3619,6 +3667,7 @@ class FastDCABot:
             f"✅ *Выставить ордер на продажу по цене {format_price(rounded_price, 4)} USDT?*"
         )
         
+        # Сохраняем данные для продажи в context.user_data
         context.user_data['pending_sell_data'] = {
             'total_quantity': total_quantity,
             'rounded_price': rounded_price,
@@ -3633,52 +3682,6 @@ class FastDCABot:
             parse_mode='Markdown'
         )
     
-    async def confirm_sell_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        
-        if text == "❌ Нет, отмена":
-            await update.message.reply_text("❌ Продажа отменена", reply_markup=self.get_main_keyboard())
-            return ConversationHandler.END
-        
-        if text == "✅ Да, выставить ордер на продажу":
-            sell_data = context.user_data.get('pending_sell_data')
-            if not sell_data:
-                await update.message.reply_text("❌ Данные о продаже не найдены", reply_markup=self.get_main_keyboard())
-                return ConversationHandler.END
-            
-            await update.message.reply_text("⏳ Выставляю ордер на продажу...")
-            
-            result = await self.strategy.place_full_sell_order(
-                sell_data['symbol'],
-                sell_data['profit_percent']
-            )
-            
-            if result['success']:
-                msg = (
-                    f"✅ *Ордер на продажу успешно создан!*\n\n"
-                    f"🪙 Токен: `{sell_data['symbol']}`\n"
-                    f"📊 Количество: `{format_quantity(result['quantity'], 6)}`\n"
-                    f"💰 Цена: `{format_price(result['price'], 4)}` USDT\n"
-                    f"📈 Целевая прибыль: `{result['profit_percent']}%`\n"
-                    f"🆔 ID ордера: `{result['order_id']}`\n\n"
-                    f"📋 *ТЕКУЩИЕ ОРДЕРА НА ПРОДАЖУ:*"
-                )
-                await update.message.reply_text(msg, parse_mode='Markdown')
-                
-                await self.show_open_orders(update, context)
-            else:
-                await update.message.reply_text(
-                    f"❌ *Ошибка при создании ордера на продажу*\n\n"
-                    f"Ошибка: `{result['error']}`",
-                    parse_mode='Markdown',
-                    reply_markup=self.get_main_keyboard()
-                )
-            
-            context.user_data.pop('pending_sell_data', None)
-            return ConversationHandler.END
-        
-        return ConversationHandler.END
-    
     async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         self.db.mark_order_as_skipped(order_id)
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
@@ -3691,6 +3694,9 @@ class FastDCABot:
         
         # Обработчик для кнопки Настройки (прямой, без ConversationHandler)
         self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.handle_settings_button))
+        
+        # Обработчик для кнопки подтверждения продажи
+        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
         
         sell_conv = ConversationHandler(
             entry_points=[],
