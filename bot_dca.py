@@ -2,8 +2,9 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЮТ ВСЕ КНОПКИ (v1.9.1)
+ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЮТ ВСЕ КНОПКИ
 """
+
 import os
 import sys
 import asyncio
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Dict, List, Optional, Tuple
 from colorama import init, Fore, Style
+
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
@@ -60,7 +62,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "1.9.1 (Исправление кнопок)"
+BOT_VERSION = "1.9 (01.04.2026)"
 
 # Состояния для ConversationHandler
 (
@@ -105,19 +107,23 @@ POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 MAX_DROP_DEPTH = 80
 STEP_PERCENT = 3
 
+
 def format_price(price: float, decimals: int = 4) -> str:
     if price is None:
         return "N/A"
     return f"{price:.{decimals}f}"
+
 
 def format_quantity(qty: float, decimals: int = 6) -> str:
     if qty is None:
         return "N/A"
     return f"{qty:.{decimals}f}"
 
+
 def round_price_up(price: float) -> float:
     """Округляет цену вверх до сотых долей"""
     return math.ceil(price * 100) / 100
+
 
 def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
     if drop_percent <= 0:
@@ -126,30 +132,37 @@ def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
     max_level = int(MAX_DROP_DEPTH / STEP_PERCENT)
     if level > max_level:
         level = max_level
+    
     if max_level == 0:
         ratio = 0
     else:
         ratio = (level / max_level) * 3
     ratio = min(ratio, 3.0)
+    
     return level, ratio
+
 
 def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float) -> float:
     if drop_percent <= 0:
         return base_amount
+    
     level, ratio = get_ladder_levels(drop_percent)
+    
     if ratio >= 3:
         amount = max_amount
     elif ratio <= 0:
         amount = base_amount
     else:
         amount = base_amount + (max_amount - base_amount) * (ratio / 3)
+    
     return min(amount, max_amount)
+
 
 class Database:
     def __init__(self, db_file: str = "dca_bot.db"):
         self.db_file = db_file
         self.init_db()
-
+    
     def init_db(self):
         try:
             conn = sqlite3.connect(self.db_file, timeout=10)
@@ -162,11 +175,11 @@ class Database:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-             
+            
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS dca_purchases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL, 
+                    symbol TEXT NOT NULL,
                     amount_usdt REAL NOT NULL,
                     price REAL NOT NULL,
                     quantity REAL NOT NULL,
@@ -175,7 +188,7 @@ class Database:
                     step_level INTEGER DEFAULT 0,
                     date TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ) 
+                )
             ''')
             
             cursor.execute('''
@@ -243,7 +256,7 @@ class Database:
                     CREATE TABLE IF NOT EXISTS executed_orders (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         order_id TEXT NOT NULL UNIQUE,
-                        symbol TEXT NOT NULL, 
+                        symbol TEXT NOT NULL,
                         price REAL NOT NULL,
                         quantity REAL NOT NULL,
                         amount_usdt REAL NOT NULL,
@@ -305,10 +318,10 @@ class Database:
             
             conn.commit()
             conn.close()
-            logger.info("Database initialized successfully")
+            logger.info(f"Database initialized successfully")
         except Exception as e:
             logger.error(f"DB init error: {e}")
-
+    
     def get_setting(self, key: str, default: str = '') -> str:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -319,7 +332,7 @@ class Database:
             return result[0] if result else default
         except Exception:
             return default
-
+    
     def set_setting(self, key: str, value: str):
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -332,7 +345,7 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error setting {key}: {e}")
-
+    
     def add_purchase(self, symbol: str, amount_usdt: float, price: float, 
                      quantity: float, multiplier: float = 1.0, drop_percent: float = 0,
                      step_level: int = 0, date: str = None):
@@ -353,7 +366,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error adding purchase: {e}")
             return None
-
+    
     def get_purchases(self, symbol: str = None) -> List[Dict]:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -369,7 +382,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting purchases: {e}")
             return []
-
+    
     def get_purchase_by_id(self, purchase_id: int) -> Optional[Dict]:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -382,7 +395,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting purchase {purchase_id}: {e}")
             return None
-
+    
     def update_purchase(self, purchase_id: int, **kwargs) -> bool:
         allowed_fields = ['symbol', 'amount_usdt', 'price', 'quantity', 'multiplier', 'drop_percent', 'step_level', 'date']
         updates = []
@@ -406,7 +419,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error updating purchase {purchase_id}: {e}")
             return False
-
+    
     def delete_purchase(self, purchase_id: int) -> bool:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -419,7 +432,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error deleting purchase {purchase_id}: {e}")
             return False
-
+    
     def get_dca_stats(self, symbol: str) -> Dict:
         purchases = self.get_purchases(symbol)
         if not purchases:
@@ -433,14 +446,14 @@ class Database:
             'total_quantity': total_qty,
             'avg_price': avg_price,
         }
-
+    
     def get_highest_price(self, symbol: str) -> float:
         purchases = self.get_purchases(symbol)
         if not purchases:
             return 0
         highest_price = max(p['price'] for p in purchases)
         return highest_price
-
+    
     def add_sell_order(self, symbol: str, order_id: str, quantity: float, 
                        target_price: float, profit_percent: float):
         try:
@@ -461,7 +474,7 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error adding sell order: {e}")
-
+    
     def get_active_sell_orders(self, symbol: str = None) -> List[Dict]:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -477,7 +490,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting active sell orders: {e}")
             return []
-
+    
     def update_sell_order_status(self, order_id: str, status: str):
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -487,7 +500,7 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error updating order status: {e}")
-
+    
     def delete_sell_order(self, order_id: str) -> bool:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -500,7 +513,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error deleting sell order: {e}")
             return False
-
+    
     def update_order_price(self, order_id: str, new_price: float, new_profit_percent: float):
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -511,7 +524,7 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error updating order price: {e}")
-
+    
     def log_action(self, action: str, symbol: str = None, details: str = None):
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -521,7 +534,7 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error logging action: {e}")
-
+    
     def set_dca_start(self, symbol: str, initial_price: float):
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -533,7 +546,7 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error setting dca start: {e}")
-
+    
     def get_ladder_settings(self, symbol: str = None) -> Dict:
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
@@ -569,7 +582,7 @@ class Database:
                 'current_drop_percent': 0,
                 'last_buy_price': None
             }
-
+    
     def save_ladder_settings(self, settings: Dict):
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -599,7 +612,7 @@ class Database:
             self.set_setting('ladder_max_amount', str(settings['max_amount']))
         except Exception as e:
             logger.error(f"Error saving ladder settings: {e}")
-
+    
     def calculate_ladder_purchase(self, current_price: float, symbol: str = None) -> Dict:
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
@@ -619,11 +632,13 @@ class Database:
         last_purchases = sorted([p for p in purchases if p.get('step_level', 0) > 0], key=lambda x: x['date'], reverse=True)
         
         max_drop = 0
+        
         for p in last_purchases:
             if p.get('drop_percent', 0) > max_drop:
                 max_drop = p.get('drop_percent', 0)
         
         current_drop = ((settings['start_price'] - current_price) / settings['start_price']) * 100
+        
         step_percent = settings['step_percent']
         next_level = int((max_drop + step_percent) / step_percent) * step_percent
         
@@ -632,6 +647,7 @@ class Database:
         
         if current_drop >= next_level and next_level > max_drop:
             level, ratio = get_ladder_levels(next_level)
+            
             base_amount = settings['base_amount']
             max_amount = settings['max_amount']
             
@@ -673,7 +689,7 @@ class Database:
             'next_drop': next_level,
             'reason': f'Ждем падения до {next_level:.1f}% ({format_price(next_price)})'
         }
-
+    
     def get_recommendation_for_current_drop(self, drop_percent: float, symbol: str = None) -> Dict:
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
@@ -688,6 +704,7 @@ class Database:
         
         step_percent = settings['step_percent']
         level_drop = int(drop_percent / step_percent) * step_percent
+        
         amount = get_amount_by_drop(level_drop, settings['base_amount'], settings['max_amount'])
         level, ratio = get_ladder_levels(level_drop)
         
@@ -698,7 +715,7 @@ class Database:
             'amount_usdt': amount,
             'level': level
         }
-
+    
     def get_ladder_summary(self, symbol: str = None, current_price: float = None) -> Dict:
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
@@ -777,7 +794,7 @@ class Database:
             'current_drop': current_drop,
             'steps': steps
         }
-
+    
     def reset_ladder(self, symbol: str = None):
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
@@ -785,7 +802,7 @@ class Database:
         settings['current_drop_percent'] = 0
         settings['last_buy_price'] = settings['start_price']
         self.save_ladder_settings(settings)
-
+    
     def get_drop_percent_from_start_price(self, price: float, symbol: str = None) -> float:
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
@@ -797,7 +814,7 @@ class Database:
         
         drop_percent = ((settings['start_price'] - price) / settings['start_price']) * 100
         return max(0, drop_percent)
-
+    
     def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float, executed_at: str = None) -> bool:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -819,7 +836,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error adding executed order: {e}")
             return False
-
+    
     def is_order_notified(self, order_id: str) -> bool:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -831,7 +848,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error checking order notified: {e}")
             return False
-
+    
     def mark_order_as_added(self, order_id: str) -> bool:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -844,7 +861,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error marking order as added: {e}")
             return False
-
+    
     def mark_order_as_skipped(self, order_id: str) -> bool:
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -857,19 +874,19 @@ class Database:
         except Exception as e:
             logger.error(f"Error marking order as skipped: {e}")
             return False
-
+    
     def get_order_execution_notify(self) -> bool:
         return self.get_setting('order_execution_notify', 'true') == 'true'
-
+    
     def set_order_execution_notify(self, enabled: bool):
         self.set_setting('order_execution_notify', 'true' if enabled else 'false')
-
+    
     def get_order_check_interval(self) -> int:
         return int(self.get_setting('order_check_interval_minutes', '5'))
-
+    
     def set_order_check_interval(self, minutes: int):
         self.set_setting('order_check_interval_minutes', str(minutes))
-
+    
     def get_last_full_check_time(self) -> Optional[datetime]:
         time_str = self.get_setting('last_full_check_time', '')
         if time_str:
@@ -878,10 +895,10 @@ class Database:
             except:
                 return None
         return None
-
+    
     def set_last_full_check_time(self, check_time: datetime):
         self.set_setting('last_full_check_time', check_time.isoformat())
-
+    
     def export_database(self) -> Tuple[bool, int, str]:
         try:
             purchases = self.get_purchases()
@@ -962,7 +979,7 @@ class Database:
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '1.9.1',
+                'version': '1.9',
                 'purchases': purchases,
                 'sell_orders': sell_orders,
                 'settings': settings,
@@ -979,7 +996,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error exporting database: {e}")
             return False, 0, str(e)
-
+    
     def import_database(self, file_path: str) -> Tuple[bool, str]:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -1127,6 +1144,7 @@ class Database:
             logger.error(f"Error importing database: {e}")
             return False, str(e)
 
+
 class BybitClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -1137,14 +1155,14 @@ class BybitClient:
         self._cache_time = {}
         self._cache_ttl = 5
         self._init_session()
-
+    
     def _init_session(self):
         try:
             self.session = HTTP(testnet=self.testnet, api_key=self.api_key, api_secret=self.api_secret, recv_window=5000)
             logger.info("Bybit session initialized")
         except Exception as e:
             logger.error(f"Session init error: {e}")
-
+    
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
         now = time.time()
         if symbol in self._cache_time and now - self._cache_time.get(symbol, 0) < self._cache_ttl:
@@ -1162,7 +1180,7 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error getting price for {symbol}: {e}")
             return None
-
+    
     async def get_balance(self, coin: str = None) -> Dict:
         try:
             if not self.session:
@@ -1189,7 +1207,7 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error in get_balance: {e}")
             return {'error': str(e)}
-
+    
     async def get_open_orders(self, symbol: str = None) -> List[Dict]:
         try:
             if not self.session:
@@ -1204,17 +1222,17 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error getting open orders: {e}")
             return []
-
+    
     async def get_open_orders_by_side(self, symbol: str = None) -> Dict[str, List[Dict]]:
         orders = await self.get_open_orders(symbol)
         buy_orders = [o for o in orders if o.get('side') == 'Buy']
         sell_orders = [o for o in orders if o.get('side') == 'Sell']
         return {'buy': buy_orders, 'sell': sell_orders}
-
+    
     async def get_sell_orders(self, symbol: str = None) -> List[Dict]:
         orders = await self.get_open_orders(symbol)
         return [o for o in orders if o.get('side') == 'Sell']
-
+    
     async def get_order_history(self, symbol: str = None, limit: int = 200) -> List[Dict]:
         try:
             if not self.session:
@@ -1230,7 +1248,7 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error getting order history: {e}")
             return []
-
+    
     async def get_all_executed_orders(self, symbol: str, days: int = 30) -> List[Dict]:
         try:
             check_date = datetime.now() - timedelta(days=days)
@@ -1276,7 +1294,7 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error getting executed orders: {e}")
             return []
-
+    
     async def cancel_order(self, symbol: str, order_id: str) -> Dict:
         try:
             if not self.session:
@@ -1287,7 +1305,7 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-
+    
     async def amend_order_price(self, symbol: str, order_id: str, new_price: float) -> Dict:
         try:
             if not self.session:
@@ -1298,7 +1316,7 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-
+    
     async def place_limit_sell(self, symbol: str, quantity: float, price: float) -> Dict:
         try:
             if not self.session:
@@ -1309,7 +1327,7 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-
+    
     async def place_market_buy(self, symbol: str, amount_usdt: float) -> Dict:
         try:
             if not self.session:
@@ -1341,7 +1359,7 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-
+    
     async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float) -> Dict:
         try:
             if not self.session:
@@ -1365,11 +1383,12 @@ class BybitClient:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
+
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
         self.bybit = bybit
-
+    
     async def execute_ladder_purchase(self, symbol: str, profit_percent: float) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
@@ -1416,7 +1435,7 @@ class DCAStrategy:
             self.db.log_action('LADDER_PURCHASE', symbol, f"Уровень {drop_percent:.1f}%: {result['total_usdt']:.2f} USDT")
         
         return result
-
+    
     async def check_and_update_sell_orders(self, symbol: str):
         active_orders = self.db.get_active_sell_orders(symbol)
         open_orders = await self.bybit.get_open_orders(symbol)
@@ -1426,7 +1445,7 @@ class DCAStrategy:
             if order['order_id'] not in open_order_ids:
                 self.db.update_sell_order_status(order['order_id'], 'completed')
                 self.db.log_action('SELL_COMPLETED', symbol, f"Продано по {format_price(order['target_price'])}")
-
+    
     async def get_recommended_purchase(self, symbol: str) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
@@ -1443,7 +1462,7 @@ class DCAStrategy:
             return {'success': True, 'should_buy': False, 'reason': ladder_info['reason'],
                    'current_price': current_price, 'next_buy_price': ladder_info['target_price'],
                    'next_drop': ladder_info.get('next_drop', 0)}
-
+    
     def calculate_target_info(self, stats: Dict, profit_percent: float) -> Dict:
         if not stats or stats['total_quantity'] <= 0:
             return None
@@ -1463,7 +1482,7 @@ class DCAStrategy:
             'avg_price': avg_price,
             'profit_percent': profit_percent
         }
-
+    
     async def check_and_notify_missing_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
         logger.info(f"Performing full check for missing orders for {symbol}")
         
@@ -1558,7 +1577,7 @@ class DCAStrategy:
         self.db.set_last_full_check_time(datetime.now())
         
         return missing_orders
-
+    
     async def auto_check_and_notify(self, symbol: str, user_id: int, bot) -> List[Dict]:
         last_check = self.db.get_last_full_check_time()
         
@@ -1568,7 +1587,7 @@ class DCAStrategy:
         else:
             logger.info("Performing incremental check for new orders")
             return await self.check_new_orders(symbol, user_id, bot)
-
+    
     async def check_new_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
         last_check_str = self.db.get_setting('last_order_check_time', '')
         
@@ -1630,7 +1649,7 @@ class DCAStrategy:
                 logger.error(f"Error sending notification: {e}")
         
         return new_executed
-
+    
     async def force_check_executed_orders(self, symbol: str) -> Dict:
         all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
         
@@ -1680,7 +1699,7 @@ class DCAStrategy:
             'missing': missing_orders,
             'check_date': datetime.now() - timedelta(days=90)
         }
-
+    
     async def place_full_sell_order(self, symbol: str, profit_percent: float) -> Dict:
         try:
             stats = self.db.get_dca_stats(symbol)
@@ -1716,7 +1735,7 @@ class DCAStrategy:
                     profit_percent=profit_percent
                 )
                 self.db.log_action('FULL_SELL_ORDER', symbol, 
-                                    f"Ордер на продажу {total_quantity:.6f} {coin} по {rounded_price:.4f} USDT")
+                                   f"Ордер на продажу {total_quantity:.6f} {coin} по {rounded_price:.4f} USDT")
                 
                 return {
                     'success': True,
@@ -1733,6 +1752,7 @@ class DCAStrategy:
             logger.error(f"Error placing full sell order: {e}")
             return {'success': False, 'error': str(e)}
 
+
 class FastDCABot:
     def __init__(self):
         self.db = Database()
@@ -1740,6 +1760,7 @@ class FastDCABot:
         self.strategy = None
         self.bybit_initialized = False
         self.import_waiting = False
+        
         request_kwargs = {'connect_timeout': 60.0, 'read_timeout': 60.0, 'write_timeout': 60.0, 'pool_timeout': 60.0}
         request = HTTPXRequest(**request_kwargs)
         builder = Application.builder().token(TELEGRAM_TOKEN).request(request)
@@ -1750,7 +1771,7 @@ class FastDCABot:
         self.pending_executed_order = None
         
         self.setup_handlers()
-
+    
     def _init_bybit(self):
         if not self.bybit_initialized and BYBIT_API_KEY and BYBIT_API_SECRET:
             try:
@@ -1760,7 +1781,7 @@ class FastDCABot:
                 logger.info("Bybit client initialized")
             except Exception as e:
                 logger.error(f"Bybit init error: {e}")
-
+    
     def get_main_keyboard(self):
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         dca_button = "⏹ Остановить Авто DCA" if is_active else "🚀 Запустить Авто DCA"
@@ -1775,14 +1796,14 @@ class FastDCABot:
             [KeyboardButton("🏠 Главное меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+    
     def get_order_management_keyboard(self):
         keyboard = [
             [KeyboardButton("📋 Список открытых ордеров"), KeyboardButton("❌ Удалить ордер")],
             [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+    
     def get_tracking_settings_keyboard(self):
         current_status = self.db.get_order_execution_notify()
         if current_status:
@@ -1798,16 +1819,16 @@ class FastDCABot:
             [KeyboardButton("🏠 Главное меню")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+    
     def get_cancel_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-
+    
     def get_sell_confirmation_keyboard(self):
         return ReplyKeyboardMarkup([
             [KeyboardButton("✅ Да, выставить ордер на продажу")],
             [KeyboardButton("❌ Нет, отмена")]
         ], resize_keyboard=True)
-
+    
     def get_settings_keyboard(self):
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("💵 Сумма покупки")],
@@ -1818,7 +1839,7 @@ class FastDCABot:
             [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+    
     def get_ladder_settings_keyboard(self):
         keyboard = [
             [KeyboardButton("💰 Цена старта"), KeyboardButton("📊 Шаг падения (%)")],
@@ -1827,7 +1848,7 @@ class FastDCABot:
             [KeyboardButton("🔄 Сбросить лестницу"), KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+    
     def get_symbol_selection_keyboard(self):
         keyboard = []
         for symbol in POPULAR_SYMBOLS:
@@ -1835,7 +1856,7 @@ class FastDCABot:
         keyboard.append([KeyboardButton("✏️ Ввести свой токен")])
         keyboard.append([KeyboardButton("❌ Отмена")])
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+    
     def get_edit_purchases_keyboard(self):
         keyboard = [
             [KeyboardButton("💰 Изменить цену"), KeyboardButton("📊 Изменить количество")],
@@ -1843,10 +1864,10 @@ class FastDCABot:
             [KeyboardButton("🔙 Назад к списку"), KeyboardButton("🏠 Главное меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+    
     def get_confirm_delete_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, удалить"), KeyboardButton("❌ Нет, отмена")]], resize_keyboard=True)
-
+    
     def get_purchases_list_keyboard(self, purchases):
         keyboard = []
         for p in purchases:
@@ -1858,10 +1879,10 @@ class FastDCABot:
             keyboard.append([KeyboardButton(btn_text)])
         keyboard.append([KeyboardButton("🏠 Главное меню")])
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+    
     def get_manual_buy_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-
+    
     async def _check_user_fast(self, update: Update) -> bool:
         user = update.effective_user
         username = f"@{user.username}" if user.username else f"ID:{user.id}"
@@ -1873,29 +1894,28 @@ class FastDCABot:
             return True
         await update.message.reply_text("⛔ Доступ запрещен")
         return False
-
+    
     async def cmd_start_fast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        # Сброс флага импорта
+        # Очищаем состояние при старте
+        context.user_data.clear()
         self.import_waiting = False
         await update.message.reply_text(
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
             f"📌 Версия: {BOT_VERSION}\n\n"
-            f"Главное меню: ",
+            f"Главное меню:",
             reply_markup=self.get_main_keyboard()
         )
-
+    
     async def show_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
         
-        # Сброс флага импорта
+        # Очищаем состояние
+        context.user_data.clear()
         self.import_waiting = False
-        
-        if context.user_
-            context.user_data.clear()
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         invest_amount = self.db.get_setting('invest_amount', '1.1')
@@ -1910,17 +1930,14 @@ class FastDCABot:
             f"📈 Прибыль: `{profit_percent}%`\n"
             f"⏰ Время: `{schedule_time}`\n"
             f"🔄 Частота: `{frequency_hours}`ч\n\n"
-            f"Выберите параметр для изменения: ",
+            f"Выберите параметр для изменения:",
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
         )
-
+    
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        
-        # Сброс флага импорта
-        self.import_waiting = False
         
         await update.message.reply_text("⏳ Экспортирую базу данных...")
         success, count, file_path = self.db.export_database()
@@ -1936,7 +1953,7 @@ class FastDCABot:
                 await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
         else:
             await update.message.reply_text(f"❌ Ошибка экспорта: {file_path}")
-
+    
     async def handle_import_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -1950,7 +1967,7 @@ class FastDCABot:
             reply_markup=self.get_cancel_keyboard(),
             parse_mode='Markdown'
         )
-
+    
     async def handle_import_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -1992,14 +2009,14 @@ class FastDCABot:
             logger.error(f"Error in import: {e}")
             self.import_waiting = False
             await update.message.reply_text(f"❌ Ошибка при импорте: {str(e)}", reply_markup=self.get_main_keyboard())
-
+    
     async def handle_import_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if self.import_waiting:
             self.import_waiting = False
             await update.message.reply_text("❌ Импорт отменен", reply_markup=self.get_main_keyboard())
         else:
             await update.message.reply_text("Нет активного импорта", reply_markup=self.get_main_keyboard())
-
+    
     async def handle_sell_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -2012,7 +2029,7 @@ class FastDCABot:
         
         if text == "✅ Да, выставить ордер на продажу":
             sell_data = context.user_data.get('pending_sell_data')
-            if not sell_
+            if not sell_data:
                 await update.message.reply_text("❌ Данные о продаже не найдены", reply_markup=self.get_main_keyboard())
                 return
             
@@ -2050,13 +2067,10 @@ class FastDCABot:
                 )
             
             context.user_data.pop('pending_sell_data', None)
-
+    
     async def toggle_order_execution(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        
-        # Сброс флага импорта
-        self.import_waiting = False
         
         current = self.db.get_order_execution_notify()
         new_status = not current
@@ -2073,13 +2087,10 @@ class FastDCABot:
             parse_mode='Markdown',
             reply_markup=self.get_main_keyboard()
         )
-
+    
     async def tracking_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
-        # Сброс флага импорта
-        self.import_waiting = False
         
         current_status = self.db.get_order_execution_notify()
         current_interval = self.db.get_order_check_interval()
@@ -2090,12 +2101,12 @@ class FastDCABot:
             f"⚙️ *Настройки отслеживания ордеров*\n\n"
             f"📋 Статус: {status_text}\n"
             f"🕐 Интервал проверки: `{current_interval}` минут\n\n"
-            f"Выберите действие: ",
+            f"Выберите действие:",
             reply_markup=self.get_tracking_settings_keyboard(),
             parse_mode='Markdown'
         )
         return NOTIFICATION_SETTINGS_MENU
-
+    
     async def toggle_tracking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = self.db.get_order_execution_notify()
         new_status = not current
@@ -2108,7 +2119,7 @@ class FastDCABot:
             reply_markup=self.get_tracking_settings_keyboard()
         )
         return NOTIFICATION_SETTINGS_MENU
-
+    
     async def set_tracking_interval_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏱ Введите интервал проверки в минутах (от 1 до 1440):\n"
@@ -2118,7 +2129,7 @@ class FastDCABot:
             parse_mode='Markdown'
         )
         return WAITING_ORDER_CHECK_INTERVAL
-
+    
     async def set_tracking_interval_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -2145,7 +2156,7 @@ class FastDCABot:
                 reply_markup=self.get_cancel_keyboard()
             )
             return WAITING_ORDER_CHECK_INTERVAL
-
+    
     async def test_tracking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return NOTIFICATION_SETTINGS_MENU
@@ -2189,24 +2200,18 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка при тестировании: {str(e)}", reply_markup=self.get_tracking_settings_keyboard())
         
         return NOTIFICATION_SETTINGS_MENU
-
+    
     async def back_to_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Сброс флага импорта
-        self.import_waiting = False
-        
         await update.message.reply_text(
             "⚙️ *Настройки*",
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
         )
         return ConversationHandler.END
-
+    
     async def orders_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
-        # Сброс флага импорта
-        self.import_waiting = False
         
         self._init_bybit()
         if not self.bybit_initialized:
@@ -2225,7 +2230,7 @@ class FastDCABot:
                 f"🪙 Токен: `{symbol}`\n"
                 f"🔴 Ордера на продажу: `{sell_count}`\n"
                 f"🟢 Ордера на покупку: `{buy_count}`\n\n"
-                f"Выберите действие: ",
+                f"Выберите действие:",
                 reply_markup=self.get_order_management_keyboard(),
                 parse_mode='Markdown'
             )
@@ -2234,13 +2239,10 @@ class FastDCABot:
             logger.error(f"Error in orders_menu: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
             return ConversationHandler.END
-
+    
     async def show_open_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        
-        # Сброс флага импорта
-        self.import_waiting = False
         
         self._init_bybit()
         if not self.bybit_initialized:
@@ -2286,13 +2288,10 @@ class FastDCABot:
         except Exception as e:
             logger.error(f"Error showing open orders: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=self.get_order_management_keyboard())
-
+    
     async def cancel_order_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
-        # Сброс флага импорта
-        self.import_waiting = False
         
         self._init_bybit()
         if not self.bybit_initialized:
@@ -2330,7 +2329,7 @@ class FastDCABot:
             
             message = f"🗑 *УДАЛЕНИЕ ОРДЕРА*\n\n"
             message += f"🪙 Токен: `{symbol}`\n\n"
-            message += f"Выберите ордер для удаления (введите номер): "
+            message += f"Выберите ордер для удаления (введите номер):"
             
             await update.message.reply_text(message, parse_mode='Markdown', reply_markup=cancel_keyboard)
             return WAITING_ORDER_ID_TO_CANCEL
@@ -2339,7 +2338,7 @@ class FastDCABot:
             logger.error(f"Error in cancel_order_start: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=self.get_order_management_keyboard())
             return ConversationHandler.END
-
+    
     async def cancel_order_execute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -2429,14 +2428,10 @@ class FastDCABot:
                 reply_markup=self.get_order_management_keyboard()
             )
             return ConversationHandler.END
-
+    
     async def show_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        
-        # Сброс флага импорта
-        self.import_waiting = False
-        
         self._init_bybit()
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
@@ -2487,14 +2482,17 @@ class FastDCABot:
         except Exception as e:
             logger.error(f"Error in show_portfolio: {e}")
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-
+    
     async def show_dca_stats_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает детальную статистику DCA"""
         if not await self._check_user_fast(update):
             return
         
-        # Сброс флага импорта
+        # Сбрасываем состояние импорта
         self.import_waiting = False
+        # Очищаем user_data, чтобы выйти из возможных разговоров
+        if context.user_data:
+            context.user_data.clear()
         
         self._init_bybit()
         if not self.bybit_initialized:
@@ -2558,14 +2556,10 @@ class FastDCABot:
         except Exception as e:
             logger.error(f"Error in show_dca_stats_detailed: {e}")
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-
+    
     async def show_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        
-        # Сброс флага импорта
-        self.import_waiting = False
-        
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         invest_amount = float(self.db.get_setting('invest_amount', '1.1'))
@@ -2590,14 +2584,10 @@ class FastDCABot:
             message += f"\n📊 Всего покупок: `{stats['total_purchases']}`\n💰 Вложено: `{stats['total_usdt']:.2f}` USDT"
         
         await update.message.reply_text(message, parse_mode='Markdown')
-
+    
     async def toggle_dca(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        
-        # Сброс флага импорта
-        self.import_waiting = False
-        
         self._init_bybit()
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
@@ -2642,15 +2632,12 @@ class FastDCABot:
                 f"📉 Макс. просадка: {MAX_DROP_DEPTH}%",
                 reply_markup=self.get_main_keyboard()
             )
-
+    
     # ============= НАСТРОЙКИ =============
-
+    
     async def settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
-        # Сброс флага импорта
-        self.import_waiting = False
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         invest_amount = self.db.get_setting('invest_amount', '1.1')
@@ -2665,16 +2652,16 @@ class FastDCABot:
             f"📈 Прибыль: `{profit_percent}%`\n"
             f"⏰ Время: `{schedule_time}`\n"
             f"🔄 Частота: `{frequency_hours}`ч\n\n"
-            f"Выберите параметр для изменения: ",
+            f"Выберите параметр для изменения:",
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
         )
         return SELECTING_ACTION
-
+    
     async def set_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💵 Введите сумму (текущая: {self.db.get_setting('invest_amount', '1.1')}):\n*Это базовая сумма для лестницы*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_AMOUNT
-
+    
     async def set_amount_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text in ["❌ ОТМЕНА", "❌ Отмена"]:
@@ -2694,11 +2681,11 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_settings_keyboard())
         return SELECTING_ACTION
-
+    
     async def set_profit_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📊 Введите процент прибыли (текущий: {self.db.get_setting('profit_percent', '5')}%):", reply_markup=self.get_cancel_keyboard())
         return SET_PROFIT_PERCENT
-
+    
     async def set_profit_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text in ["❌ ОТМЕНА", "❌ Отмена"]:
@@ -2713,11 +2700,11 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_settings_keyboard())
         return SELECTING_ACTION
-
+    
     async def set_drop_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📉 Введите макс. падение % и множитель (текущие: {self.db.get_setting('max_drop_percent', '60')}% x{self.db.get_setting('max_multiplier', '3')}):\nНапример: 60 3", reply_markup=self.get_cancel_keyboard())
         return SET_MAX_DROP
-
+    
     async def set_drop_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text in ["❌ ОТМЕНА", "❌ Отмена"]:
@@ -2741,11 +2728,11 @@ class FastDCABot:
         except Exception:
             await update.message.reply_text("❌ Ошибка формата. Используйте: 60 3", reply_markup=self.get_settings_keyboard())
         return SELECTING_ACTION
-
+    
     async def set_time_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '09:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
         return SET_SCHEDULE_TIME
-
+    
     async def set_time_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         time_str = update.message.text.strip()
         if time_str in ["❌ ОТМЕНА", "❌ Отмена"]:
@@ -2758,11 +2745,11 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Некорректный формат. Используйте ЧЧ:ММ", reply_markup=self.get_settings_keyboard())
         return SELECTING_ACTION
-
+    
     async def set_frequency_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"🔄 Введите частоту в часах (текущая: {self.db.get_setting('frequency_hours', '2')}):", reply_markup=self.get_cancel_keyboard())
+        await update.message.reply_text(f"🔄 Введите частоту в часах (текущая: {self.db.get_setting('frequency_hours', '24')}):", reply_markup=self.get_cancel_keyboard())
         return SET_FREQUENCY_HOURS
-
+    
     async def set_frequency_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text in ["❌ ОТМЕНА", "❌ Отмена"]:
@@ -2777,17 +2764,13 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Введите число от 1 до 720", reply_markup=self.get_settings_keyboard())
         return SELECTING_ACTION
-
+    
     async def set_symbol_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return SELECTING_ACTION
-        
-        # Сброс флага импорта
-        self.import_waiting = False
-        
         await update.message.reply_text(f"🪙 Выберите токен или введите свой\nТекущий: {self.db.get_setting('symbol', 'TONUSDT')}", reply_markup=self.get_symbol_selection_keyboard())
         return SELECTING_SYMBOL
-
+    
     async def process_symbol_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -2801,14 +2784,14 @@ class FastDCABot:
         else:
             await update.message.reply_text("❌ Неверный выбор.", reply_markup=self.get_symbol_selection_keyboard())
             return SELECTING_SYMBOL
-
+    
     async def set_symbol_manual(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = update.message.text.upper().strip()
         if symbol in ["❌ ОТМЕНА", "❌ Отмена"]:
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
             return SELECTING_ACTION
         return await self._validate_and_set_symbol(update, symbol)
-
+    
     async def _validate_and_set_symbol(self, update: Update, symbol: str) -> int:
         self._init_bybit()
         if not self.bybit_initialized:
@@ -2837,13 +2820,10 @@ class FastDCABot:
         self.db.save_ladder_settings(ladder)
         
         return SELECTING_ACTION
-
+    
     async def ladder_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
-        # Сброс флага импорта
-        self.import_waiting = False
         
         await update.message.reply_text(
             "🪜 *Настройка лестницы (Мартингейл)*\n\n"
@@ -2857,7 +2837,7 @@ class FastDCABot:
             parse_mode='Markdown'
         )
         return LADDER_MENU
-
+    
     async def show_ladder_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
@@ -2890,13 +2870,13 @@ class FastDCABot:
         
         await update.message.reply_text(text, parse_mode='Markdown', reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
-
+    
     async def set_ladder_start_price_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
         await update.message.reply_text("💰 Введите новую стартовую цену (USDT):\n\nПример: 2.35", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_START_PRICE
-
+    
     async def set_ladder_start_price_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -2916,13 +2896,13 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Некорректная цена. Введите положительное число.", reply_markup=self.get_cancel_keyboard())
             return SET_LADDER_START_PRICE
-
+    
     async def set_ladder_step_percent_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
         await update.message.reply_text("📊 Введите шаг падения в процентах (1-5%):\n*Рекомендуется 3%*\n\nПример: 3", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_STEP_PERCENT
-
+    
     async def set_ladder_step_percent_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -2941,13 +2921,13 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Некорректное значение (1-10).", reply_markup=self.get_cancel_keyboard())
             return SET_LADDER_STEP_PERCENT
-
+    
     async def set_ladder_max_depth_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
         await update.message.reply_text("📉 Введите глубину просадки в процентах (30-95%):\n*Рекомендуется 80%*\n\nПример: 80", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_DEPTH
-
+    
     async def set_ladder_max_depth_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -2966,13 +2946,13 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Некорректное значение (30-95).", reply_markup=self.get_cancel_keyboard())
             return SET_LADDER_DEPTH
-
+    
     async def set_ladder_base_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
         await update.message.reply_text("💵 Введите базовую сумму (мин 1 USDT):\n*Сумма первого ордера*\n\nПример: 1.1", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_BASE_AMOUNT
-
+    
     async def set_ladder_base_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -2992,13 +2972,13 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Некорректная сумма (мин 1).", reply_markup=self.get_cancel_keyboard())
             return SET_LADDER_BASE_AMOUNT
-
+    
     async def set_ladder_max_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
         await update.message.reply_text("💰 Введите максимальную сумму (USDT):\n*Сумма последнего ордера*\n\nПример: 3.3", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_BASE_AMOUNT
-
+    
     async def set_ladder_max_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -3017,7 +2997,7 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Некорректная сумма (мин 1).", reply_markup=self.get_cancel_keyboard())
             return SET_LADDER_BASE_AMOUNT
-
+    
     async def reset_ladder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
@@ -3025,12 +3005,13 @@ class FastDCABot:
         self.db.reset_ladder(symbol)
         await update.message.reply_text("🔄 Лестница сброшена!", reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
-
+    
     async def manual_buy_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
-        # Сброс флага импорта
+        # Очищаем user_data перед началом
+        if context.user_data:
+            context.user_data.clear()
         self.import_waiting = False
         
         self._init_bybit()
@@ -3054,7 +3035,7 @@ class FastDCABot:
         msg += f"Введите цену лимитного ордера (или нажмите Отмена):"
         await update.message.reply_text(msg, reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
         return MANUAL_BUY_PRICE
-
+    
     async def manual_buy_price_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -3072,13 +3053,12 @@ class FastDCABot:
             await update.message.reply_text(f"💰 Введите сумму покупки в USDT\n*Рекомендуемая сумма:* {suggested_amount:.2f} USDT\nМинимум: 1.1 USDT:", reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
             return MANUAL_BUY_AMOUNT
         except ValueError:
-            await update.message.reply_text("❌ Некорректная цена.", reply_markup=self.get_manual_buy_keyboard())
+            await update.message.reply_text("❌ Некорректная цена. Введите число больше 0.", reply_markup=self.get_manual_buy_keyboard())
             return MANUAL_BUY_PRICE
-
+    
     async def manual_buy_amount_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
         self._init_bybit()
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -3117,12 +3097,13 @@ class FastDCABot:
             await update.message.reply_text(f"❌ {str(e)}", reply_markup=self.get_manual_buy_keyboard())
             return MANUAL_BUY_AMOUNT
         return ConversationHandler.END
-
+    
     async def manual_add_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
-        # Сброс флага импорта
+        # Очищаем user_data перед началом
+        if context.user_data:
+            context.user_data.clear()
         self.import_waiting = False
         
         self._init_bybit()
@@ -3157,7 +3138,7 @@ class FastDCABot:
         
         await update.message.reply_text(msg, reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return MANUAL_ADD_PRICE
-
+    
     async def manual_add_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -3194,7 +3175,7 @@ class FastDCABot:
                 reply_markup=self.get_cancel_keyboard()
             )
             return MANUAL_ADD_PRICE
-
+    
     async def manual_add_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -3250,14 +3231,10 @@ class FastDCABot:
                 reply_markup=self.get_cancel_keyboard()
             )
             return MANUAL_ADD_AMOUNT
-
+    
     async def edit_purchases_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        
-        # Сброс флага импорта
-        self.import_waiting = False
-        
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         purchases = self.db.get_purchases(symbol)
         if not purchases:
@@ -3266,7 +3243,7 @@ class FastDCABot:
         context.user_data.pop('editing_purchase_id', None)
         await update.message.reply_text("✏️ Выберите покупку:", reply_markup=self.get_purchases_list_keyboard(purchases))
         return EDIT_PURCHASE_SELECT
-
+    
     async def edit_purchase_selected(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
         if text == "🏠 Главное меню":
@@ -3294,12 +3271,12 @@ class FastDCABot:
             return EDIT_PURCHASE_SELECT
         except Exception as e:
             await update.message.reply_text("❌ Ошибка выбора", reply_markup=self.get_main_keyboard())
-            return EDIT_PURCHASE_SELECT
-
+            return ConversationHandler.END
+    
     async def edit_price_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("💰 Введите новую цену:", reply_markup=self.get_cancel_keyboard())
         return EDIT_PRICE
-
+    
     async def edit_price_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -3327,11 +3304,11 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Ошибка! Введите число.", reply_markup=self.get_cancel_keyboard())
             return EDIT_PRICE
-
+    
     async def edit_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📊 Введите новое количество:", reply_markup=self.get_cancel_keyboard())
         return EDIT_AMOUNT
-
+    
     async def edit_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -3357,7 +3334,7 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Ошибка! Введите число.", reply_markup=self.get_cancel_keyboard())
             return EDIT_AMOUNT
-
+    
     def parse_date(self, date_str: str) -> str:
         date_str = date_str.strip()
         patterns = [
@@ -3375,7 +3352,7 @@ class FastDCABot:
                 except ValueError:
                     raise ValueError("Некорректная дата")
         raise ValueError("Неподдерживаемый формат")
-
+    
     async def edit_date_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         purchase_id = context.user_data.get('editing_purchase_id')
         purchase = self.db.get_purchase_by_id(purchase_id)
@@ -3385,7 +3362,7 @@ class FastDCABot:
             current_date = purchase['date'][:10] if purchase['date'] else "неизвестно"
         await update.message.reply_text(f"📅 Текущая дата: {current_date}\n\nВведите новую дату (ДД.ММ.ГГГГ):", reply_markup=self.get_cancel_keyboard())
         return EDIT_DATE
-
+    
     async def edit_date_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         if text == "❌ Отмена":
@@ -3412,11 +3389,11 @@ class FastDCABot:
         except ValueError as e:
             await update.message.reply_text(f"❌ {str(e)}", reply_markup=self.get_cancel_keyboard())
             return EDIT_DATE
-
+    
     async def delete_purchase_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ *Удалить эту покупку?*", reply_markup=self.get_confirm_delete_keyboard(), parse_mode='Markdown')
         return DELETE_CONFIRM
-
+    
     async def delete_purchase_execute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
         if text == "❌ Нет, отмена":
@@ -3432,7 +3409,7 @@ class FastDCABot:
                 await update.message.reply_text("❌ Ошибка при удалении", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
         return EDIT_PURCHASE_SELECT
-
+    
     async def show_purchase_after_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE, purchase_id):
         purchase = self.db.get_purchase_by_id(purchase_id)
         if not purchase:
@@ -3443,33 +3420,34 @@ class FastDCABot:
         except:
             date_display = purchase['date'][:10] if purchase['date'] else "N/A"
         await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
-
+    
     async def cancel_to_edit_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         purchase_id = context.user_data.get('editing_purchase_id')
         if purchase_id:
             await self.show_purchase_after_edit(update, context, purchase_id)
         else:
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
-
+    
     async def back_to_main(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         self.import_waiting = False
         await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
         return ConversationHandler.END
-
+    
     async def cancel_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         self.import_waiting = False
         await update.message.reply_text("Действие отменено", reply_markup=self.get_main_keyboard())
         return ConversationHandler.END
-
+    
     async def handle_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        # Сброс флага импорта
+        # Если пришла неизвестная команда, очищаем состояние
+        context.user_data.clear()
         self.import_waiting = False
         await update.message.reply_text("Используйте кнопки меню", reply_markup=self.get_main_keyboard())
-
+    
     async def dca_scheduler_loop(self):
         logger.info("DCA scheduler loop started")
         while self.scheduler_running:
@@ -3500,7 +3478,7 @@ class FastDCABot:
                 break
             except Exception as e:
                 logger.error(f"DCA scheduler error: {e}")
-
+    
     async def order_checker_loop(self):
         logger.info("Order checker loop started")
         
@@ -3545,13 +3523,13 @@ class FastDCABot:
                 logger.error(f"Order checker error: {e}")
             
             await asyncio.sleep(self.db.get_order_check_interval() * 60)
-
+    
     async def post_init(self, application):
         self.scheduler_running = True
         asyncio.create_task(self.dca_scheduler_loop())
         asyncio.create_task(self.order_checker_loop())
         logger.info("Bot initialized, scheduler loops started")
-
+    
     async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -3564,7 +3542,7 @@ class FastDCABot:
         elif data.startswith("skip_order_"):
             order_id = data.replace("skip_order_", "")
             await self.skip_executed_order(update, context, order_id)
-
+    
     async def add_executed_order_to_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         conn = sqlite3.connect(self.db.db_file, timeout=5)
         conn.row_factory = sqlite3.Row
@@ -3634,7 +3612,7 @@ class FastDCABot:
             
         else:
             await update.callback_query.edit_message_text("❌ Ошибка при добавлении покупки в статистику.")
-
+    
     async def send_sell_recommendation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         profit_percent = float(self.db.get_setting('profit_percent', '5'))
@@ -3680,57 +3658,36 @@ class FastDCABot:
             reply_markup=self.get_sell_confirmation_keyboard(),
             parse_mode='Markdown'
         )
-
+    
     async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         self.db.mark_order_as_skipped(order_id)
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
-
+    
     def setup_handlers(self):
         logger.info("Setting up handlers...")
         
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
         
-        # Обработчики для кнопок главного меню (ДО ConversationHandler)
-        self.application.add_handler(MessageHandler(filters.Regex(r'^📊 Мой Портфель$'), self.show_portfolio))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^🚀 Запустить Авто DCA$'), self.toggle_dca))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^⏹ Остановить Авто DCA$'), self.toggle_dca))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^📈 Статистика DCA$'), self.show_dca_stats_detailed))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^📋 Статус бота$'), self.show_status))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^📝 Управление ордерами$'), self.orders_menu))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^✅ Отслеживание ордеров Вкл$'), self.toggle_order_execution))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^⏳ Отслеживание ордеров Выкл$'), self.toggle_order_execution))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^🏠 Главное меню$'), self.back_to_main))
-        
-        # Обработчики для кнопок настроек
-        self.application.add_handler(MessageHandler(filters.Regex(r'^⚙️ Настройки$'), self.show_settings_menu))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^📤 Экспорт базы$'), self.handle_export))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^📥 Импорт базы$'), self.handle_import_start))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^❌ Отмена$'), self.handle_import_cancel))
+        # Обработчики для кнопок главного меню
+        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.show_settings_menu))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start))
+        self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_import_file))
         
         # Обработчик для кнопки подтверждения продажи
-        self.application.add_handler(MessageHandler(filters.Regex(r'^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
+        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
         
-        # Обработчики для управления ордерами
-        self.application.add_handler(MessageHandler(filters.Regex(r'^📋 Список открытых ордеров$'), self.show_open_orders))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^🔙 Назад в меню$'), self.back_to_main))
-        
-        # Обработчики для редактирования покупок
-        self.application.add_handler(MessageHandler(filters.Regex(r'^➕ Добавить покупку вручную$'), self.manual_add_start))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^💰 Ручная покупка \(лимит\)$'), self.manual_buy_start))
-        self.application.add_handler(MessageHandler(filters.Regex(r'^✏️ Редактировать покупки$'), self.edit_purchases_list))
-        
-        # ConversationHandler для отслеживания
         tracking_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex(r'^⚙️ Настройки отслеживания$'), self.tracking_settings)],
+            entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
             states={
                 NOTIFICATION_SETTINGS_MENU: [
-                    MessageHandler(filters.Regex(r'^(✅ Отслеживание включено|❌ Отслеживание выключено)$'), self.toggle_tracking),
-                    MessageHandler(filters.Regex(r'^⏱ Изменить интервал проверки$'), self.set_tracking_interval_start),
-                    MessageHandler(filters.Regex(r'^🔍 Тест отслеживания$'), self.test_tracking),
-                    MessageHandler(filters.Regex(r'^🔙 Назад в настройки$'), self.back_to_settings),
-                    MessageHandler(filters.Regex(r'^🏠 Главное меню$'), self.back_to_main),
+                    MessageHandler(filters.Regex('^(✅ Отслеживание включено|❌ Отслеживание выключено)$'), self.toggle_tracking),
+                    MessageHandler(filters.Regex('^(⏱ Изменить интервал проверки)$'), self.set_tracking_interval_start),
+                    MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
+                    MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
+                    MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
                 ],
                 WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_tracking_interval_done)],
             },
@@ -3740,17 +3697,16 @@ class FastDCABot:
         )
         self.application.add_handler(tracking_conv)
         
-        # ConversationHandler для редактирования покупок
         edit_purchases_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex(r'^✏️ Редактировать покупки$'), self.edit_purchases_list)],
+            entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
             states={
                 EDIT_PURCHASE_SELECT: [
-                    MessageHandler(filters.Regex(r'^💰 Изменить цену$'), self.edit_price_start),
-                    MessageHandler(filters.Regex(r'^📊 Изменить количество$'), self.edit_amount_start),
-                    MessageHandler(filters.Regex(r'^📅 Изменить дату$'), self.edit_date_start),
-                    MessageHandler(filters.Regex(r'^❌ Удалить покупку$'), self.delete_purchase_confirm),
-                    MessageHandler(filters.Regex(r'^🔙 Назад к списку$'), self.edit_purchases_list),
-                    MessageHandler(filters.Regex(r'^🏠 Главное меню$'), self.back_to_main),
+                    MessageHandler(filters.Regex('^(💰 Изменить цену)$'), self.edit_price_start),
+                    MessageHandler(filters.Regex('^(📊 Изменить количество)$'), self.edit_amount_start),
+                    MessageHandler(filters.Regex('^(📅 Изменить дату)$'), self.edit_date_start),
+                    MessageHandler(filters.Regex('^(❌ Удалить покупку)$'), self.delete_purchase_confirm),
+                    MessageHandler(filters.Regex('^(🔙 Назад к списку)$'), self.edit_purchases_list),
+                    MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_purchase_selected),
                 ],
                 EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_price_save)],
@@ -3764,20 +3720,19 @@ class FastDCABot:
         )
         self.application.add_handler(edit_purchases_conv)
         
-        # ConversationHandler для главных настроек
         main_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex(r'^⚙️ Настройки$'), self.settings_menu)],
+            entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
                 SELECTING_ACTION: [
-                    MessageHandler(filters.Regex(r'^🪙 Выбор токена$'), self.set_symbol_start),
-                    MessageHandler(filters.Regex(r'^💵 Сумма покупки$'), self.set_amount_start),
-                    MessageHandler(filters.Regex(r'^📊 Процент прибыли$'), self.set_profit_start),
-                    MessageHandler(filters.Regex(r'^📉 Настройки падения$'), self.set_drop_start),
-                    MessageHandler(filters.Regex(r'^⏰ Время покупки$'), self.set_time_start),
-                    MessageHandler(filters.Regex(r'^🔄 Частота покупки$'), self.set_frequency_start),
-                    MessageHandler(filters.Regex(r'^🪜 Настройка лестницы$'), self.ladder_settings_menu),
-                    MessageHandler(filters.Regex(r'^⚙️ Настройки отслеживания$'), self.tracking_settings),
-                    MessageHandler(filters.Regex(r'^🔙 Назад в меню$'), self.back_to_main),
+                    MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start),
+                    MessageHandler(filters.Regex('^(💵 Сумма покупки)$'), self.set_amount_start),
+                    MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start),
+                    MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start),
+                    MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start),
+                    MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start),
+                    MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu),
+                    MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
+                    MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
                 ],
                 SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
                 SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)],
@@ -3793,25 +3748,24 @@ class FastDCABot:
         )
         self.application.add_handler(main_conv)
         
-        # ConversationHandler для лестницы
         ladder_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex(r'^🪜 Настройка лестницы$'), self.ladder_settings_menu)],
+            entry_points=[MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu)],
             states={
                 LADDER_MENU: [
-                    MessageHandler(filters.Regex(r'^💰 Цена старта$'), self.set_ladder_start_price_start),
-                    MessageHandler(filters.Regex(r'^📊 Шаг падения \(%\)$'), self.set_ladder_step_percent_start),
-                    MessageHandler(filters.Regex(r'^📉 Глубина просадки \(%\)$'), self.set_ladder_max_depth_start),
-                    MessageHandler(filters.Regex(r'^💵 Базовая сумма$'), self.set_ladder_base_amount_start),
-                    MessageHandler(filters.Regex(r'^💰 Максимальная сумма$'), self.set_ladder_max_amount_start),
-                    MessageHandler(filters.Regex(r'^📋 Текущие настройки$'), self.show_ladder_settings),
-                    MessageHandler(filters.Regex(r'^🔄 Сбросить лестницу$'), self.reset_ladder),
-                    MessageHandler(filters.Regex(r'^🔙 Назад в меню$'), self.back_to_main),
+                    MessageHandler(filters.Regex('^(💰 Цена старта)$'), self.set_ladder_start_price_start),
+                    MessageHandler(filters.Regex('^(📊 Шаг падения \(%\))$'), self.set_ladder_step_percent_start),
+                    MessageHandler(filters.Regex('^(📉 Глубина просадки \(%\))$'), self.set_ladder_max_depth_start),
+                    MessageHandler(filters.Regex('^(💵 Базовая сумма)$'), self.set_ladder_base_amount_start),
+                    MessageHandler(filters.Regex('^(💰 Максимальная сумма)$'), self.set_ladder_max_amount_start),
+                    MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_ladder_settings),
+                    MessageHandler(filters.Regex('^(🔄 Сбросить лестницу)$'), self.reset_ladder),
+                    MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
                 ],
                 SET_LADDER_START_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_start_price_save)],
                 SET_LADDER_STEP_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_step_percent_save)],
                 SET_LADDER_DEPTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_max_depth_save)],
                 SET_LADDER_BASE_AMOUNT: [
-                    MessageHandler(filters.Regex(r'^💰 Максимальная сумма$'), self.set_ladder_max_amount_save),
+                    MessageHandler(filters.Regex('^(💰 Максимальная сумма)$'), self.set_ladder_max_amount_save),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save),
                 ],
             },
@@ -3821,9 +3775,8 @@ class FastDCABot:
         )
         self.application.add_handler(ladder_conv)
         
-        # ConversationHandler для ручной покупки (лимит)
         manual_limit_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex(r'^💰 Ручная покупка \(лимит\)$'), self.manual_buy_start)],
+            entry_points=[MessageHandler(filters.Regex('^(💰 Ручная покупка \(лимит\))$'), self.manual_buy_start)],
             states={
                 MANUAL_BUY_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_buy_price_done)],
                 MANUAL_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_buy_amount_done)],
@@ -3834,9 +3787,8 @@ class FastDCABot:
         )
         self.application.add_handler(manual_limit_conv)
         
-        # ConversationHandler для добавления покупки вручную
         manual_add_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex(r'^➕ Добавить покупку вручную$'), self.manual_add_start)],
+            entry_points=[MessageHandler(filters.Regex('^(➕ Добавить покупку вручную)$'), self.manual_add_start)],
             states={
                 MANUAL_ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_add_price)],
                 MANUAL_ADD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_add_amount)],
@@ -3847,9 +3799,8 @@ class FastDCABot:
         )
         self.application.add_handler(manual_add_conv)
         
-        # ConversationHandler для удаления ордера
         cancel_order_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex(r'^❌ Удалить ордер$'), self.cancel_order_start)],
+            entry_points=[MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start)],
             states={
                 WAITING_ORDER_ID_TO_CANCEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cancel_order_execute)],
             },
@@ -3859,11 +3810,21 @@ class FastDCABot:
         )
         self.application.add_handler(cancel_order_conv)
         
-        # handle_unknown ДОЛЖЕН БЫТЬ ПОСЛЕДНИМ
+        self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
+        self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
+        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
+        self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
+        
+        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
+        self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
+        
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         
         logger.info("Handlers setup completed")
-
+    
     def run(self):
         print(f"\n{Fore.CYAN}{'='*60}")
         print(f"{Fore.CYAN}🚀 ЗАПУСК DCA BYBIT BOT (МАРТИНГЕЙЛ ЛЕСЕНКОЙ)")
@@ -3888,6 +3849,7 @@ class FastDCABot:
             logger.error(f"Failed to start bot: {e}")
             print(f"{Fore.RED}❌ Ошибка: {e}")
 
+
 if __name__ == "__main__":
     try:
         import colorama
@@ -3895,5 +3857,6 @@ if __name__ == "__main__":
         print("Устанавливаю colorama...")
         os.system(f"{sys.executable} -m pip install colorama")
         import colorama
+    
     bot = FastDCABot()
     bot.run()
