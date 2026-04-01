@@ -1938,8 +1938,8 @@ class FastDCABot:
             reply_markup=self.get_main_keyboard()
         )
     
-    async def handle_settings_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик для кнопки Настройки"""
+    async def show_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать меню настроек"""
         if not await self._check_user_fast(update):
             return
         
@@ -1965,7 +1965,95 @@ class FastDCABot:
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
         )
-        return SELECTING_ACTION
+    
+    async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Экспорт базы данных"""
+        if not await self._check_user_fast(update):
+            return
+        
+        await update.message.reply_text("⏳ Экспортирую базу данных...")
+        success, count, file_path = self.db.export_database()
+        if success:
+            await update.message.reply_text(f"✅ Экспортировано! Записей: {count}")
+            try:
+                with open(file_path, 'rb') as f:
+                    await update.message.reply_document(
+                        document=InputFile(f, filename=DB_EXPORT_FILE),
+                        caption=f"💾 Файл базы данных от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                    )
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
+        else:
+            await update.message.reply_text(f"❌ Ошибка экспорта: {file_path}")
+    
+    async def handle_import_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начать импорт базы данных"""
+        if not await self._check_user_fast(update):
+            return
+        
+        self.import_waiting = True
+        await update.message.reply_text(
+            "📥 *ИМПОРТ БАЗЫ ДАННЫХ*\n\n"
+            "Отправьте файл .json\n"
+            "⚠️ *ВНИМАНИЕ! Все текущие данные будут заменены!*\n\n"
+            "Или нажмите ❌ Отмена для отмены",
+            reply_markup=self.get_cancel_keyboard(),
+            parse_mode='Markdown'
+        )
+    
+    async def handle_import_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка загруженного файла для импорта"""
+        if not await self._check_user_fast(update):
+            return
+        
+        # Проверяем, что мы в режиме импорта
+        if not self.import_waiting:
+            await update.message.reply_text("Сначала нажмите кнопку '📥 Импорт базы' в меню настроек")
+            return
+        
+        if not update.message.document:
+            await update.message.reply_text("Пожалуйста, отправьте файл .json", reply_markup=self.get_cancel_keyboard())
+            return
+        
+        if not update.message.document.file_name.endswith('.json'):
+            await update.message.reply_text("❌ Файл должен иметь расширение .json", reply_markup=self.get_cancel_keyboard())
+            return
+        
+        try:
+            await update.message.reply_text("⏳ Импортирую данные...")
+            file = await context.bot.get_file(update.message.document.file_id)
+            temp_file = f"temp_import_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+            await file.download_to_drive(temp_file)
+            success, message = self.db.import_database(temp_file)
+            
+            # Удаляем временный файл
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            
+            self.import_waiting = False
+            
+            if success:
+                await update.message.reply_text(f"✅ {message}", reply_markup=self.get_main_keyboard())
+                # Переинициализируем Bybit клиент с новыми настройками
+                self.bybit_initialized = False
+                self._init_bybit()
+            else:
+                await update.message.reply_text(f"❌ Ошибка импорта: {message}", reply_markup=self.get_main_keyboard())
+        except Exception as e:
+            logger.error(f"Error in import: {e}")
+            self.import_waiting = False
+            await update.message.reply_text(f"❌ Ошибка при импорте: {str(e)}", reply_markup=self.get_main_keyboard())
+    
+    async def handle_import_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена импорта"""
+        if self.import_waiting:
+            self.import_waiting = False
+            await update.message.reply_text("❌ Импорт отменен", reply_markup=self.get_main_keyboard())
+        else:
+            await update.message.reply_text("Нет активного импорта", reply_markup=self.get_main_keyboard())
     
     async def handle_sell_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик для кнопки подтверждения продажи"""
@@ -2161,96 +2249,6 @@ class FastDCABot:
             parse_mode='Markdown'
         )
         return ConversationHandler.END
-    
-    async def export_database(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Экспорт базы данных"""
-        if not await self._check_user_fast(update):
-            return
-        
-        await update.message.reply_text("⏳ Экспортирую базу данных...")
-        success, count, file_path = self.db.export_database()
-        if success:
-            await update.message.reply_text(f"✅ Экспортировано! Записей: {count}", reply_markup=self.get_settings_keyboard())
-            try:
-                with open(file_path, 'rb') as f:
-                    await update.message.reply_document(
-                        document=InputFile(f, filename=DB_EXPORT_FILE),
-                        caption=f"💾 Файл базы данных от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-                    )
-            except Exception as e:
-                await update.message.reply_text(f"❌ Ошибка отправки файла: {e}", reply_markup=self.get_settings_keyboard())
-        else:
-            await update.message.reply_text(f"❌ Ошибка экспорта: {file_path}", reply_markup=self.get_settings_keyboard())
-    
-    async def import_database_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начать импорт базы данных"""
-        if not await self._check_user_fast(update):
-            return
-        
-        self.import_waiting = True
-        await update.message.reply_text(
-            "📥 *ИМПОРТ БАЗЫ ДАННЫХ*\n\n"
-            "Отправьте файл .json\n"
-            "⚠️ *ВНИМАНИЕ! Все текущие данные будут заменены!*\n\n"
-            "Или нажмите ❌ Отмена для отмены",
-            reply_markup=self.get_cancel_keyboard(),
-            parse_mode='Markdown'
-        )
-        return WAITING_IMPORT_FILE
-    
-    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка загруженного файла для импорта"""
-        if not await self._check_user_fast(update):
-            return
-        
-        # Проверяем, что мы в режиме импорта
-        if not self.import_waiting:
-            await update.message.reply_text("Сначала нажмите кнопку '📥 Импорт базы' в меню настроек")
-            return
-        
-        if not update.message.document:
-            await update.message.reply_text("Пожалуйста, отправьте файл .json", reply_markup=self.get_cancel_keyboard())
-            return
-        
-        if not update.message.document.file_name.endswith('.json'):
-            await update.message.reply_text("❌ Файл должен иметь расширение .json", reply_markup=self.get_cancel_keyboard())
-            return
-        
-        try:
-            await update.message.reply_text("⏳ Импортирую данные...")
-            file = await context.bot.get_file(update.message.document.file_id)
-            temp_file = f"temp_import_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
-            await file.download_to_drive(temp_file)
-            success, message = self.db.import_database(temp_file)
-            
-            # Удаляем временный файл
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-            
-            self.import_waiting = False
-            
-            if success:
-                await update.message.reply_text(f"✅ {message}", reply_markup=self.get_main_keyboard())
-                # Переинициализируем Bybit клиент с новыми настройками
-                self.bybit_initialized = False
-                self._init_bybit()
-            else:
-                await update.message.reply_text(f"❌ Ошибка импорта: {message}", reply_markup=self.get_main_keyboard())
-        except Exception as e:
-            logger.error(f"Error in import: {e}")
-            self.import_waiting = False
-            await update.message.reply_text(f"❌ Ошибка при импорте: {str(e)}", reply_markup=self.get_main_keyboard())
-    
-    async def cancel_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отмена импорта"""
-        if self.import_waiting:
-            self.import_waiting = False
-            await update.message.reply_text("❌ Импорт отменен", reply_markup=self.get_main_keyboard())
-        else:
-            await update.message.reply_text("Нет активного импорта", reply_markup=self.get_main_keyboard())
     
     async def orders_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3708,8 +3706,12 @@ class FastDCABot:
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
         
-        # Обработчик для кнопки Настройки (прямой, без ConversationHandler)
-        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.handle_settings_button))
+        # Обработчики для кнопок главного меню
+        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.show_settings_menu))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
+        self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start))
+        self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
+        self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_import_file))
         
         # Обработчик для кнопки подтверждения продажи
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
@@ -3767,8 +3769,6 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start),
                     MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu),
                     MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
-                    MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database),
-                    MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
                 ],
                 SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
@@ -3854,10 +3854,6 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
         self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
-        
-        self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.cancel_import))
-        
-        self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
