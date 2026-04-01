@@ -62,7 +62,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "1.8 (31.03.2026)"
+BOT_VERSION = "1.9 (01.04.2026)"
 
 # Состояния для ConversationHandler
 (
@@ -983,7 +983,7 @@ class Database:
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '1.8',
+                'version': '1.9',
                 'purchases': purchases,
                 'sell_orders': sell_orders,
                 'settings': settings,
@@ -2163,39 +2163,47 @@ class FastDCABot:
         return ConversationHandler.END
     
     async def export_database(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Экспорт базы данных"""
         if not await self._check_user_fast(update):
             return
         
-        await update.message.reply_text("⏳ Экспортирую...")
+        await update.message.reply_text("⏳ Экспортирую базу данных...")
         success, count, file_path = self.db.export_database()
         if success:
             await update.message.reply_text(f"✅ Экспортировано! Записей: {count}", reply_markup=self.get_settings_keyboard())
             try:
                 with open(file_path, 'rb') as f:
-                    await update.message.reply_document(document=InputFile(f, filename=DB_EXPORT_FILE), caption="💾 Файл базы данных")
+                    await update.message.reply_document(
+                        document=InputFile(f, filename=DB_EXPORT_FILE),
+                        caption=f"💾 Файл базы данных от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                    )
             except Exception as e:
-                await update.message.reply_text(f"❌ Ошибка отправки: {e}", reply_markup=self.get_settings_keyboard())
+                await update.message.reply_text(f"❌ Ошибка отправки файла: {e}", reply_markup=self.get_settings_keyboard())
         else:
             await update.message.reply_text(f"❌ Ошибка экспорта: {file_path}", reply_markup=self.get_settings_keyboard())
     
     async def import_database_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начать импорт базы данных"""
         if not await self._check_user_fast(update):
             return
         
         self.import_waiting = True
         await update.message.reply_text(
-            "📥 *ИМПОРТ БАЗЫ*\n\n"
+            "📥 *ИМПОРТ БАЗЫ ДАННЫХ*\n\n"
             "Отправьте файл .json\n"
-            "⚠️ *Все записи будут заменены!*\n\n"
+            "⚠️ *ВНИМАНИЕ! Все текущие данные будут заменены!*\n\n"
             "Или нажмите ❌ Отмена для отмены",
             reply_markup=self.get_cancel_keyboard(),
             parse_mode='Markdown'
         )
+        return WAITING_IMPORT_FILE
     
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка загруженного файла для импорта"""
         if not await self._check_user_fast(update):
             return
         
+        # Проверяем, что мы в режиме импорта
         if not self.import_waiting:
             await update.message.reply_text("Сначала нажмите кнопку '📥 Импорт базы' в меню настроек")
             return
@@ -2209,12 +2217,13 @@ class FastDCABot:
             return
         
         try:
-            await update.message.reply_text("⏳ Импортирую...")
+            await update.message.reply_text("⏳ Импортирую данные...")
             file = await context.bot.get_file(update.message.document.file_id)
             temp_file = f"temp_import_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
             await file.download_to_drive(temp_file)
             success, message = self.db.import_database(temp_file)
             
+            # Удаляем временный файл
             if os.path.exists(temp_file):
                 try:
                     os.remove(temp_file)
@@ -2225,16 +2234,18 @@ class FastDCABot:
             
             if success:
                 await update.message.reply_text(f"✅ {message}", reply_markup=self.get_main_keyboard())
+                # Переинициализируем Bybit клиент с новыми настройками
                 self.bybit_initialized = False
                 self._init_bybit()
             else:
-                await update.message.reply_text(f"❌ Ошибка: {message}", reply_markup=self.get_main_keyboard())
+                await update.message.reply_text(f"❌ Ошибка импорта: {message}", reply_markup=self.get_main_keyboard())
         except Exception as e:
             logger.error(f"Error in import: {e}")
             self.import_waiting = False
             await update.message.reply_text(f"❌ Ошибка при импорте: {str(e)}", reply_markup=self.get_main_keyboard())
     
     async def cancel_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена импорта"""
         if self.import_waiting:
             self.import_waiting = False
             await update.message.reply_text("❌ Импорт отменен", reply_markup=self.get_main_keyboard())
