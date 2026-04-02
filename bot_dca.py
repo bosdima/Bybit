@@ -62,7 +62,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "1.9 (01.04.2026)"
+BOT_VERSION = "1.9 (02.04.2026)"
 
 # Состояния для ConversationHandler
 (
@@ -123,6 +123,11 @@ def format_quantity(qty: float, decimals: int = 6) -> str:
 def round_price_up(price: float) -> float:
     """Округляет цену вверх до сотых долей"""
     return math.ceil(price * 100) / 100
+
+
+def round_quantity_down(quantity: float, precision: int = 6) -> float:
+    """Округляет количество вниз до указанной точности"""
+    return math.floor(quantity * (10 ** precision)) / (10 ** precision)
 
 
 def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
@@ -1181,6 +1186,33 @@ class BybitClient:
             logger.error(f"Error getting price for {symbol}: {e}")
             return None
     
+    async def get_instrument_info(self, symbol: str) -> Dict:
+        """Получение информации о торговом инструменте"""
+        try:
+            if not self.session:
+                self._init_session()
+            response = self.session.get_instruments_info(category="spot", symbol=symbol)
+            if response['retCode'] == 0 and response['result']['list']:
+                return response['result']['list'][0]
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting instrument info: {e}")
+            return {}
+    
+    async def get_quantity_precision(self, symbol: str) -> int:
+        """Получение точности количества для символа"""
+        try:
+            instrument = await self.get_instrument_info(symbol)
+            if instrument:
+                lot_size_filter = instrument.get('lotSizeFilter', {})
+                qty_step = float(lot_size_filter.get('qtyStep', '0.000001'))
+                precision = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 6
+                return precision
+            return 6
+        except Exception as e:
+            logger.error(f"Error getting precision: {e}")
+            return 6
+    
     async def get_balance(self, coin: str = None) -> Dict:
         try:
             if not self.session:
@@ -1321,9 +1353,23 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            response = self.session.place_order(category="spot", symbol=symbol, side="Sell", orderType="Limit", qty=str(quantity), price=str(price), timeInForce="GTC")
+            
+            # Получаем точность количества для символа
+            precision = await self.get_quantity_precision(symbol)
+            # Округляем количество до нужной точности
+            rounded_quantity = round_quantity_down(quantity, precision)
+            
+            response = self.session.place_order(
+                category="spot", 
+                symbol=symbol, 
+                side="Sell", 
+                orderType="Limit", 
+                qty=str(rounded_quantity), 
+                price=str(price), 
+                timeInForce="GTC"
+            )
             if response['retCode'] == 0:
-                return {'success': True, 'order_id': response['result']['orderId'], 'quantity': quantity, 'price': price}
+                return {'success': True, 'order_id': response['result']['orderId'], 'quantity': rounded_quantity, 'price': price}
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
@@ -1724,6 +1770,25 @@ class DCAStrategy:
             if total_quantity <= 0:
                 return {'success': False, 'error': f'Количество {coin} равно 0'}
             
+            # Проверяем наличие активных ордеров на продажу
+            open_orders = await self.bybit.get_open_orders(symbol)
+            existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
+            
+            if existing_sell_orders:
+                # Отправляем сообщение о существующих ордерах
+                orders_list = []
+                for order in existing_sell_orders:
+                    order_price = float(order.get('price', 0))
+                    order_qty = float(order.get('qty', 0))
+                    orders_list.append(f"  • {format_quantity(order_qty, 6)} {coin} @ {format_price(order_price, 4)} USDT")
+                
+                orders_text = "\n".join(orders_list)
+                return {
+                    'success': False, 
+                    'error': f'⚠️ Уже есть активные ордера на продажу!\n\nАктивные ордера:\n{orders_text}\n\nПожалуйста, сначала отмените существующие ордера через "Управление ордерами" -> "Удалить ордер", затем повторите попытку.'
+                }
+            
+            # Создаем ордер на продажу
             result = await self.bybit.place_limit_sell(symbol, total_quantity, rounded_price)
             
             if result['success']:
@@ -2061,7 +2126,7 @@ class FastDCABot:
             else:
                 await update.message.reply_text(
                     f"❌ *Ошибка при создании ордера на продажу*\n\n"
-                    f"Ошибка: `{result['error']}`",
+                    f"{result['error']}",
                     parse_mode='Markdown',
                     reply_markup=self.get_main_keyboard()
                 )
@@ -2488,11 +2553,9 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return
         
-        # Сбрасываем состояние импорта
+        # Сбрасываем состояние
+        context.user_data.clear()
         self.import_waiting = False
-        # Очищаем user_data, чтобы выйти из возможных разговоров
-        if context.user_data:
-            context.user_data.clear()
         
         self._init_bybit()
         if not self.bybit_initialized:
@@ -3010,8 +3073,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         # Очищаем user_data перед началом
-        if context.user_data:
-            context.user_data.clear()
+        context.user_data.clear()
         self.import_waiting = False
         
         self._init_bybit()
@@ -3102,8 +3164,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         # Очищаем user_data перед началом
-        if context.user_data:
-            context.user_data.clear()
+        context.user_data.clear()
         self.import_waiting = False
         
         self._init_bybit()
