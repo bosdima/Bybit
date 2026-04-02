@@ -107,6 +107,9 @@ POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 MAX_DROP_DEPTH = 80
 STEP_PERCENT = 3
 
+# Кэш для точности символов
+PRECISION_CACHE = {}
+
 
 def format_price(price: float, decimals: int = 4) -> str:
     if price is None:
@@ -1160,7 +1163,6 @@ class BybitClient:
         self._price_cache = {}
         self._cache_time = {}
         self._cache_ttl = 5
-        self._precision_cache = {}
         self._init_session()
     
     def _init_session(self):
@@ -1190,8 +1192,9 @@ class BybitClient:
     
     async def get_quantity_precision(self, symbol: str) -> int:
         """Получение точности количества для символа"""
-        if symbol in self._precision_cache:
-            return self._precision_cache[symbol]
+        global PRECISION_CACHE
+        if symbol in PRECISION_CACHE:
+            return PRECISION_CACHE[symbol]
         
         try:
             if not self.session:
@@ -1201,8 +1204,12 @@ class BybitClient:
                 instrument = response['result']['list'][0]
                 lot_size_filter = instrument.get('lotSizeFilter', {})
                 qty_step = lot_size_filter.get('qtyStep', '0.000001')
-                precision = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 6
-                self._precision_cache[symbol] = precision
+                # Определяем количество знаков после запятой
+                if '.' in str(qty_step):
+                    precision = len(str(qty_step).split('.')[-1])
+                else:
+                    precision = 0
+                PRECISION_CACHE[symbol] = precision
                 logger.info(f"Precision for {symbol}: {precision} decimals (qtyStep: {qty_step})")
                 return precision
             return 6
@@ -1374,10 +1381,19 @@ class BybitClient:
             
             # Получаем точность количества для символа
             precision = await self.get_quantity_precision(symbol)
-            # Округляем количество до нужной точности
+            # Округляем количество до нужной точности (всегда вниз)
             rounded_quantity = round_quantity_to_precision(quantity, precision)
             
-            logger.info(f"Placing sell order: {symbol}, qty: {rounded_quantity} (precision: {precision}), price: {price}")
+            # Дополнительная проверка: если rounded_quantity = 0, то берем минимальное количество
+            if rounded_quantity <= 0:
+                # Получаем минимальное количество для символа
+                response = self.session.get_instruments_info(category="spot", symbol=symbol)
+                if response['retCode'] == 0 and response['result']['list']:
+                    min_qty = float(response['result']['list'][0]['lotSizeFilter'].get('minOrderQty', 0.000001))
+                    rounded_quantity = min_qty
+                    logger.warning(f"Quantity was zero, using min qty: {min_qty}")
+            
+            logger.info(f"Placing sell order: {symbol}, original qty: {quantity}, rounded qty: {rounded_quantity} (precision: {precision}), price: {price}")
             
             response = self.session.place_order(
                 category="spot", 
@@ -1766,7 +1782,8 @@ class DCAStrategy:
             'check_date': datetime.now() - timedelta(days=90)
         }
     
-    async def place_full_sell_order(self, symbol: str, profit_percent: float, auto_cancel_old: bool = True) -> Dict:
+    async def place_full_sell_order(self, update, symbol: str, profit_percent: float, auto_cancel_old: bool = True) -> Dict:
+        """Выставляет ордер на продажу с автоматической отменой старых"""
         try:
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
@@ -1794,9 +1811,9 @@ class DCAStrategy:
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
             
-            # Если есть старые ордера и auto_cancel_old = True, отменяем их автоматически
-            if existing_sell_orders and auto_cancel_old:
-                await update.callback_query.message.reply_text("🔄 Обнаружены старые ордера на продажу. Отменяю их...")
+            # Если есть старые ордера, отменяем их автоматически
+            if existing_sell_orders:
+                await update.message.reply_text("🔄 Обнаружены старые ордера на продажу. Отменяю их...")
                 
                 cancelled_count, cancelled_ids = await self.bybit.cancel_all_sell_orders(symbol)
                 
@@ -1805,24 +1822,17 @@ class DCAStrategy:
                     for order_id in cancelled_ids:
                         self.db.update_sell_order_status(order_id, 'cancelled')
                     
-                    await update.callback_query.message.reply_text(f"✅ Отменено {cancelled_count} старых ордеров. Выставляю новый...")
+                    await update.message.reply_text(f"✅ Отменено {cancelled_count} старых ордеров. Выставляю новый...")
                 else:
-                    await update.callback_query.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
+                    await update.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
                     return {'success': False, 'error': 'Не удалось отменить старые ордера'}
             
-            elif existing_sell_orders and not auto_cancel_old:
-                # Если не нужно автоматически отменять, выводим сообщение
-                orders_list = []
-                for order in existing_sell_orders:
-                    order_price = float(order.get('price', 0))
-                    order_qty = float(order.get('qty', 0))
-                    orders_list.append(f"  • {format_quantity(order_qty, 6)} {coin} @ {format_price(order_price, 4)} USDT")
-                
-                orders_text = "\n".join(orders_list)
-                return {
-                    'success': False, 
-                    'error': f'⚠️ Уже есть активные ордера на продажу!\n\nАктивные ордера:\n{orders_text}\n\nБот автоматически отменит их и выставит новый ордер. Нажмите "✅ Да" еще раз.'
-                }
+            # Получаем точность количества
+            precision = await self.bybit.get_quantity_precision(symbol)
+            # Округляем количество до нужной точности
+            rounded_quantity = round_quantity_to_precision(total_quantity, precision)
+            
+            logger.info(f"Placing sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, precision: {precision}, price: {rounded_price}")
             
             # Создаем ордер на продажу
             result = await self.bybit.place_limit_sell(symbol, total_quantity, rounded_price)
@@ -1831,17 +1841,17 @@ class DCAStrategy:
                 self.db.add_sell_order(
                     symbol=symbol,
                     order_id=result['order_id'],
-                    quantity=total_quantity,
+                    quantity=rounded_quantity,
                     target_price=rounded_price,
                     profit_percent=profit_percent
                 )
                 self.db.log_action('FULL_SELL_ORDER', symbol, 
-                                   f"Ордер на продажу {total_quantity:.6f} {coin} по {rounded_price:.4f} USDT")
+                                   f"Ордер на продажу {rounded_quantity:.6f} {coin} по {rounded_price:.4f} USDT")
                 
                 return {
                     'success': True,
                     'order_id': result['order_id'],
-                    'quantity': total_quantity,
+                    'quantity': rounded_quantity,
                     'price': rounded_price,
                     'raw_price': raw_price,
                     'profit_percent': profit_percent
@@ -2141,6 +2151,7 @@ class FastDCABot:
             
             # Передаем update для отправки сообщений из стратегии
             result = await self.strategy.place_full_sell_order(
+                update,
                 sell_data['symbol'],
                 sell_data['profit_percent'],
                 auto_cancel_old=True
@@ -3726,10 +3737,14 @@ class FastDCABot:
         balance = await self.bybit.get_balance(coin)
         total_quantity = balance.get('equity', 0) if balance else 0
         
+        # Округляем количество для отображения
+        precision = await self.bybit.get_quantity_precision(symbol)
+        display_quantity = round_quantity_to_precision(total_quantity, precision)
+        
         msg = (
             f"📊 *РЕКОМЕНДАЦИЯ ПО ПРОДАЖЕ*\n\n"
             f"🪙 Токен: `{symbol}`\n"
-            f"💰 Количество для продажи: `{format_quantity(total_quantity, 6)}` {coin}\n"
+            f"💰 Количество для продажи: `{format_quantity(display_quantity, precision)}` {coin}\n"
             f"📈 Целевая прибыль: `{profit_percent}%`\n"
             f"💰 Цена продажи (расчетная): `{format_price(raw_price, 4)}` USDT\n"
             f"💰 Цена продажи (округленная): `{format_price(rounded_price, 4)}` USDT\n"
@@ -3739,6 +3754,8 @@ class FastDCABot:
         
         context.user_data['pending_sell_data'] = {
             'total_quantity': total_quantity,
+            'display_quantity': display_quantity,
+            'precision': precision,
             'rounded_price': rounded_price,
             'raw_price': raw_price,
             'profit_percent': profit_percent,
