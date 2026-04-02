@@ -125,9 +125,10 @@ def round_price_up(price: float) -> float:
     return math.ceil(price * 100) / 100
 
 
-def round_quantity_down(quantity: float, precision: int = 6) -> float:
-    """Округляет количество вниз до указанной точности"""
-    return math.floor(quantity * (10 ** precision)) / (10 ** precision)
+def round_quantity_to_precision(quantity: float, precision: int) -> float:
+    """Округляет количество до указанной точности (количество знаков после запятой)"""
+    factor = 10 ** precision
+    return math.floor(quantity * factor) / factor
 
 
 def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
@@ -1159,6 +1160,7 @@ class BybitClient:
         self._price_cache = {}
         self._cache_time = {}
         self._cache_ttl = 5
+        self._precision_cache = {}
         self._init_session()
     
     def _init_session(self):
@@ -1186,32 +1188,48 @@ class BybitClient:
             logger.error(f"Error getting price for {symbol}: {e}")
             return None
     
-    async def get_instrument_info(self, symbol: str) -> Dict:
-        """Получение информации о торговом инструменте"""
+    async def get_quantity_precision(self, symbol: str) -> int:
+        """Получение точности количества для символа"""
+        if symbol in self._precision_cache:
+            return self._precision_cache[symbol]
+        
         try:
             if not self.session:
                 self._init_session()
             response = self.session.get_instruments_info(category="spot", symbol=symbol)
             if response['retCode'] == 0 and response['result']['list']:
-                return response['result']['list'][0]
-            return {}
-        except Exception as e:
-            logger.error(f"Error getting instrument info: {e}")
-            return {}
-    
-    async def get_quantity_precision(self, symbol: str) -> int:
-        """Получение точности количества для символа"""
-        try:
-            instrument = await self.get_instrument_info(symbol)
-            if instrument:
+                instrument = response['result']['list'][0]
                 lot_size_filter = instrument.get('lotSizeFilter', {})
-                qty_step = float(lot_size_filter.get('qtyStep', '0.000001'))
+                qty_step = lot_size_filter.get('qtyStep', '0.000001')
                 precision = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 6
+                self._precision_cache[symbol] = precision
+                logger.info(f"Precision for {symbol}: {precision} decimals (qtyStep: {qty_step})")
                 return precision
             return 6
         except Exception as e:
-            logger.error(f"Error getting precision: {e}")
+            logger.error(f"Error getting precision for {symbol}: {e}")
             return 6
+    
+    async def cancel_all_sell_orders(self, symbol: str) -> Tuple[int, List[str]]:
+        """Отменяет все активные ордера на продажу для символа"""
+        try:
+            open_orders = await self.get_open_orders(symbol)
+            sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
+            
+            cancelled_ids = []
+            for order in sell_orders:
+                order_id = order.get('orderId')
+                result = await self.cancel_order(symbol, order_id)
+                if result['success']:
+                    cancelled_ids.append(order_id)
+                    logger.info(f"Cancelled sell order {order_id} for {symbol}")
+                else:
+                    logger.warning(f"Failed to cancel order {order_id}: {result.get('error')}")
+            
+            return len(cancelled_ids), cancelled_ids
+        except Exception as e:
+            logger.error(f"Error cancelling sell orders: {e}")
+            return 0, []
     
     async def get_balance(self, coin: str = None) -> Dict:
         try:
@@ -1357,7 +1375,9 @@ class BybitClient:
             # Получаем точность количества для символа
             precision = await self.get_quantity_precision(symbol)
             # Округляем количество до нужной точности
-            rounded_quantity = round_quantity_down(quantity, precision)
+            rounded_quantity = round_quantity_to_precision(quantity, precision)
+            
+            logger.info(f"Placing sell order: {symbol}, qty: {rounded_quantity} (precision: {precision}), price: {price}")
             
             response = self.session.place_order(
                 category="spot", 
@@ -1370,7 +1390,7 @@ class BybitClient:
             )
             if response['retCode'] == 0:
                 return {'success': True, 'order_id': response['result']['orderId'], 'quantity': rounded_quantity, 'price': price}
-            return {'success': False, 'error': response['retMsg']}
+            return {'success': False, 'error': f"{response['retMsg']} (Код: {response['retCode']})"}
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
@@ -1746,7 +1766,7 @@ class DCAStrategy:
             'check_date': datetime.now() - timedelta(days=90)
         }
     
-    async def place_full_sell_order(self, symbol: str, profit_percent: float) -> Dict:
+    async def place_full_sell_order(self, symbol: str, profit_percent: float, auto_cancel_old: bool = True) -> Dict:
         try:
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
@@ -1774,8 +1794,24 @@ class DCAStrategy:
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
             
-            if existing_sell_orders:
-                # Отправляем сообщение о существующих ордерах
+            # Если есть старые ордера и auto_cancel_old = True, отменяем их автоматически
+            if existing_sell_orders and auto_cancel_old:
+                await update.callback_query.message.reply_text("🔄 Обнаружены старые ордера на продажу. Отменяю их...")
+                
+                cancelled_count, cancelled_ids = await self.bybit.cancel_all_sell_orders(symbol)
+                
+                if cancelled_count > 0:
+                    # Обновляем статус в БД
+                    for order_id in cancelled_ids:
+                        self.db.update_sell_order_status(order_id, 'cancelled')
+                    
+                    await update.callback_query.message.reply_text(f"✅ Отменено {cancelled_count} старых ордеров. Выставляю новый...")
+                else:
+                    await update.callback_query.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
+                    return {'success': False, 'error': 'Не удалось отменить старые ордера'}
+            
+            elif existing_sell_orders and not auto_cancel_old:
+                # Если не нужно автоматически отменять, выводим сообщение
                 orders_list = []
                 for order in existing_sell_orders:
                     order_price = float(order.get('price', 0))
@@ -1785,7 +1821,7 @@ class DCAStrategy:
                 orders_text = "\n".join(orders_list)
                 return {
                     'success': False, 
-                    'error': f'⚠️ Уже есть активные ордера на продажу!\n\nАктивные ордера:\n{orders_text}\n\nПожалуйста, сначала отмените существующие ордера через "Управление ордерами" -> "Удалить ордер", затем повторите попытку.'
+                    'error': f'⚠️ Уже есть активные ордера на продажу!\n\nАктивные ордера:\n{orders_text}\n\nБот автоматически отменит их и выставит новый ордер. Нажмите "✅ Да" еще раз.'
                 }
             
             # Создаем ордер на продажу
@@ -1963,7 +1999,6 @@ class FastDCABot:
     async def cmd_start_fast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        # Очищаем состояние при старте
         context.user_data.clear()
         self.import_waiting = False
         await update.message.reply_text(
@@ -1978,7 +2013,6 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return
         
-        # Очищаем состояние
         context.user_data.clear()
         self.import_waiting = False
         
@@ -2105,9 +2139,11 @@ class FastDCABot:
                 await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_main_keyboard())
                 return
             
+            # Передаем update для отправки сообщений из стратегии
             result = await self.strategy.place_full_sell_order(
                 sell_data['symbol'],
-                sell_data['profit_percent']
+                sell_data['profit_percent'],
+                auto_cancel_old=True
             )
             
             if result['success']:
@@ -2549,11 +2585,9 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     async def show_dca_stats_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает детальную статистику DCA"""
         if not await self._check_user_fast(update):
             return
         
-        # Сбрасываем состояние
         context.user_data.clear()
         self.import_waiting = False
         
@@ -3072,7 +3106,6 @@ class FastDCABot:
     async def manual_buy_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        # Очищаем user_data перед началом
         context.user_data.clear()
         self.import_waiting = False
         
@@ -3163,7 +3196,6 @@ class FastDCABot:
     async def manual_add_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
-        # Очищаем user_data перед началом
         context.user_data.clear()
         self.import_waiting = False
         
@@ -3504,7 +3536,6 @@ class FastDCABot:
     async def handle_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        # Если пришла неизвестная команда, очищаем состояние
         context.user_data.clear()
         self.import_waiting = False
         await update.message.reply_text("Используйте кнопки меню", reply_markup=self.get_main_keyboard())
