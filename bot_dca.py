@@ -107,9 +107,6 @@ POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 MAX_DROP_DEPTH = 80
 STEP_PERCENT = 3
 
-# Кэш для точности символов
-PRECISION_CACHE = {}
-
 
 def format_price(price: float, decimals: int = 4) -> str:
     if price is None:
@@ -117,7 +114,7 @@ def format_price(price: float, decimals: int = 4) -> str:
     return f"{price:.{decimals}f}"
 
 
-def format_quantity(qty: float, decimals: int = 6) -> str:
+def format_quantity(qty: float, decimals: int = 2) -> str:
     if qty is None:
         return "N/A"
     return f"{qty:.{decimals}f}"
@@ -128,10 +125,9 @@ def round_price_up(price: float) -> float:
     return math.ceil(price * 100) / 100
 
 
-def round_quantity_to_precision(quantity: float, precision: int) -> float:
-    """Округляет количество до указанной точности (количество знаков после запятой)"""
-    factor = 10 ** precision
-    return math.floor(quantity * factor) / factor
+def round_quantity_for_sell(quantity: float) -> float:
+    """Округляет количество для продажи до 2 знаков после запятой (в меньшую сторону)"""
+    return math.floor(quantity * 100) / 100
 
 
 def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
@@ -1190,33 +1186,6 @@ class BybitClient:
             logger.error(f"Error getting price for {symbol}: {e}")
             return None
     
-    async def get_quantity_precision(self, symbol: str) -> int:
-        """Получение точности количества для символа"""
-        global PRECISION_CACHE
-        if symbol in PRECISION_CACHE:
-            return PRECISION_CACHE[symbol]
-        
-        try:
-            if not self.session:
-                self._init_session()
-            response = self.session.get_instruments_info(category="spot", symbol=symbol)
-            if response['retCode'] == 0 and response['result']['list']:
-                instrument = response['result']['list'][0]
-                lot_size_filter = instrument.get('lotSizeFilter', {})
-                qty_step = lot_size_filter.get('qtyStep', '0.000001')
-                # Определяем количество знаков после запятой
-                if '.' in str(qty_step):
-                    precision = len(str(qty_step).split('.')[-1])
-                else:
-                    precision = 0
-                PRECISION_CACHE[symbol] = precision
-                logger.info(f"Precision for {symbol}: {precision} decimals (qtyStep: {qty_step})")
-                return precision
-            return 6
-        except Exception as e:
-            logger.error(f"Error getting precision for {symbol}: {e}")
-            return 6
-    
     async def cancel_all_sell_orders(self, symbol: str) -> Tuple[int, List[str]]:
         """Отменяет все активные ордера на продажу для символа"""
         try:
@@ -1379,21 +1348,15 @@ class BybitClient:
             if not self.session:
                 self._init_session()
             
-            # Получаем точность количества для символа
-            precision = await self.get_quantity_precision(symbol)
-            # Округляем количество до нужной точности (всегда вниз)
-            rounded_quantity = round_quantity_to_precision(quantity, precision)
+            # Округляем количество до 2 знаков после запятой (в меньшую сторону)
+            rounded_quantity = round_quantity_for_sell(quantity)
             
-            # Дополнительная проверка: если rounded_quantity = 0, то берем минимальное количество
+            # Проверка: если количество стало 0, используем минимальное
             if rounded_quantity <= 0:
-                # Получаем минимальное количество для символа
-                response = self.session.get_instruments_info(category="spot", symbol=symbol)
-                if response['retCode'] == 0 and response['result']['list']:
-                    min_qty = float(response['result']['list'][0]['lotSizeFilter'].get('minOrderQty', 0.000001))
-                    rounded_quantity = min_qty
-                    logger.warning(f"Quantity was zero, using min qty: {min_qty}")
+                rounded_quantity = 0.01  # Минимальное количество для TONUSDT
+                logger.warning(f"Quantity was zero, using min qty: {rounded_quantity}")
             
-            logger.info(f"Placing sell order: {symbol}, original qty: {quantity}, rounded qty: {rounded_quantity} (precision: {precision}), price: {price}")
+            logger.info(f"Placing sell order: {symbol}, original qty: {quantity}, rounded qty: {rounded_quantity}, price: {price}")
             
             response = self.session.place_order(
                 category="spot", 
@@ -1812,7 +1775,7 @@ class DCAStrategy:
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
             
             # Если есть старые ордера, отменяем их автоматически
-            if existing_sell_orders:
+            if existing_sell_orders and auto_cancel_old:
                 await update.message.reply_text("🔄 Обнаружены старые ордера на продажу. Отменяю их...")
                 
                 cancelled_count, cancelled_ids = await self.bybit.cancel_all_sell_orders(symbol)
@@ -1827,12 +1790,10 @@ class DCAStrategy:
                     await update.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
                     return {'success': False, 'error': 'Не удалось отменить старые ордера'}
             
-            # Получаем точность количества
-            precision = await self.bybit.get_quantity_precision(symbol)
-            # Округляем количество до нужной точности
-            rounded_quantity = round_quantity_to_precision(total_quantity, precision)
+            # Округляем количество до 2 знаков
+            rounded_quantity = round_quantity_for_sell(total_quantity)
             
-            logger.info(f"Placing sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, precision: {precision}, price: {rounded_price}")
+            logger.info(f"Placing sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, price: {rounded_price}")
             
             # Создаем ордер на продажу
             result = await self.bybit.place_limit_sell(symbol, total_quantity, rounded_price)
@@ -1846,7 +1807,7 @@ class DCAStrategy:
                     profit_percent=profit_percent
                 )
                 self.db.log_action('FULL_SELL_ORDER', symbol, 
-                                   f"Ордер на продажу {rounded_quantity:.6f} {coin} по {rounded_price:.4f} USDT")
+                                   f"Ордер на продажу {rounded_quantity:.2f} {coin} по {rounded_price:.4f} USDT")
                 
                 return {
                     'success': True,
@@ -1986,7 +1947,7 @@ class FastDCABot:
                 date_display = datetime.strptime(p['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
             except:
                 date_display = p['date'][:10] if p['date'] else "N/A"
-            btn_text = f"ID{p['id']}: {date_display} - {format_quantity(p['quantity'], 4)} по {format_price(p['price'], 4)}"
+            btn_text = f"ID{p['id']}: {date_display} - {format_quantity(p['quantity'], 2)} по {format_price(p['price'], 4)}"
             keyboard.append([KeyboardButton(btn_text)])
         keyboard.append([KeyboardButton("🏠 Главное меню")])
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -2161,7 +2122,7 @@ class FastDCABot:
                 msg = (
                     f"✅ *Ордер на продажу успешно создан!*\n\n"
                     f"🪙 Токен: `{sell_data['symbol']}`\n"
-                    f"📊 Количество: `{format_quantity(result['quantity'], 6)}`\n"
+                    f"📊 Количество: `{format_quantity(result['quantity'], 2)}`\n"
                     f"💰 Цена: `{format_price(result['price'], 4)}` USDT\n"
                     f"📈 Целевая прибыль: `{result['profit_percent']}%`\n"
                     f"🆔 ID ордера: `{result['order_id']}`\n\n"
@@ -2169,7 +2130,7 @@ class FastDCABot:
                 )
                 await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=self.get_main_keyboard())
                 self.db.log_action('SELL_ORDER_PLACED', sell_data['symbol'], 
-                                   f"Ордер на продажу {result['quantity']:.6f} по {result['price']:.4f} USDT")
+                                   f"Ордер на продажу {result['quantity']:.2f} по {result['price']:.4f} USDT")
             else:
                 await update.message.reply_text(
                     f"❌ *Ошибка при создании ордера на продажу*\n\n"
@@ -2376,7 +2337,7 @@ class FastDCABot:
                     order_id = order.get('orderId', 'N/A')
                     price = float(order.get('price', 0))
                     qty = float(order.get('qty', 0))
-                    message += f"{i}. `{order_id}` - {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)} USDT\n"
+                    message += f"{i}. `{order_id}` - {format_quantity(qty, 2)} {coin} @ {format_price(price, 4)} USDT\n"
                 if len(sell_orders) > 20:
                     message += f"_...и еще {len(sell_orders) - 20}_\n"
                 message += f"\n"
@@ -2390,7 +2351,7 @@ class FastDCABot:
                     order_id = order.get('orderId', 'N/A')
                     price = float(order.get('price', 0))
                     qty = float(order.get('qty', 0))
-                    message += f"{i}. `{order_id}` - {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)} USDT\n"
+                    message += f"{i}. `{order_id}` - {format_quantity(qty, 2)} {coin} @ {format_price(price, 4)} USDT\n"
                 if len(buy_orders) > 20:
                     message += f"_...и еще {len(buy_orders) - 20}_\n"
             else:
@@ -2432,7 +2393,7 @@ class FastDCABot:
                 side_emoji = "🔴" if order.get('side') == 'Sell' else "🟢"
                 price = float(order.get('price', 0))
                 qty = float(order.get('qty', 0))
-                btn_text = f"{idx}. {side_emoji} {format_quantity(qty, 4)} @ {format_price(price, 2)} USDT"
+                btn_text = f"{idx}. {side_emoji} {format_quantity(qty, 2)} @ {format_price(price, 2)} USDT"
                 keyboard.append([KeyboardButton(btn_text)])
             
             keyboard.append([KeyboardButton("❌ Отмена")])
@@ -2515,7 +2476,7 @@ class FastDCABot:
                     f"🪙 Токен: `{symbol}`\n"
                     f"📊 Сторона: `{side}`\n"
                     f"💰 Цена: `{format_price(price, 4)}` USDT\n"
-                    f"📊 Количество: `{format_quantity(qty, 6)}`\n"
+                    f"📊 Количество: `{format_quantity(qty, 2)}`\n"
                     f"🆔 ID: `{order_id}`",
                     parse_mode='Markdown',
                     reply_markup=self.get_order_management_keyboard()
@@ -2582,8 +2543,8 @@ class FastDCABot:
                 emoji = "🟢" if pnl_percent >= 0 else "🔴"
                 
                 message += f"🪙 *{coin}*\n"
-                message += f"Количество: `{format_quantity(equity, 6)}`\n"
-                message += f"Доступно: `{format_quantity(available, 6)}`\n"
+                message += f"Количество: `{format_quantity(equity, 2)}`\n"
+                message += f"Доступно: `{format_quantity(available, 2)}`\n"
                 message += f"Стоимость: `{usd_value:.2f}` USDT\n"
                 message += f"Текущая цена: `{format_price(current_price, 4)}` USDT\n"
                 if avg_price > 0:
@@ -2628,7 +2589,7 @@ class FastDCABot:
             
             text = f"📊 *ДЕТАЛЬНАЯ СТАТИСТИКА DCA*\n\n"
             text += f"🪙 Токен: `{symbol}`\n"
-            text += f"💰 Куплено: `{format_quantity(total_amount, 6)}` {coin}\n"
+            text += f"💰 Куплено: `{format_quantity(total_amount, 2)}` {coin}\n"
             text += f"💵 Инвестировано: `{total_cost:.2f}` USDT\n"
             text += f"📈 Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
             
@@ -2642,7 +2603,7 @@ class FastDCABot:
             if target_info:
                 rounded_target = round_price_up(target_info['target_price'])
                 text += f"\n🎯 *ЦЕЛЕВАЯ ПРИБЫЛЬ {profit_percent}%:*\n"
-                text += f"Нужно продать: `{format_quantity(target_info['total_qty'], 6)}` {coin}\n"
+                text += f"Нужно продать: `{format_quantity(target_info['total_qty'], 2)}` {coin}\n"
                 text += f"Цена продажи (расчетная): `{format_price(target_info['target_price'], 4)}` USDT\n"
                 text += f"Цена продажи (с округлением вверх): `{format_price(rounded_target, 4)}` USDT\n"
                 text += f"Получите: `{target_info['target_value']:.2f}` USDT\n"
@@ -3192,7 +3153,7 @@ class FastDCABot:
                 sell_result = await self.bybit.place_limit_sell(symbol, result['quantity'], target_price)
                 if sell_result['success']:
                     self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'], quantity=result['quantity'], target_price=target_price, profit_percent=profit_percent)
-                msg = f"✅ *Лимитный ордер создан!*\n\nЦена: `{format_price(price, 4)}` USDT\nСумма: `{amount:.2f}` USDT\nКоличество: `{format_quantity(result['quantity'], 6)}`\n"
+                msg = f"✅ *Лимитный ордер создан!*\n\nЦена: `{format_price(price, 4)}` USDT\nСумма: `{amount:.2f}` USDT\nКоличество: `{format_quantity(result['quantity'], 2)}`\n"
                 if drop_percent > 0:
                     msg += f"📉 Падение: `{drop_percent:.1f}%`\n"
                 msg += f"Цель продажи: `{format_price(target_price, 4)}` USDT ({profit_percent}%)"
@@ -3319,7 +3280,7 @@ class FastDCABot:
                 msg = f"✅ *Покупка добавлена!*\n\n"
                 msg += f"🆔 ID: `{purchase_id}`\n"
                 msg += f"💰 Цена: `{format_price(price, 4)}` USDT\n"
-                msg += f"📊 Количество: `{format_quantity(quantity, 6)}`\n"
+                msg += f"📊 Количество: `{format_quantity(quantity, 2)}`\n"
                 msg += f"💵 Сумма: `{amount_usdt:.2f}` USDT"
                 if drop_percent > 0:
                     msg += f"\n📉 Падение: `{drop_percent:.1f}%` от цены старта"
@@ -3371,7 +3332,7 @@ class FastDCABot:
                 date_display = datetime.strptime(purchase['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
             except:
                 date_display = purchase['date'][:10] if purchase['date'] else "N/A"
-            await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
+            await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 2)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
             return EDIT_PURCHASE_SELECT
         except Exception as e:
             await update.message.reply_text("❌ Ошибка выбора", reply_markup=self.get_main_keyboard())
@@ -3430,7 +3391,7 @@ class FastDCABot:
                 return ConversationHandler.END
             new_amount_usdt = purchase['price'] * new_quantity
             if self.db.update_purchase(purchase_id, quantity=new_quantity, amount_usdt=new_amount_usdt):
-                await update.message.reply_text(f"✅ Количество обновлено: {format_quantity(new_quantity, 6)}")
+                await update.message.reply_text(f"✅ Количество обновлено: {format_quantity(new_quantity, 2)}")
             else:
                 await update.message.reply_text("❌ Ошибка при обновлении")
             await self.show_purchase_after_edit(update, context, purchase_id)
@@ -3523,7 +3484,7 @@ class FastDCABot:
             date_display = datetime.strptime(purchase['date'], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
         except:
             date_display = purchase['date'][:10] if purchase['date'] else "N/A"
-        await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 6)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text(f"✏️ *РЕДАКТИРОВАНИЕ ID: {purchase_id}*\n\n📅 Дата: `{date_display}`\n💰 Цена: `{format_price(purchase['price'], 4)}` USDT\n📊 Количество: `{format_quantity(purchase['quantity'], 2)}`", reply_markup=self.get_edit_purchases_keyboard(), parse_mode='Markdown')
     
     async def cancel_to_edit_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         purchase_id = context.user_data.get('editing_purchase_id')
@@ -3699,7 +3660,7 @@ class FastDCABot:
                 f"✅ *Покупка добавлена в статистику!*\n\n"
                 f"🪙 Токен: `{order_dict['symbol']}`\n"
                 f"💰 Цена: `{format_price(order_dict['price'], 4)}` USDT\n"
-                f"📊 Количество: `{format_quantity(order_dict['quantity'], 6)}`\n"
+                f"📊 Количество: `{format_quantity(order_dict['quantity'], 2)}`\n"
                 f"💵 Сумма: `{order_dict['amount_usdt']:.2f}` USDT\n"
                 f"📅 Дата: `{purchase_date}`\n"
                 f"📉 Падение: `{drop_percent:.1f}%`\n"
@@ -3737,14 +3698,13 @@ class FastDCABot:
         balance = await self.bybit.get_balance(coin)
         total_quantity = balance.get('equity', 0) if balance else 0
         
-        # Округляем количество для отображения
-        precision = await self.bybit.get_quantity_precision(symbol)
-        display_quantity = round_quantity_to_precision(total_quantity, precision)
+        # Округляем количество до 2 знаков для отображения
+        display_quantity = round_quantity_for_sell(total_quantity)
         
         msg = (
             f"📊 *РЕКОМЕНДАЦИЯ ПО ПРОДАЖЕ*\n\n"
             f"🪙 Токен: `{symbol}`\n"
-            f"💰 Количество для продажи: `{format_quantity(display_quantity, precision)}` {coin}\n"
+            f"💰 Количество для продажи: `{format_quantity(display_quantity, 2)}` {coin}\n"
             f"📈 Целевая прибыль: `{profit_percent}%`\n"
             f"💰 Цена продажи (расчетная): `{format_price(raw_price, 4)}` USDT\n"
             f"💰 Цена продажи (округленная): `{format_price(rounded_price, 4)}` USDT\n"
@@ -3755,7 +3715,6 @@ class FastDCABot:
         context.user_data['pending_sell_data'] = {
             'total_quantity': total_quantity,
             'display_quantity': display_quantity,
-            'precision': precision,
             'rounded_price': rounded_price,
             'raw_price': raw_price,
             'profit_percent': profit_percent,
