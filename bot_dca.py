@@ -1770,6 +1770,11 @@ class DCAStrategy:
             if total_quantity <= 0:
                 return {'success': False, 'error': f'Количество {coin} равно 0'}
             
+            # Округляем количество до 2 знаков (обязательно!)
+            rounded_quantity = round_quantity_for_sell(total_quantity)
+            
+            logger.info(f"Place full sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, price: {rounded_price}")
+            
             # Проверяем наличие активных ордеров на продажу
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
@@ -1790,13 +1795,8 @@ class DCAStrategy:
                     await update.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
                     return {'success': False, 'error': 'Не удалось отменить старые ордера'}
             
-            # Округляем количество до 2 знаков
-            rounded_quantity = round_quantity_for_sell(total_quantity)
-            
-            logger.info(f"Placing sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, price: {rounded_price}")
-            
-            # Создаем ордер на продажу
-            result = await self.bybit.place_limit_sell(symbol, total_quantity, rounded_price)
+            # Создаем ордер на продажу с округленным количеством
+            result = await self.bybit.place_limit_sell(symbol, rounded_quantity, rounded_price)
             
             if result['success']:
                 self.db.add_sell_order(
