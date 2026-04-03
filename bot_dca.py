@@ -61,7 +61,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-# Версия бота (обновлена 03.04.2026)
+# Версия бота
 BOT_VERSION = "1.9 (03.04.2026)"
 
 # Состояния для ConversationHandler
@@ -427,43 +427,15 @@ class Database:
     
     def delete_purchase(self, purchase_id: int) -> bool:
         try:
-            # Сначала получаем информацию о покупке для сброса статуса в executed_orders
-            purchase = self.get_purchase_by_id(purchase_id)
-            
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
             cursor.execute('DELETE FROM dca_purchases WHERE id = ?', (purchase_id,))
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
-            
-            # Если покупка найдена, сбрасываем статус в executed_orders
-            if success and purchase:
-                self.reset_executed_order_status(purchase['price'], purchase['quantity'], purchase['symbol'])
-                logger.info(f"Reset executed order status for purchase {purchase_id}: price={purchase['price']}, qty={purchase['quantity']}")
-            
             return success
         except Exception as e:
             logger.error(f"Error deleting purchase {purchase_id}: {e}")
-            return False
-    
-    def reset_executed_order_status(self, price: float, quantity: float, symbol: str) -> bool:
-        """Сбрасывает статус added_to_stats в executed_orders для указанного ордера"""
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            # Ищем ордер по цене и количеству (с округлением)
-            cursor.execute('''
-                UPDATE executed_orders 
-                SET added_to_stats = 0, notified_at = NULL 
-                WHERE symbol = ? AND ABS(price - ?) < 0.0001 AND ABS(quantity - ?) < 0.0001
-            ''', (symbol, price, quantity))
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            return success
-        except Exception as e:
-            logger.error(f"Error resetting executed order status: {e}")
             return False
     
     def get_dca_stats(self, symbol: str) -> Dict:
@@ -1564,18 +1536,16 @@ class DCAStrategy:
         
         purchases = self.db.get_purchases(symbol)
         
-        # Создаем множество для быстрого поиска уже добавленных ордеров из статистики
         added_orders = set()
         for p in purchases:
             price_key = round(p['price'], 4)
             qty_key = round(p['quantity'], 6)
             added_orders.add(f"{price_key}_{qty_key}")
         
-        # Также получаем список уже обработанных ордеров из executed_orders
         conn = sqlite3.connect(self.db.db_file, timeout=5)
         cursor = conn.cursor()
         try:
-            cursor.execute('SELECT order_id, added_to_stats, skipped, price, quantity FROM executed_orders WHERE symbol = ?', (symbol,))
+            cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
             executed_records = cursor.fetchall()
         except Exception as e:
             logger.warning(f"Error querying executed_orders: {e}")
@@ -1584,40 +1554,20 @@ class DCAStrategy:
         
         processed_order_ids = set()
         for record in executed_records:
-            # record: order_id, added_to_stats, skipped, price, quantity
             added_to_stats = record[1] if len(record) > 1 else 0
             skipped = record[2] if len(record) > 2 else 0
             if added_to_stats == 1 or skipped == 1:
                 processed_order_ids.add(record[0])
-            else:
-                # Если ордер не отмечен как обработанный, проверяем по цене и количеству
-                if len(record) > 3:
-                    price_key = round(record[3], 4)
-                    qty_key = round(record[4], 6)
-                    if f"{price_key}_{qty_key}" in added_orders:
-                        # Ордер есть в статистике, но не отмечен - исправляем
-                        try:
-                            conn2 = sqlite3.connect(self.db.db_file, timeout=5)
-                            cursor2 = conn2.cursor()
-                            cursor2.execute('UPDATE executed_orders SET added_to_stats = 1 WHERE order_id = ?', (record[0],))
-                            conn2.commit()
-                            conn2.close()
-                            logger.info(f"Fixed missing flag for order {record[0]}")
-                        except:
-                            pass
         
         missing_orders = []
         
         for order in all_orders:
-            # Проверяем по order_id
             if order['order_id'] in processed_order_ids:
                 continue
             
-            # Проверяем по цене и количеству в статистике
             price_key = round(order['price'], 4)
             qty_key = round(order['quantity'], 6)
             if f"{price_key}_{qty_key}" in added_orders:
-                # Ордер уже есть в статистике, но не отмечен в executed_orders
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
@@ -1629,28 +1579,17 @@ class DCAStrategy:
                 self.db.mark_order_as_added(order['order_id'])
                 continue
             
-            # Ордер не найден - добавляем в пропущенные
-            # Проверяем, не добавлен ли он уже в executed_orders
-            existing = False
-            for record in executed_records:
-                if record[0] == order['order_id']:
-                    existing = True
-                    break
-            
-            if not existing:
-                self.db.add_executed_order(
-                    order['order_id'],
-                    symbol,
-                    order['price'],
-                    order['quantity'],
-                    order['amount_usdt'],
-                    order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
-                )
-            
+            self.db.add_executed_order(
+                order['order_id'],
+                symbol,
+                order['price'],
+                order['quantity'],
+                order['amount_usdt'],
+                order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
+            )
             missing_orders.append(order)
             logger.info(f"Missing order found: {order['order_id']} at {order['price']} on {order['executed_at']}")
         
-        # Отправляем уведомления о пропущенных ордерах
         for order in missing_orders:
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -1756,13 +1695,11 @@ class DCAStrategy:
         
         return new_executed
     
-    async def force_check_executed_orders(self, update, symbol: str) -> Dict:
-        """Принудительная проверка всех исполненных ордеров (для теста)"""
+    async def force_check_executed_orders(self, symbol: str) -> Dict:
         all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
         
         purchases = self.db.get_purchases(symbol)
         
-        # Создаем множество для быстрого поиска уже добавленных ордеров из статистики
         added_orders = set()
         for p in purchases:
             price_key = round(p['price'], 4)
@@ -1772,7 +1709,7 @@ class DCAStrategy:
         conn = sqlite3.connect(self.db.db_file, timeout=5)
         cursor = conn.cursor()
         try:
-            cursor.execute('SELECT order_id, added_to_stats, skipped, price, quantity FROM executed_orders WHERE symbol = ?', (symbol,))
+            cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
             executed_records = cursor.fetchall()
         except Exception as e:
             logger.warning(f"Error querying executed_orders: {e}")
@@ -1798,63 +1735,8 @@ class DCAStrategy:
             qty_key = round(order['quantity'], 6)
             if f"{price_key}_{qty_key}" in added_orders:
                 already_added.append(order)
-                # Если ордер есть в статистике, но не отмечен в executed_orders - исправляем
-                try:
-                    self.db.add_executed_order(
-                        order['order_id'],
-                        symbol,
-                        order['price'],
-                        order['quantity'],
-                        order['amount_usdt'],
-                        order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
-                    )
-                    self.db.mark_order_as_added(order['order_id'])
-                    logger.info(f"Fixed missing flag for order {order['order_id']}")
-                except Exception as e:
-                    logger.warning(f"Error fixing order {order['order_id']}: {e}")
             else:
-                # Проверяем, есть ли уже запись в executed_orders
-                existing = False
-                for record in executed_records:
-                    if record[0] == order['order_id']:
-                        existing = True
-                        break
-                
-                if not existing:
-                    self.db.add_executed_order(
-                        order['order_id'],
-                        symbol,
-                        order['price'],
-                        order['quantity'],
-                        order['amount_usdt'],
-                        order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
-                    )
                 missing_orders.append(order)
-        
-        # Если есть пропущенные ордера, отправляем уведомления
-        if missing_orders and update:
-            for order in missing_orders[:5]:  # Отправляем не более 5 за раз
-                msg = (
-                    f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
-                    f"🪙 Токен: `{symbol}`\n"
-                    f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
-                    f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
-                    f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
-                    f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                    f"❗ *Добавить в статистику покупок?*"
-                )
-                
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
-                        InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
-                    ]
-                ])
-                
-                try:
-                    await update.callback_query.message.reply_text(msg, parse_mode='Markdown', reply_markup=keyboard)
-                except:
-                    pass
         
         return {
             'total_found': len(all_orders),
@@ -1888,23 +1770,19 @@ class DCAStrategy:
             if total_quantity <= 0:
                 return {'success': False, 'error': f'Количество {coin} равно 0'}
             
-            # Округляем количество до 2 знаков (обязательно!)
             rounded_quantity = round_quantity_for_sell(total_quantity)
             
             logger.info(f"Place full sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, price: {rounded_price}")
             
-            # Проверяем наличие активных ордеров на продажу
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
             
-            # Если есть старые ордера, отменяем их автоматически
             if existing_sell_orders and auto_cancel_old:
                 await update.message.reply_text("🔄 Обнаружены старые ордера на продажу. Отменяю их...")
                 
                 cancelled_count, cancelled_ids = await self.bybit.cancel_all_sell_orders(symbol)
                 
                 if cancelled_count > 0:
-                    # Обновляем статус в БД
                     for order_id in cancelled_ids:
                         self.db.update_sell_order_status(order_id, 'cancelled')
                     
@@ -1913,7 +1791,6 @@ class DCAStrategy:
                     await update.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
                     return {'success': False, 'error': 'Не удалось отменить старые ордера'}
             
-            # Создаем ордер на продажу с округленным количеством
             result = await self.bybit.place_limit_sell(symbol, rounded_quantity, rounded_price)
             
             if result['success']:
@@ -2228,7 +2105,6 @@ class FastDCABot:
                 await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_main_keyboard())
                 return
             
-            # Передаем update для отправки сообщений из стратегии
             result = await self.strategy.place_full_sell_order(
                 update,
                 sell_data['symbol'],
@@ -2362,7 +2238,7 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         
         try:
-            result = await self.strategy.force_check_executed_orders(update, symbol)
+            result = await self.strategy.force_check_executed_orders(symbol)
             
             message = f"📊 *РЕЗУЛЬТАТ ТЕСТА ОТСЛЕЖИВАНИЯ*\n\n"
             message += f"🪙 Токен: `{symbol}`\n"
@@ -2381,7 +2257,6 @@ class FastDCABot:
                 
                 message += f"\n\n💡 *Рекомендация:*\n"
                 message += f"Включите автоматическое отслеживание, чтобы бот сам предлагал добавить эти ордера."
-                message += f"\n\n✅ *Уведомления о пропущенных ордерах уже отправлены выше!*"
             else:
                 message += f"✨ *Отлично!* Все ордера уже добавлены в статистику."
             
@@ -2676,11 +2551,21 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     async def show_dca_stats_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает детальную статистику DCA"""
         if not await self._check_user_fast(update):
             return
         
+        # КРИТИЧЕСКИ ВАЖНО: Сбрасываем все состояния перед показом статистики
+        # Это решает проблему "залипания" бота после отмены в ручной покупке
         context.user_data.clear()
         self.import_waiting = False
+        
+        # Также завершаем все активные разговоры
+        if hasattr(context, 'conversation_state'):
+            try:
+                await context.conversation_state.reset()
+            except:
+                pass
         
         self._init_bybit()
         if not self.bybit_initialized:
@@ -3817,7 +3702,6 @@ class FastDCABot:
         balance = await self.bybit.get_balance(coin)
         total_quantity = balance.get('equity', 0) if balance else 0
         
-        # Округляем количество до 2 знаков для отображения
         display_quantity = round_quantity_for_sell(total_quantity)
         
         msg = (
@@ -3856,14 +3740,12 @@ class FastDCABot:
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
         
-        # Обработчики для кнопок главного меню
         self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.show_settings_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
         self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start))
         self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_import_file))
         
-        # Обработчик для кнопки подтверждения продажи
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
         
         tracking_conv = ConversationHandler(
