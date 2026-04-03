@@ -61,8 +61,8 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-# Версия бота
-BOT_VERSION = "1.9 (02.04.2026)"
+# Версия бота (обновлена 03.04.2026)
+BOT_VERSION = "1.9 (03.04.2026)"
 
 # Состояния для ConversationHandler
 (
@@ -984,7 +984,7 @@ class Database:
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '1.9',
+                'version': '1.9 (03.04.2026)',
                 'purchases': purchases,
                 'sell_orders': sell_orders,
                 'settings': settings,
