@@ -1546,22 +1546,18 @@ class DCAStrategy:
         
         logger.info(f"Incremental check for new orders since {last_check.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Получаем ордера за последние 7 дней для надежности
         all_orders = await self.bybit.get_all_executed_orders(symbol, days=7)
         
-        # Обновляем время последней проверки
         self.db.set_last_incremental_check_time(datetime.now())
         
         purchases = self.db.get_purchases(symbol)
         
-        # Создаем множество уже добавленных ордеров из статистики
         added_orders = set()
         for p in purchases:
             price_key = round(p['price'], 4)
             qty_key = round(p['quantity'], 6)
             added_orders.add(f"{price_key}_{qty_key}")
         
-        # Получаем уже обработанные ордера из executed_orders
         conn = sqlite3.connect(self.db.db_file, timeout=5)
         cursor = conn.cursor()
         try:
@@ -1581,15 +1577,12 @@ class DCAStrategy:
         
         new_orders = []
         for order in all_orders:
-            # Пропускаем если уже обработан
             if order['order_id'] in processed_order_ids:
                 continue
             
-            # Пропускаем если уже есть в статистике
             price_key = round(order['price'], 4)
             qty_key = round(order['quantity'], 6)
             if f"{price_key}_{qty_key}" in added_orders:
-                # Отмечаем как обработанный
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
@@ -1601,9 +1594,7 @@ class DCAStrategy:
                 self.db.mark_order_as_added(order['order_id'])
                 continue
             
-            # Проверяем, что ордер новый (после последней проверки)
             if order['executed_at'] > last_check:
-                # Сохраняем в базу
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
@@ -1615,7 +1606,6 @@ class DCAStrategy:
                 new_orders.append(order)
                 logger.info(f"New order found: {order['order_id']} at {order['price']} on {order['executed_at']}")
         
-        # Отправляем уведомления о новых ордерах
         for order in new_orders:
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -1656,14 +1646,12 @@ class DCAStrategy:
         
         purchases = self.db.get_purchases(symbol)
         
-        # Создаем множество уже добавленных ордеров из статистики
         added_orders = set()
         for p in purchases:
             price_key = round(p['price'], 4)
             qty_key = round(p['quantity'], 6)
             added_orders.add(f"{price_key}_{qty_key}")
         
-        # Получаем уже обработанные ордера из executed_orders
         conn = sqlite3.connect(self.db.db_file, timeout=5)
         cursor = conn.cursor()
         try:
@@ -1684,15 +1672,12 @@ class DCAStrategy:
         missing_orders = []
         
         for order in all_orders:
-            # Проверяем по order_id
             if order['order_id'] in processed_order_ids:
                 continue
             
-            # Проверяем по цене и количеству в статистике
             price_key = round(order['price'], 4)
             qty_key = round(order['quantity'], 6)
             if f"{price_key}_{qty_key}" in added_orders:
-                # Ордер уже есть в статистике, но не отмечен в executed_orders
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
@@ -1704,8 +1689,6 @@ class DCAStrategy:
                 self.db.mark_order_as_added(order['order_id'])
                 continue
             
-            # Ордер не найден - добавляем в пропущенные
-            # Проверяем, не добавлен ли он уже в executed_orders
             existing = False
             for record in executed_records:
                 if record[0] == order['order_id']:
@@ -1725,7 +1708,6 @@ class DCAStrategy:
             missing_orders.append(order)
             logger.info(f"Missing order found: {order['order_id']} at {order['price']} on {order['executed_at']}")
         
-        # Отправляем уведомления о пропущенных ордерах
         for order in missing_orders:
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -1764,20 +1746,16 @@ class DCAStrategy:
         last_full_check = self.db.get_last_full_check_time()
         now = datetime.now()
         
-        # Проверяем, нужно ли делать полную проверку (раз в день в 19:00)
         need_full_check = False
         if last_full_check is None:
             need_full_check = True
         else:
-            # Проверяем, был ли уже полныйチェック сегодня после 19:00
             last_check_date = last_full_check.date()
             today = now.date()
             if last_check_date < today:
-                # Если сегодня еще не было полной проверки, проверяем время
                 if now.hour >= 19:
                     need_full_check = True
             elif last_check_date == today and last_full_check.hour < 19 and now.hour >= 19:
-                # Если проверка была до 19:00, а сейчас после 19:00
                 need_full_check = True
         
         if need_full_check:
@@ -1789,7 +1767,7 @@ class DCAStrategy:
             new_orders = await self.check_new_orders_incremental(symbol, user_id, bot)
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
     
-    async def force_check_executed_orders(self, update, symbol: str) -> Dict:
+    async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
         """Принудительная проверка всех исполненных ордеров (для теста)"""
         all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
         
@@ -1830,7 +1808,6 @@ class DCAStrategy:
             qty_key = round(order['quantity'], 6)
             if f"{price_key}_{qty_key}" in added_orders:
                 already_added.append(order)
-                # Исправляем статус
                 try:
                     self.db.add_executed_order(
                         order['order_id'],
@@ -1845,7 +1822,6 @@ class DCAStrategy:
                 except:
                     pass
             else:
-                # Проверяем, есть ли уже запись
                 existing = False
                 for record in executed_records:
                     if record[0] == order['order_id']:
@@ -1864,29 +1840,33 @@ class DCAStrategy:
                 missing_orders.append(order)
         
         # Отправляем уведомления о пропущенных ордерах
-        if missing_orders and update:
-            for order in missing_orders[:10]:  # Не более 10 за раз
-                msg = (
-                    f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
-                    f"🪙 Токен: `{symbol}`\n"
-                    f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
-                    f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
-                    f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
-                    f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                    f"❗ *Добавить в статистику покупок?*"
+        for order in missing_orders[:10]:
+            msg = (
+                f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
+                f"🪙 Токен: `{symbol}`\n"
+                f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
+                f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
+                f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
+                f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                f"❗ *Добавить в статистику покупок?*"
+            )
+            
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
+                    InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
+                ]
+            ])
+            
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=msg,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
                 )
-                
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
-                        InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
-                    ]
-                ])
-                
-                try:
-                    await update.callback_query.message.reply_text(msg, parse_mode='Markdown', reply_markup=keyboard)
-                except:
-                    pass
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
         
         return {
             'total_found': len(all_orders),
@@ -2407,15 +2387,11 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         
         try:
-            # Создаем фейковый callback_query для отправки уведомлений
-            class FakeCallback:
-                def __init__(self, message):
-                    self.message = message
-            
-            fake_callback = FakeCallback(update.message)
-            update.callback_query = fake_callback
-            
-            result = await self.strategy.force_check_executed_orders(update, symbol)
+            result = await self.strategy.force_check_executed_orders(
+                symbol, 
+                self.application.bot, 
+                self.authorized_user_id
+            )
             
             message = f"📊 *РЕЗУЛЬТАТ ПОЛНОЙ ПРОВЕРКИ*\n\n"
             message += f"🪙 Токен: `{symbol}`\n"
@@ -3739,7 +3715,6 @@ class FastDCABot:
                 logger.error(f"DCA scheduler error: {e}")
     
     async def order_checker_loop(self):
-        """Цикл проверки исполненных ордеров (каждый час инкрементально, раз в день в 19:00 полная проверка)"""
         logger.info("Order checker loop started")
         
         await asyncio.sleep(30)
@@ -3762,7 +3737,6 @@ class FastDCABot:
                 symbol = self.db.get_setting('symbol', 'TONUSDT')
                 
                 if self.authorized_user_id:
-                    # Автоматическая проверка (сама решит, делать полную или инкрементальную)
                     result = await self.strategy.auto_check_and_notify(
                         symbol, 
                         self.authorized_user_id, 
