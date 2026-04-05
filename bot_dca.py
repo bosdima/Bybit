@@ -430,15 +430,49 @@ class Database:
     
     def delete_purchase(self, purchase_id: int) -> bool:
         try:
+            # Сначала получаем информацию о покупке для сброса статуса в executed_orders
+            purchase = self.get_purchase_by_id(purchase_id)
+            
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
             cursor.execute('DELETE FROM dca_purchases WHERE id = ?', (purchase_id,))
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
+            
+            # Если покупка найдена, сбрасываем статус в executed_orders
+            if success and purchase:
+                self.reset_executed_order_status(purchase['price'], purchase['quantity'], purchase['symbol'])
+                logger.info(f"Reset executed order status for purchase {purchase_id}: price={purchase['price']}, qty={purchase['quantity']}")
+            
             return success
         except Exception as e:
             logger.error(f"Error deleting purchase {purchase_id}: {e}")
+            return False
+    
+    def reset_executed_order_status(self, price: float, quantity: float, symbol: str) -> bool:
+        """Сбрасывает статус added_to_stats в executed_orders для указанного ордера"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            # Ищем ордер по цене и количеству (с округлением)
+            cursor.execute('''
+                UPDATE executed_orders 
+                SET added_to_stats = 0, skipped = 0, notified_at = NULL 
+                WHERE symbol = ? AND ABS(price - ?) < 0.0001 AND ABS(quantity - ?) < 0.0001
+            ''', (symbol, price, quantity))
+            success = cursor.rowcount > 0
+            conn.commit()
+            conn.close()
+            
+            if success:
+                logger.info(f"Reset executed order status for {symbol} at price {price}, qty {quantity}")
+            else:
+                logger.info(f"No matching executed order found for {symbol} at price {price}, qty {quantity}")
+            
+            return success
+        except Exception as e:
+            logger.error(f"Error resetting executed order status: {e}")
             return False
     
     def get_dca_stats(self, symbol: str) -> Dict:
@@ -1673,11 +1707,14 @@ class DCAStrategy:
         missing_orders = []
         
         for order in all_orders:
+            # Если ордер уже обработан - пропускаем
             if order['order_id'] in processed_order_ids:
                 continue
             
             price_key = round(order['price'], 4)
             qty_key = round(order['quantity'], 6)
+            
+            # Если ордер уже есть в статистике - отмечаем как обработанный
             if f"{price_key}_{qty_key}" in added_orders:
                 self.db.add_executed_order(
                     order['order_id'],
@@ -1690,6 +1727,7 @@ class DCAStrategy:
                 self.db.mark_order_as_added(order['order_id'])
                 continue
             
+            # Проверяем, есть ли уже запись в executed_orders
             existing = False
             for record in executed_records:
                 if record[0] == order['order_id']:
@@ -1709,6 +1747,7 @@ class DCAStrategy:
             missing_orders.append(order)
             logger.info(f"Missing order found: {order['order_id']} at {order['price']} on {order['executed_at']}")
         
+        # Отправляем уведомления о пропущенных ордерах
         for order in missing_orders:
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -1807,6 +1846,7 @@ class DCAStrategy:
             qty_key = round(order['quantity'], 6)
             if f"{price_key}_{qty_key}" in added_orders:
                 already_added.append(order)
+                # Исправляем статус
                 try:
                     self.db.add_executed_order(
                         order['order_id'],
@@ -1838,6 +1878,7 @@ class DCAStrategy:
                     )
                 missing_orders.append(order)
         
+        # Отправляем уведомления о пропущенных ордерах
         for order in missing_orders[:10]:
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -2107,17 +2148,6 @@ class FastDCABot:
                     current_conv._conversations.pop(chat_id, None)
         except Exception as e:
             logger.debug(f"Error resetting conversation: {e}")
-    
-    async def _timeout_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Callback при таймауте ConversationHandler"""
-        await self._reset_bot_state(context)
-        await update.message.reply_text(
-            "⏰ *Время ожидания истекло!*\n\n"
-            "Возвращаюсь в главное меню.",
-            reply_markup=self.get_main_keyboard(),
-            parse_mode='Markdown'
-        )
-        return ConversationHandler.END
     
     async def cmd_start_fast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3924,7 +3954,6 @@ class FastDCABot:
         
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
         
-        # ConversationHandler с таймаутом
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
             states={
