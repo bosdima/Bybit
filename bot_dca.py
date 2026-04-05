@@ -62,7 +62,10 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "1.9 (04.04.2026)"
+BOT_VERSION = "1.9 (05.04.2026)"
+
+# Таймаут для ConversationHandler (3 минуты)
+CONVERSATION_TIMEOUT = 180
 
 # Состояния для ConversationHandler
 (
@@ -996,7 +999,7 @@ class Database:
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '1.9 (04.04.2026)',
+                'version': '1.9 (05.04.2026)',
                 'purchases': purchases,
                 'sell_orders': sell_orders,
                 'settings': settings,
@@ -1538,7 +1541,6 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        """Инкрементальная проверка новых ордеров (каждый час)"""
         last_check = self.db.get_last_incremental_check_time()
         
         if last_check is None:
@@ -1638,7 +1640,6 @@ class DCAStrategy:
         return new_orders
     
     async def full_check_missing_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        """Полная проверка всех ордеров за последние 90 дней"""
         logger.info(f"Performing full check for missing orders for {symbol}")
         
         all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
@@ -1742,7 +1743,6 @@ class DCAStrategy:
         return missing_orders
     
     async def auto_check_and_notify(self, symbol: str, user_id: int, bot) -> Dict:
-        """Автоматическая проверка (вызывается по таймеру)"""
         last_full_check = self.db.get_last_full_check_time()
         now = datetime.now()
         
@@ -1768,7 +1768,6 @@ class DCAStrategy:
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
     
     async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
-        """Принудительная проверка всех исполненных ордеров (для теста)"""
         all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
         
         purchases = self.db.get_purchases(symbol)
@@ -1839,7 +1838,6 @@ class DCAStrategy:
                     )
                 missing_orders.append(order)
         
-        # Отправляем уведомления о пропущенных ордерах
         for order in missing_orders[:10]:
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -2092,6 +2090,7 @@ class FastDCABot:
         return False
     
     async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
+        """Принудительный сброс всех состояний бота"""
         context.user_data.clear()
         self.import_waiting = False
         
@@ -2108,6 +2107,17 @@ class FastDCABot:
                     current_conv._conversations.pop(chat_id, None)
         except Exception as e:
             logger.debug(f"Error resetting conversation: {e}")
+    
+    async def _timeout_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Callback при таймауте ConversationHandler"""
+        await self._reset_bot_state(context)
+        await update.message.reply_text(
+            "⏰ *Время ожидания истекло!*\n\n"
+            "Возвращаюсь в главное меню.",
+            reply_markup=self.get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
     
     async def cmd_start_fast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3914,6 +3924,7 @@ class FastDCABot:
         
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
         
+        # ConversationHandler с таймаутом
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
             states={
@@ -3929,6 +3940,7 @@ class FastDCABot:
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="tracking_conversation",
             persistent=False,
+            conversation_timeout=CONVERSATION_TIMEOUT,
         )
         self.application.add_handler(tracking_conv)
         
@@ -3952,6 +3964,7 @@ class FastDCABot:
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="edit_purchases_conversation",
             persistent=False,
+            conversation_timeout=CONVERSATION_TIMEOUT,
         )
         self.application.add_handler(edit_purchases_conv)
         
@@ -3980,6 +3993,7 @@ class FastDCABot:
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="main_conversation",
             persistent=False,
+            conversation_timeout=CONVERSATION_TIMEOUT,
         )
         self.application.add_handler(main_conv)
         
@@ -4007,6 +4021,7 @@ class FastDCABot:
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="ladder_conversation",
             persistent=False,
+            conversation_timeout=CONVERSATION_TIMEOUT,
         )
         self.application.add_handler(ladder_conv)
         
@@ -4019,6 +4034,7 @@ class FastDCABot:
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="manual_buy_conversation",
             persistent=False,
+            conversation_timeout=CONVERSATION_TIMEOUT,
         )
         self.application.add_handler(manual_limit_conv)
         
@@ -4031,6 +4047,7 @@ class FastDCABot:
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="manual_add_conversation",
             persistent=False,
+            conversation_timeout=CONVERSATION_TIMEOUT,
         )
         self.application.add_handler(manual_add_conv)
         
@@ -4042,6 +4059,7 @@ class FastDCABot:
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="cancel_order_conversation",
             persistent=False,
+            conversation_timeout=CONVERSATION_TIMEOUT,
         )
         self.application.add_handler(cancel_order_conv)
         
