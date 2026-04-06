@@ -3,6 +3,7 @@
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
 ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЮТ ВСЕ КНОПКИ
+С ТАЙМАУТОМ ОЖИДАНИЯ 3 МИНУТЫ
 """
 
 import os
@@ -3417,6 +3418,8 @@ class FastDCABot:
     
     async def manual_add_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
+        
+        # Обработка команды отмены
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
@@ -3447,13 +3450,16 @@ class FastDCABot:
         except ValueError as e:
             await update.message.reply_text(
                 f"❌ Ошибка! Введите корректную цену.\n"
-                f"Пример: 2.35 или 2,35",
+                f"Пример: 2.35 или 2,35\n\n"
+                f"Ошибка: {str(e)}",
                 reply_markup=self.get_cancel_keyboard()
             )
             return MANUAL_ADD_PRICE
     
     async def manual_add_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
+        
+        # Обработка команды отмены
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
