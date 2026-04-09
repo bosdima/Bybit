@@ -3,7 +3,7 @@
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
 ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЮТ ВСЕ КНОПКИ
-С ТАЙМАУТОМ ОЖИДАНИЯ 3 МИНУТЫ
+С ТАЙМАУТОМ ОЖИДАНИЯ 3 МИНУТЫ И ФИКСАЦИЕЙ ЗАЛИПАНИЙ
 """
 
 import os
@@ -2136,19 +2136,32 @@ class FastDCABot:
         context.user_data.clear()
         self.import_waiting = False
         
+        # Завершаем все активные диалоги
+        for conv_name in ['manual_add_conversation', 'manual_buy_conversation', 'main_conversation', 
+                         'ladder_conversation', 'edit_purchases_conversation', 'tracking_conversation',
+                         'cancel_order_conversation']:
+            try:
+                conv_handler = getattr(self.application, conv_name, None)
+                if conv_handler and hasattr(conv_handler, '_conversations'):
+                    for chat_id in list(conv_handler._conversations.keys()):
+                        conv_handler._conversations.pop(chat_id, None)
+            except Exception as e:
+                logger.debug(f"Error resetting conversation {conv_name}: {e}")
+        
         try:
             current_conv = self.application.conversation_handler
             if current_conv:
-                chat_id = None
-                if hasattr(context, '_chat_id') and context._chat_id:
-                    chat_id = context._chat_id
-                elif hasattr(context, 'chat_id') and context.chat_id:
-                    chat_id = context.chat_id
-                
-                if chat_id and hasattr(current_conv, '_conversations'):
-                    current_conv._conversations.pop(chat_id, None)
+                if hasattr(current_conv, '_conversations'):
+                    for chat_id in list(current_conv._conversations.keys()):
+                        current_conv._conversations.pop(chat_id, None)
         except Exception as e:
             logger.debug(f"Error resetting conversation: {e}")
+    
+    async def _end_conversation_gracefully(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Корректно завершает текущий диалог и возвращает в главное меню"""
+        await self._reset_bot_state(context)
+        await update.message.reply_text("Действие отменено", reply_markup=self.get_main_keyboard())
+        return ConversationHandler.END
     
     async def cmd_start_fast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -2320,6 +2333,8 @@ class FastDCABot:
                 )
             
             context.user_data.pop('pending_sell_data', None)
+            # После продажи сбрасываем состояние
+            await self._reset_bot_state(context)
     
     async def toggle_order_execution(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3381,6 +3396,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         
+        # Принудительно сбрасываем состояние перед началом диалога
         await self._reset_bot_state(context)
         
         self._init_bybit()
@@ -3424,6 +3440,17 @@ class FastDCABot:
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         
+        # Проверка: если сообщение начинается с кнопки меню - завершаем диалог
+        menu_buttons = ["📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
+                       "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
+                       "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
+                       "📝 Управление ордерами", "✅ Отслеживание ордеров Вкл", "⏳ Отслеживание ордеров Выкл",
+                       "🏠 Главное меню"]
+        
+        if text in menu_buttons:
+            await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
+            return ConversationHandler.END
+        
         try:
             price_str = text.replace(',', '.').strip()
             price = float(price_str)
@@ -3462,6 +3489,17 @@ class FastDCABot:
         # Обработка команды отмены
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
+            return ConversationHandler.END
+        
+        # Проверка: если сообщение начинается с кнопки меню - завершаем диалог
+        menu_buttons = ["📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
+                       "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
+                       "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
+                       "📝 Управление ордерами", "✅ Отслеживание ордеров Вкл", "⏳ Отслеживание ордеров Выкл",
+                       "🏠 Главное меню"]
+        
+        if text in menu_buttons:
+            await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         
         try:
