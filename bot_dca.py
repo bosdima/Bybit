@@ -2,7 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 2.1 (11.04.2026)
+Версия 2.2 (11.04.2026)
+ИСПРАВЛЕНО: ПОЛНЫЙ ПОИСК ОРДЕРОВ ЗА 90 ДНЕЙ
 """
 
 import os
@@ -62,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "2.1 (11.04.2026)"
+BOT_VERSION = "2.2 (11.04.2026)"
 BOT_VERSION_FILE = "bot_version.txt"
 UPDATE_INFO_FILE = "obnovlenie.txt"
 
@@ -1472,21 +1473,30 @@ class BybitClient:
             logger.error(f"Error getting order history: {e}")
             return []
     
-    async def get_all_executed_orders(self, symbol: str, days: int = 30) -> List[Dict]:
+    async def get_all_executed_orders(self, symbol: str, days: int = 90) -> List[Dict]:
+        """Получает ВСЕ исполненные ордера на покупку за указанное количество дней (по умолчанию 90)"""
         try:
             check_date = datetime.now() - timedelta(days=days)
-            orders = await self.get_order_history(symbol, limit=200)
+            # Увеличиваем лимит для получения большего количества ордеров
+            orders = await self.get_order_history(symbol, limit=500)
             executed = []
             
+            logger.info(f"Searching for executed buy orders since {check_date.strftime('%Y-%m-%d')}")
+            
             for order in orders:
-                if order.get('orderStatus') in ['Filled'] and order.get('side') == 'Buy':
+                # Проверяем, что ордер исполнен и это покупка
+                order_status = order.get('orderStatus', '')
+                side = order.get('side', '')
+                
+                if order_status in ['Filled', 'PartiallyFilled'] and side == 'Buy':
                     created_time_str = order.get('createdTime', '')
                     if created_time_str:
                         try:
                             created_time_ms = int(created_time_str)
                             created_time = datetime.fromtimestamp(created_time_ms / 1000)
                             
-                            if created_time > check_date:
+                            # Проверяем дату
+                            if created_time >= check_date:
                                 avg_price = float(order.get('avgPrice', 0))
                                 if avg_price == 0:
                                     avg_price = float(order.get('price', 0))
@@ -1507,12 +1517,14 @@ class BybitClient:
                                         'quantity': qty,
                                         'amount_usdt': amount_usdt,
                                         'executed_at': created_time,
-                                        'order_status': order.get('orderStatus')
+                                        'order_status': order_status
                                     })
                                     logger.info(f"Found executed order: {order.get('orderId')} at {avg_price} USDT, qty {qty}, date {created_time}")
                         except Exception as e:
                             logger.error(f"Error parsing order time for {order.get('orderId')}: {e}")
                             continue
+            
+            logger.info(f"Total executed orders found: {len(executed)}")
             return executed
         except Exception as e:
             logger.error(f"Error getting executed orders: {e}")
@@ -1883,7 +1895,7 @@ class DCAStrategy:
         
         logger.info(f"Incremental check for new orders since {last_check.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        all_orders = await self.bybit.get_all_executed_orders(symbol, days=7)
+        all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
         
         self.db.set_last_incremental_check_time(datetime.now())
         
@@ -2104,9 +2116,14 @@ class DCAStrategy:
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
     
     async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
+        """Принудительная полная проверка всех ордеров за 90 дней"""
+        logger.info(f"Force checking all executed orders for {symbol} (last 90 days)")
+        
         all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
+        logger.info(f"Total orders found: {len(all_orders)}")
         
         purchases = self.db.get_purchases(symbol)
+        logger.info(f"Purchases in DB: {len(purchases)}")
         
         added_orders = set()
         for p in purchases:
@@ -2119,6 +2136,7 @@ class DCAStrategy:
         try:
             cursor.execute('SELECT order_id, added_to_stats, skipped, price, quantity FROM executed_orders WHERE symbol = ?', (symbol,))
             executed_records = cursor.fetchall()
+            logger.info(f"Executed records in DB: {len(executed_records)}")
         except Exception as e:
             logger.warning(f"Error querying executed_orders: {e}")
             executed_records = []
@@ -2141,6 +2159,8 @@ class DCAStrategy:
             
             price_key = round(order['price'], 4)
             qty_key = round(order['quantity'], 6)
+            
+            # Проверяем, есть ли уже такой ордер в статистике покупок
             if f"{price_key}_{qty_key}" in added_orders:
                 already_added.append(order)
                 try:
@@ -2154,8 +2174,8 @@ class DCAStrategy:
                     )
                     self.db.mark_order_as_added(order['order_id'])
                     logger.info(f"Fixed missing flag for order {order['order_id']}")
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error fixing order {order['order_id']}: {e}")
             else:
                 existing = False
                 for record in executed_records:
@@ -2173,8 +2193,13 @@ class DCAStrategy:
                         order['executed_at'].strftime("%Y-%m-%d %H:%M:%S")
                     )
                 missing_orders.append(order)
+                logger.info(f"Missing order found: {order['order_id']} - price: {order['price']}, qty: {order['quantity']}, date: {order['executed_at']}")
         
-        for order in missing_orders[:10]:
+        # Отправляем уведомления о пропущенных ордерах
+        notified_count = 0
+        for order in missing_orders:
+            if notified_count >= 10:  # Ограничиваем количество уведомлений за раз
+                break
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
                 f"🪙 Токен: `{symbol}`\n"
@@ -2199,6 +2224,8 @@ class DCAStrategy:
                     parse_mode='Markdown',
                     reply_markup=keyboard
                 )
+                notified_count += 1
+                await asyncio.sleep(0.5)  # Небольшая задержка между сообщениями
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
         
@@ -2206,7 +2233,8 @@ class DCAStrategy:
             'total_found': len(all_orders),
             'already_added': len(already_added),
             'missing': missing_orders,
-            'check_date': datetime.now() - timedelta(days=90)
+            'check_date': datetime.now() - timedelta(days=90),
+            'notified_count': notified_count
         }
     
     async def place_full_sell_order(self, update, symbol: str, profit_percent: float, auto_cancel_old: bool = True) -> Dict:
@@ -2316,7 +2344,6 @@ class FastDCABot:
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         dca_button = "⏹ Остановить Авто DCA" if is_active else "🚀 Запустить Авто DCA"
         
-        # Кнопки: Настройки теперь перед Управлением ордерами
         keyboard = [
             [KeyboardButton("📊 Мой Портфель"), KeyboardButton(dca_button)],
             [KeyboardButton("💰 Ручная покупка (лимит)"), KeyboardButton("📈 Статистика DCA")],
@@ -2446,7 +2473,6 @@ class FastDCABot:
             
             save_current_version()
             
-            # Отправляем уведомление, если есть куда отправить
             if update and update.effective_chat:
                 await update.message.reply_text(message, parse_mode='Markdown')
             elif self.authorized_user_id:
@@ -2509,7 +2535,6 @@ class FastDCABot:
             return
         await self._reset_bot_state(context)
         
-        # Проверяем версию и отправляем уведомление об обновлении
         await self.check_version_and_notify(update)
         
         await update.message.reply_text(
@@ -2837,15 +2862,17 @@ class FastDCABot:
             if result['missing']:
                 message += f"*Ордера, которых нет в статистике:*\n"
                 for i, order in enumerate(result['missing'][:10], 1):
-                    message += f"{i}. {format_price(order['price'], 4)} USDT | {format_quantity(order['quantity'], 6)} | {order['amount_usdt']:.2f} USDT\n"
+                    message += f"{i}. Цена: {format_price(order['price'], 4)} USDT | Кол-во: {format_quantity(order['quantity'], 6)} | Сумма: {order['amount_usdt']:.2f} USDT\n"
                     message += f"   📅 {order['executed_at'].strftime('%d.%m.%Y %H:%M')}\n"
                 if len(result['missing']) > 10:
                     message += f"\n_...и еще {len(result['missing']) - 10} ордеров_"
                 
-                message += f"\n\n💡 *Рекомендация:*\n"
-                message += f"Включите автоматическое отслеживание (оно уже должно быть включено).\n"
-                message += f"Бот автоматически проверит все ордера каждый день в 19:00.\n\n"
-                message += f"✅ *Уведомления о пропущенных ордерах отправлены выше!*"
+                if result.get('notified_count', 0) > 0:
+                    message += f"\n\n✅ *Отправлено уведомлений: {result['notified_count']}*\n"
+                    message += f"💡 Проверьте уведомления выше и добавьте ордера в статистику!"
+                else:
+                    message += f"\n\n⚠️ *Ордера найдены, но уведомления не отправлены!*\n"
+                    message += f"💡 Проверьте настройки уведомлений."
             else:
                 message += f"✨ *Отлично!* Все ордера уже добавлены в статистику.\n\n"
                 message += f"📌 Автоматическая проверка работает корректно."
@@ -4260,7 +4287,6 @@ class FastDCABot:
         asyncio.create_task(self.order_checker_loop())
         asyncio.create_task(self.sell_checker_loop())
         
-        # Проверяем версию при запуске (без update, так как нет контекста)
         saved_version = get_saved_version()
         current_version = BOT_VERSION
         
@@ -4280,7 +4306,6 @@ class FastDCABot:
             save_current_version()
             logger.info(f"Bot updated from {saved_version} to {current_version}")
             
-            # Отправляем уведомление админу
             if self.authorized_user_id:
                 try:
                     await application.bot.send_message(
@@ -4362,7 +4387,6 @@ class FastDCABot:
                 reply_markup=None
             )
             
-            # Также сбрасываем настройки лестницы
             ladder = self.db.get_ladder_settings(symbol)
             ladder['current_drop_percent'] = 0
             self.db.save_ladder_settings(ladder)
