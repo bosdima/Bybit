@@ -2,7 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 2.1 (11.04.2026)
+Версия 2.2 (11.04.2026)
 """
 
 import os
@@ -62,7 +62,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "2.1 (11.04.2026)"
+BOT_VERSION = "2.2 (11.04.2026)"
 BOT_VERSION_FILE = "bot_version.txt"
 UPDATE_INFO_FILE = "obnovlenie.txt"
 
@@ -2316,13 +2316,13 @@ class FastDCABot:
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         dca_button = "⏹ Остановить Авто DCA" if is_active else "🚀 Запустить Авто DCA"
         
-        # Убраны кнопки отслеживания ордеров и продаж, а также кнопка "Главное меню"
+        # Кнопки: Портфель и DCA, Ручная покупка и Статистика, Добавить покупку и Редактировать, Управление ордерами и Настройки
         keyboard = [
             [KeyboardButton("📊 Мой Портфель"), KeyboardButton(dca_button)],
             [KeyboardButton("💰 Ручная покупка (лимит)"), KeyboardButton("📈 Статистика DCA")],
             [KeyboardButton("➕ Добавить покупку вручную"), KeyboardButton("✏️ Редактировать покупки")],
-            [KeyboardButton("⚙️ Настройки"), KeyboardButton("📋 Статус бота")],
-            [KeyboardButton("📝 Управление ордерами")],
+            [KeyboardButton("📝 Управление ордерами"), KeyboardButton("⚙️ Настройки")],
+            [KeyboardButton("📋 Статус бота")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2709,7 +2709,7 @@ class FastDCABot:
         new_status = not current
         self.db.set_sell_tracking_enabled(new_status)
         
-        status_text = "✅ Включено" if new_status else "⏹ Выключено"
+        status_text = "💰 Включено" if new_status else "⏹ Выключено"
         
         await update.message.reply_text(
             f"💰 *Отслеживание выполненных продаж*: {status_text}\n\n"
@@ -4512,8 +4512,6 @@ class FastDCABot:
         
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
         
-        # Кнопки управления отслеживанием продаж в главном меню - УБРАНЫ
-        
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
             states={
@@ -4657,8 +4655,7 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
         self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
-        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
-        self.application.add_handler(MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking))
+        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.show_settings_menu))
         
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
