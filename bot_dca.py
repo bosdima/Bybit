@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 2.3 (11.04.2026)
-ИСПРАВЛЕНО: УВЕДОМЛЕНИЯ ОБ ОБНОВЛЕНИЯХ
+Версия 2.4 (11.04.2026)
+ИСПРАВЛЕНО: ЗАЛИПАНИЕ ДИАЛОГОВ, ТАЙМАУТ 3 МИНУТЫ
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "2.3 (11.04.2026)"
+BOT_VERSION = "2.4 (11.04.2026)"
 BOT_VERSION_FILE = "bot_version.txt"
 UPDATE_INFO_FILE = "obnovlenie.txt"
 
@@ -113,6 +113,16 @@ DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 MAX_DROP_DEPTH = 80
 STEP_PERCENT = 3
+
+# Список кнопок главного меню для проверки
+MAIN_MENU_BUTTONS = [
+    "📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
+    "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
+    "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
+    "📝 Управление ордерами", "✅ Отслеживание ордеров Вкл", "⏳ Отслеживание ордеров Выкл",
+    "💰 Отслеживание продаж Вкл", "⏳ Отслеживание продаж Выкл", "🏠 Главное меню",
+    "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку"
+]
 
 
 def get_update_info() -> str:
@@ -2435,7 +2445,6 @@ class FastDCABot:
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
     async def check_and_send_version_notification(self, chat_id: int = None):
-        """Проверяет версию и отправляет уведомление об обновлении"""
         saved_version = get_saved_version()
         current_version = BOT_VERSION
         
@@ -2451,7 +2460,6 @@ class FastDCABot:
             save_current_version()
             logger.info(f"Bot updated from {saved_version} to {current_version}")
             
-            # Отправляем уведомление
             if chat_id:
                 try:
                     await self.application.bot.send_message(
@@ -2475,7 +2483,6 @@ class FastDCABot:
         return False
     
     async def cmd_version(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /version - показывает текущую версию и информацию об обновлениях"""
         if not await self._check_user_fast(update):
             return
         
@@ -2533,6 +2540,22 @@ class FastDCABot:
         except Exception as e:
             logger.debug(f"Error resetting conversation: {e}")
     
+    async def _check_and_reset_if_timeout(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Проверяет, не завис ли бот в диалоге, и сбрасывает если нужно"""
+        if context.user_data:
+            last_activity = context.user_data.get('last_activity')
+            if last_activity:
+                elapsed = (datetime.now() - last_activity).total_seconds()
+                if elapsed > CONVERSATION_TIMEOUT:
+                    logger.info(f"Resetting conversation due to timeout ({elapsed:.0f}s)")
+                    await self._reset_bot_state(context)
+                    await update.message.reply_text(
+                        "⏰ Время ожидания истекло (3 минуты). Действие отменено.\nВозврат в главное меню.",
+                        reply_markup=self.get_main_keyboard()
+                    )
+                    return True
+        return False
+    
     async def _end_conversation_gracefully(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
         await update.message.reply_text("Действие отменено", reply_markup=self.get_main_keyboard())
@@ -2543,7 +2566,6 @@ class FastDCABot:
             return
         await self._reset_bot_state(context)
         
-        # Проверяем версию и отправляем уведомление
         await self.check_and_send_version_notification(update.effective_chat.id)
         
         await update.message.reply_text(
@@ -3851,17 +3873,15 @@ class FastDCABot:
     async def manual_add_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
+        # Проверяем, не нажата ли кнопка главного меню
+        if text in MAIN_MENU_BUTTONS:
+            await self._reset_bot_state(context)
+            await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         
-        menu_buttons = ["📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
-                       "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
-                       "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
-                       "📝 Управление ордерами", "🏠 Главное меню"]
-        
-        if text in menu_buttons:
-            await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
+        if text == "❌ Отмена":
+            await self._reset_bot_state(context)
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         
         try:
@@ -3899,17 +3919,15 @@ class FastDCABot:
     async def manual_add_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
+        # Проверяем, не нажата ли кнопка главного меню
+        if text in MAIN_MENU_BUTTONS:
+            await self._reset_bot_state(context)
+            await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         
-        menu_buttons = ["📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
-                       "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
-                       "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
-                       "📝 Управление ордерами", "🏠 Главное меню"]
-        
-        if text in menu_buttons:
-            await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
+        if text == "❌ Отмена":
+            await self._reset_bot_state(context)
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         
         try:
@@ -3920,6 +3938,7 @@ class FastDCABot:
             
             price = context.user_data.get('manual_price')
             if not price:
+                await self._reset_bot_state(context)
                 await update.message.reply_text("❌ Ошибка: цена не найдена. Попробуйте заново.", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
             
@@ -4296,7 +4315,6 @@ class FastDCABot:
         asyncio.create_task(self.order_checker_loop())
         asyncio.create_task(self.sell_checker_loop())
         
-        # Проверяем версию при запуске (без update, так как нет контекста)
         saved_version = get_saved_version()
         current_version = BOT_VERSION
         
@@ -4311,7 +4329,6 @@ class FastDCABot:
             save_current_version()
             logger.info(f"Bot updated from {saved_version} to {current_version}")
             
-            # Отправляем уведомление админу
             if self.authorized_user_id:
                 try:
                     await application.bot.send_message(
