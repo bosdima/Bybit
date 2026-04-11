@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 2.6 (11.04.2026)
-ИСПРАВЛЕНО: ТЕСТ ОТСЛЕЖИВАНИЯ, УБРАНЫ ЛИШНИЕ ФУНКЦИИ
+Версия 2.7 (11.04.2026)
+ИСПРАВЛЕНО: ПОДТВЕРЖДЕНИЕ ОЧИСТКИ СТАТИСТИКИ ПРИ ПРОДАЖЕ
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "2.6 (11.04.2026)"
+BOT_VERSION = "2.7 (11.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -1755,7 +1755,7 @@ class DCAStrategy:
                 self.db.log_action('SELL_COMPLETED', symbol, f"Продано по {format_price(order['target_price'])}")
     
     async def check_completed_sells(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        """Проверяет выполненные ордера на продажу и уведомляет о них"""
+        """Проверяет выполненные ордера на продажу и уведомляет о них с запросом подтверждения"""
         last_check = self.db.get_last_sell_check_time()
         
         if last_check is None:
@@ -1796,7 +1796,7 @@ class DCAStrategy:
                 profit_percent = 0
                 profit_usdt = 0
             
-            self.db.add_completed_sell(
+            sell_id = self.db.add_completed_sell(
                 symbol=symbol,
                 order_id=sell['order_id'],
                 quantity=sell['quantity'],
@@ -1806,6 +1806,7 @@ class DCAStrategy:
             )
             
             new_completed.append({
+                'id': sell_id,
                 'order_id': sell['order_id'],
                 'quantity': sell['quantity'],
                 'sell_price': sell['sell_price'],
@@ -1817,7 +1818,7 @@ class DCAStrategy:
             
             self.db.update_sell_order_status(sell['order_id'], 'completed')
         
-        # Отправляем уведомления о новых продажах и автоматически очищаем статистику
+        # Отправляем уведомления о новых продажах с запросом подтверждения
         for sell in new_completed:
             profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
             profit_color = "+" if sell['profit_usdt'] >= 0 else ""
@@ -1830,26 +1831,25 @@ class DCAStrategy:
                 f"💵 Сумма: `{sell['amount_usdt']:.2f}` USDT\n"
                 f"{profit_emoji} Прибыль: `{profit_color}{sell['profit_usdt']:.2f}` USDT (`{profit_color}{sell['profit_percent']:.2f}%`)\n"
                 f"🕐 Время: `{sell['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                f"🗑 *Статистика DCA автоматически очищена!*\n"
-                f"📊 Начинаем новый цикл накопления."
+                f"❗ *Очистить статистику DCA по этому токену?*\n"
+                f"После очистки начнется новый цикл накопления."
             )
             
-            # АВТОМАТИЧЕСКАЯ ОЧИСТКА СТАТИСТИКИ
-            deleted_count = self.db.clear_all_purchases(symbol)
-            self.db.log_action('AUTO_STATS_CLEARED', symbol, f"Автоочистка после продажи, удалено {deleted_count} покупок")
-            
-            # Сбрасываем лестницу
-            ladder = self.db.get_ladder_settings(symbol)
-            ladder['current_drop_percent'] = 0
-            self.db.save_ladder_settings(ladder)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Да, очистить статистику", callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
+                    InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")
+                ]
+            ])
             
             try:
                 await bot.send_message(
                     chat_id=user_id,
                     text=msg,
-                    parse_mode='Markdown'
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
                 )
-                logger.info(f"Sent notification for completed sell {sell['order_id']} with auto cleanup")
+                logger.info(f"Sent notification for completed sell {sell['order_id']} with confirmation request")
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
         
@@ -2275,7 +2275,7 @@ class DCAStrategy:
                 profit_percent = 0
                 profit_usdt = 0
             
-            self.db.add_completed_sell(
+            sell_id = self.db.add_completed_sell(
                 symbol=symbol,
                 order_id=sell['order_id'],
                 quantity=sell['quantity'],
@@ -2285,6 +2285,7 @@ class DCAStrategy:
             )
             
             missing_sells.append({
+                'id': sell_id,
                 'order_id': sell['order_id'],
                 'quantity': sell['quantity'],
                 'sell_price': sell['sell_price'],
@@ -2296,7 +2297,7 @@ class DCAStrategy:
             
             self.db.update_sell_order_status(sell['order_id'], 'completed')
         
-        # Отправляем уведомления о пропущенных продажах
+        # Отправляем уведомления о пропущенных продажах с запросом подтверждения
         for sell in missing_sells:
             profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
             profit_color = "+" if sell['profit_usdt'] >= 0 else ""
@@ -2309,23 +2310,23 @@ class DCAStrategy:
                 f"💵 Сумма: `{sell['amount_usdt']:.2f}` USDT\n"
                 f"{profit_emoji} Прибыль: `{profit_color}{sell['profit_usdt']:.2f}` USDT (`{profit_color}{sell['profit_percent']:.2f}%`)\n"
                 f"🕐 Время: `{sell['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                f"🗑 *Статистика DCA автоматически очищена!*\n"
-                f"📊 Начинаем новый цикл накопления."
+                f"❗ *Очистить статистику DCA по этому токену?*\n"
+                f"После очистки начнется новый цикл накопления."
             )
             
-            # АВТОМАТИЧЕСКАЯ ОЧИСТКА СТАТИСТИКИ
-            deleted_count = self.db.clear_all_purchases(symbol)
-            self.db.log_action('AUTO_STATS_CLEARED', symbol, f"Автоочистка после продажи, удалено {deleted_count} покупок")
-            
-            ladder = self.db.get_ladder_settings(symbol)
-            ladder['current_drop_percent'] = 0
-            self.db.save_ladder_settings(ladder)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Да, очистить статистику", callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
+                    InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")
+                ]
+            ])
             
             try:
                 await bot.send_message(
                     chat_id=user_id,
                     text=msg,
-                    parse_mode='Markdown'
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
                 )
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
@@ -3040,6 +3041,9 @@ class FastDCABot:
                 if sell_result['missing']:
                     message += f"🔴 Новых продаж: {len(sell_result['missing'])}\n"
                 message += f"\n✅ *Уведомления отправлены выше!*"
+                
+                if sell_result['missing']:
+                    message += f"\n\n💡 *Для продаж:* Нажмите 'Да, очистить статистику' для подтверждения"
             else:
                 message += f"✨ *Отлично!* Все ордера синхронизированы."
             
@@ -4550,6 +4554,64 @@ class FastDCABot:
         elif data.startswith("cancel_clear_"):
             symbol = data.replace("cancel_clear_", "")
             await query.edit_message_text(f"❌ Очистка статистики для {symbol} отменена.")
+        elif data.startswith("confirm_clear_stats_"):
+            parts = data.replace("confirm_clear_stats_", "").split("_")
+            if len(parts) >= 2:
+                symbol = "_".join(parts[:-1])
+                sell_id = int(parts[-1])
+                await self.execute_clear_stats(update, context, symbol, sell_id)
+        elif data.startswith("skip_clear_stats_"):
+            parts = data.replace("skip_clear_stats_", "").split("_")
+            if len(parts) >= 2:
+                symbol = "_".join(parts[:-1])
+                sell_id = int(parts[-1])
+                await self.skip_clear_stats(update, context, symbol, sell_id)
+    
+    async def execute_clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str, sell_id: int):
+        """Выполняет очистку статистики после подтверждения"""
+        query = update.callback_query
+        
+        # Очищаем статистику
+        deleted_count = self.db.clear_all_purchases(symbol)
+        
+        if deleted_count > 0:
+            self.db.log_action('CONFIRMED_STATS_CLEARED', symbol, f"Подтвержденная очистка после продажи, удалено {deleted_count} покупок")
+            
+            # Отмечаем, что статистика очищена
+            self.db.mark_completed_sell_stats_cleared(sell_id)
+            
+            # Сбрасываем лестницу
+            ladder = self.db.get_ladder_settings(symbol)
+            ladder['current_drop_percent'] = 0
+            self.db.save_ladder_settings(ladder)
+            
+            await query.edit_message_text(
+                f"✅ *Статистика DCA очищена!*\n\n"
+                f"🪙 Токен: `{symbol}`\n"
+                f"🗑 Удалено покупок: `{deleted_count}`\n\n"
+                f"📊 Начинаем новый цикл накопления.\n"
+                f"🪜 Лестница сброшена.",
+                parse_mode='Markdown'
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Ошибка при очистке статистики для {symbol}\n"
+                f"Возможно, статистика уже была очищена.",
+                parse_mode='Markdown'
+            )
+    
+    async def skip_clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str, sell_id: int):
+        """Пропускает очистку статистики"""
+        query = update.callback_query
+        
+        self.db.mark_completed_sell_notified(sell_id)
+        
+        await query.edit_message_text(
+            f"⏭ Очистка статистики для {symbol} отложена.\n\n"
+            f"📊 Статистика DCA сохранена.\n"
+            f"💡 Вы можете очистить её позже вручную через раздел '✏️ Редактировать покупки'.",
+            parse_mode='Markdown'
+        )
     
     async def confirm_clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
         query = update.callback_query
@@ -4732,7 +4794,7 @@ class FastDCABot:
         logger.info("Setting up handlers...")
         
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
-        self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_)'))
+        self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_|confirm_clear_stats_|skip_clear_stats_)'))
         
         self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.show_settings_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
