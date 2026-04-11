@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 2.7 (11.04.2026)
-ИСПРАВЛЕНО: ПОДТВЕРЖДЕНИЕ ОЧИСТКИ СТАТИСТИКИ ПРИ ПРОДАЖЕ
+Версия 2.8 (11.04.2026)
+ИСПРАВЛЕНО: ПОРЯДОК ВЫВОДА ИНФОРМАЦИИ, ФИКС КНОПКИ ОЧИСТКИ
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "2.7 (11.04.2026)"
+BOT_VERSION = "2.8 (11.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -3004,54 +3004,50 @@ class FastDCABot:
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         
-        try:
-            # Проверяем ордера на покупку
-            buy_result = await self.strategy.force_check_executed_orders(
-                symbol, 
-                self.application.bot, 
-                self.authorized_user_id
-            )
+        # Сначала проверяем продажи
+        sell_result = await self.strategy.force_check_completed_sells(
+            symbol, 
+            self.application.bot, 
+            self.authorized_user_id
+        )
+        
+        # Затем проверяем покупки
+        buy_result = await self.strategy.force_check_executed_orders(
+            symbol, 
+            self.application.bot, 
+            self.authorized_user_id
+        )
+        
+        # Формируем итоговое сообщение
+        message = f"📊 *РЕЗУЛЬТАТ ПОЛНОЙ ПРОВЕРКИ*\n\n"
+        message += f"🪙 Токен: `{symbol}`\n"
+        message += f"📅 Проверка за последние 90 дней\n\n"
+        message += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"🟢 *ПОКУПКИ:*\n"
+        message += f"📋 Всего найдено: `{buy_result['total_found']}`\n"
+        message += f"✅ Уже в статистике: `{buy_result['already_added']}`\n"
+        message += f"❌ Отсутствуют: `{len(buy_result['missing'])}`\n"
+        message += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"🔴 *ПРОДАЖИ:*\n"
+        message += f"📋 Всего найдено: `{sell_result['total_found']}`\n"
+        message += f"✅ Уже обработано: `{sell_result['already_processed']}`\n"
+        message += f"❌ Отсутствуют: `{len(sell_result['missing'])}`\n"
+        message += f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        if buy_result['missing'] or sell_result['missing']:
+            message += f"⚠️ *Найдены новые ордера!*\n"
+            if buy_result['missing']:
+                message += f"🟢 Новых покупок: {len(buy_result['missing'])}\n"
+            if sell_result['missing']:
+                message += f"🔴 Новых продаж: {len(sell_result['missing'])}\n"
+            message += f"\n✅ *Уведомления отправлены выше!*"
             
-            # Проверяем ордера на продажу
-            sell_result = await self.strategy.force_check_completed_sells(
-                symbol, 
-                self.application.bot, 
-                self.authorized_user_id
-            )
-            
-            message = f"📊 *РЕЗУЛЬТАТ ПОЛНОЙ ПРОВЕРКИ*\n\n"
-            message += f"🪙 Токен: `{symbol}`\n"
-            message += f"📅 Проверка за последние 90 дней\n\n"
-            message += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            message += f"🟢 *ПОКУПКИ:*\n"
-            message += f"📋 Всего найдено: `{buy_result['total_found']}`\n"
-            message += f"✅ Уже в статистике: `{buy_result['already_added']}`\n"
-            message += f"❌ Отсутствуют: `{len(buy_result['missing'])}`\n"
-            message += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            message += f"🔴 *ПРОДАЖИ:*\n"
-            message += f"📋 Всего найдено: `{sell_result['total_found']}`\n"
-            message += f"✅ Уже обработано: `{sell_result['already_processed']}`\n"
-            message += f"❌ Отсутствуют: `{len(sell_result['missing'])}`\n"
-            message += f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            
-            if buy_result['missing'] or sell_result['missing']:
-                message += f"⚠️ *Найдены новые ордера!*\n"
-                if buy_result['missing']:
-                    message += f"🟢 Новых покупок: {len(buy_result['missing'])}\n"
-                if sell_result['missing']:
-                    message += f"🔴 Новых продаж: {len(sell_result['missing'])}\n"
-                message += f"\n✅ *Уведомления отправлены выше!*"
-                
-                if sell_result['missing']:
-                    message += f"\n\n💡 *Для продаж:* Нажмите 'Да, очистить статистику' для подтверждения"
-            else:
-                message += f"✨ *Отлично!* Все ордера синхронизированы."
-            
-            await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_tracking_settings_keyboard())
-            
-        except Exception as e:
-            logger.error(f"Error in test tracking: {e}")
-            await update.message.reply_text(f"❌ Ошибка при тестировании: {str(e)}", reply_markup=self.get_tracking_settings_keyboard())
+            if sell_result['missing']:
+                message += f"\n\n💡 *Для продаж:* Нажмите 'Да, очистить статистику' для подтверждения"
+        else:
+            message += f"✨ *Отлично!* Все ордера синхронизированы."
+        
+        await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_tracking_settings_keyboard())
         
         return NOTIFICATION_SETTINGS_MENU
     
