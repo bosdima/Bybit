@@ -3,7 +3,7 @@
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
 ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЮТ ВСЕ КНОПКИ
-С ТАЙМАУТОМ ОЖИДАНИЯ 3 МИНУТЫ И ФИКСАЦИЕЙ ЗАЛИПАНИЙ
+С ОТСЛЕЖИВАНИЕМ ПРОДАННЫХ ОРДЕРОВ
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "1.9 (05.04.2026)"
+BOT_VERSION = "2.0 (11.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -104,7 +104,8 @@ CONVERSATION_TIMEOUT = 180
     WAITING_ORDER_CHECK_INTERVAL,
     WAITING_ORDER_ID_TO_CANCEL,
     WAITING_SELL_CONFIRMATION,
-) = range(34)
+    WAITING_CLEAR_STATS_CONFIRMATION,
+) = range(35)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
@@ -214,6 +215,20 @@ class Database:
             ''')
             
             cursor.execute('''
+                CREATE TABLE IF NOT EXISTS completed_sells (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    order_id TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    sell_price REAL NOT NULL,
+                    profit_percent REAL NOT NULL,
+                    profit_usdt REAL NOT NULL,
+                    sold_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    notified BOOLEAN DEFAULT 0
+                )
+            ''')
+            
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -311,8 +326,10 @@ class Database:
                 ('ladder_start_price', '0'),
                 ('order_execution_notify', 'true'),
                 ('order_check_interval_minutes', '60'),
+                ('sell_tracking_enabled', 'true'),
                 ('last_order_check_time', ''),
                 ('last_full_check_time', ''),
+                ('last_sell_check_time', ''),
             ]
             
             for key, value in defaults:
@@ -567,6 +584,81 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error updating order price: {e}")
+    
+    def add_completed_sell(self, symbol: str, order_id: str, quantity: float, 
+                           sell_price: float, profit_percent: float, profit_usdt: float):
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO completed_sells (symbol, order_id, quantity, sell_price, profit_percent, profit_usdt, notified)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+            ''', (symbol, order_id, quantity, sell_price, profit_percent, profit_usdt))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding completed sell: {e}")
+            return False
+    
+    def get_completed_sells_not_notified(self, symbol: str = None) -> List[Dict]:
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if symbol:
+                cursor.execute('SELECT * FROM completed_sells WHERE symbol = ? AND notified = 0 ORDER BY sold_at DESC', (symbol,))
+            else:
+                cursor.execute('SELECT * FROM completed_sells WHERE notified = 0 ORDER BY sold_at DESC')
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting completed sells: {e}")
+            return []
+    
+    def mark_completed_sell_notified(self, sell_id: int):
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE completed_sells SET notified = 1 WHERE id = ?', (sell_id,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error marking sell notified: {e}")
+    
+    def clear_all_purchases(self, symbol: str) -> int:
+        """Удаляет все покупки для указанного символа"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM dca_purchases WHERE symbol = ?', (symbol,))
+            deleted_count = cursor.rowcount
+            conn.commit()
+            conn.close()
+            logger.info(f"Deleted {deleted_count} purchases for {symbol}")
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Error clearing purchases: {e}")
+            return 0
+    
+    def get_sell_tracking_enabled(self) -> bool:
+        return self.get_setting('sell_tracking_enabled', 'true') == 'true'
+    
+    def set_sell_tracking_enabled(self, enabled: bool):
+        self.set_setting('sell_tracking_enabled', 'true' if enabled else 'false')
+    
+    def get_last_sell_check_time(self) -> Optional[datetime]:
+        time_str = self.get_setting('last_sell_check_time', '')
+        if time_str:
+            try:
+                return datetime.fromisoformat(time_str)
+            except:
+                return None
+        return None
+    
+    def set_last_sell_check_time(self, check_time: datetime):
+        self.set_setting('last_sell_check_time', check_time.isoformat())
     
     def log_action(self, action: str, symbol: str = None, details: str = None):
         try:
@@ -958,6 +1050,7 @@ class Database:
         try:
             purchases = self.get_purchases()
             sell_orders = self.get_active_sell_orders()
+            completed_sells = self.get_completed_sells_not_notified()
             settings = {}
             
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -1034,9 +1127,10 @@ class Database:
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '1.9 (05.04.2026)',
+                'version': '2.0 (11.04.2026)',
                 'purchases': purchases,
                 'sell_orders': sell_orders,
+                'completed_sells': completed_sells,
                 'settings': settings,
                 'notifications': notifications,
                 'dca_start': dca_start,
@@ -1064,6 +1158,7 @@ class Database:
             
             cursor.execute("DELETE FROM dca_purchases")
             cursor.execute("DELETE FROM sell_orders")
+            cursor.execute("DELETE FROM completed_sells")
             cursor.execute("DELETE FROM settings")
             cursor.execute("DELETE FROM dca_start")
             cursor.execute("DELETE FROM ladder_settings")
@@ -1115,6 +1210,27 @@ class Database:
                     orders_imported += 1
                 except Exception as e:
                     logger.warning(f"Error importing order: {e}")
+                    continue
+            
+            for sell in data.get('completed_sells', []):
+                try:
+                    cursor.execute('''
+                        INSERT INTO completed_sells 
+                        (id, symbol, order_id, quantity, sell_price, profit_percent, profit_usdt, sold_at, notified)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        sell.get('id'),
+                        sell.get('symbol', 'TONUSDT'),
+                        sell.get('order_id'),
+                        sell.get('quantity', 0),
+                        sell.get('sell_price', 0),
+                        sell.get('profit_percent', 0),
+                        sell.get('profit_usdt', 0),
+                        sell.get('sold_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        sell.get('notified', 0)
+                    ))
+                except Exception as e:
+                    logger.warning(f"Error importing completed sell: {e}")
                     continue
             
             for key, value in data.get('settings', {}).items():
@@ -1370,6 +1486,52 @@ class BybitClient:
             logger.error(f"Error getting executed orders: {e}")
             return []
     
+    async def get_completed_sell_orders(self, symbol: str = None, hours: int = 24) -> List[Dict]:
+        """Получает выполненные ордера на продажу за последние N часов"""
+        try:
+            check_time = datetime.now() - timedelta(hours=hours)
+            orders = await self.get_order_history(symbol, limit=200)
+            completed = []
+            
+            for order in orders:
+                if order.get('orderStatus') in ['Filled'] and order.get('side') == 'Sell':
+                    created_time_str = order.get('createdTime', '')
+                    if created_time_str:
+                        try:
+                            created_time_ms = int(created_time_str)
+                            created_time = datetime.fromtimestamp(created_time_ms / 1000)
+                            
+                            if created_time > check_time:
+                                avg_price = float(order.get('avgPrice', 0))
+                                if avg_price == 0:
+                                    avg_price = float(order.get('price', 0))
+                                
+                                qty = float(order.get('cumExecQty', 0))
+                                if qty == 0:
+                                    qty = float(order.get('qty', 0))
+                                
+                                amount_usdt = float(order.get('cumExecValue', 0))
+                                if amount_usdt == 0 and avg_price > 0:
+                                    amount_usdt = avg_price * qty
+                                
+                                if qty > 0 and avg_price > 0:
+                                    completed.append({
+                                        'order_id': order.get('orderId'),
+                                        'symbol': order.get('symbol'),
+                                        'sell_price': avg_price,
+                                        'quantity': qty,
+                                        'amount_usdt': amount_usdt,
+                                        'executed_at': created_time,
+                                    })
+                                    logger.info(f"Found completed sell order: {order.get('orderId')} at {avg_price} USDT, qty {qty}")
+                        except Exception as e:
+                            logger.error(f"Error parsing order time for {order.get('orderId')}: {e}")
+                            continue
+            return completed
+        except Exception as e:
+            logger.error(f"Error getting completed sell orders: {e}")
+            return []
+    
     async def cancel_order(self, symbol: str, order_id: str) -> Dict:
         try:
             if not self.session:
@@ -1537,6 +1699,112 @@ class DCAStrategy:
             if order['order_id'] not in open_order_ids:
                 self.db.update_sell_order_status(order['order_id'], 'completed')
                 self.db.log_action('SELL_COMPLETED', symbol, f"Продано по {format_price(order['target_price'])}")
+    
+    async def check_completed_sells(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Проверяет выполненные ордера на продажу и уведомляет о них"""
+        last_check = self.db.get_last_sell_check_time()
+        
+        if last_check is None:
+            last_check = datetime.now() - timedelta(hours=24)
+        
+        hours_to_check = max(1, int((datetime.now() - last_check).total_seconds() / 3600) + 1)
+        hours_to_check = min(hours_to_check, 48)
+        
+        logger.info(f"Checking completed sells since {last_check.strftime('%Y-%m-%d %H:%M:%S')} (looking back {hours_to_check} hours)")
+        
+        all_completed = await self.bybit.get_completed_sell_orders(symbol, hours=hours_to_check)
+        
+        self.db.set_last_sell_check_time(datetime.now())
+        
+        # Получаем уже обработанные продажи
+        already_processed = self.db.get_completed_sells_not_notified(symbol)
+        processed_order_ids = set([s['order_id'] for s in already_processed])
+        
+        # Также проверяем активные ордера, которые могли быть исполнены
+        active_sell_orders = self.db.get_active_sell_orders(symbol)
+        active_order_ids = {o['order_id'] for o in active_sell_orders}
+        
+        new_completed = []
+        
+        for sell in all_completed:
+            if sell['order_id'] in processed_order_ids:
+                continue
+            
+            # Проверяем, был ли это наш ордер (есть в активных или был в активных)
+            was_our_order = sell['order_id'] in active_order_ids
+            
+            # Если это не наш ордер - пропускаем
+            if not was_our_order:
+                continue
+            
+            # Получаем информацию о покупках для расчета прибыли
+            stats = self.db.get_dca_stats(symbol)
+            if stats and stats['total_quantity'] > 0:
+                avg_price = stats['avg_price']
+                profit_percent = ((sell['sell_price'] - avg_price) / avg_price) * 100
+                profit_usdt = (sell['sell_price'] - avg_price) * sell['quantity']
+            else:
+                profit_percent = 0
+                profit_usdt = 0
+            
+            self.db.add_completed_sell(
+                symbol=symbol,
+                order_id=sell['order_id'],
+                quantity=sell['quantity'],
+                sell_price=sell['sell_price'],
+                profit_percent=profit_percent,
+                profit_usdt=profit_usdt
+            )
+            
+            new_completed.append({
+                'order_id': sell['order_id'],
+                'quantity': sell['quantity'],
+                'sell_price': sell['sell_price'],
+                'amount_usdt': sell['amount_usdt'],
+                'executed_at': sell['executed_at'],
+                'profit_percent': profit_percent,
+                'profit_usdt': profit_usdt
+            })
+            
+            # Обновляем статус ордера в sell_orders
+            self.db.update_sell_order_status(sell['order_id'], 'completed')
+        
+        # Отправляем уведомления о новых продажах
+        for sell in new_completed:
+            profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
+            profit_color = "+" if sell['profit_usdt'] >= 0 else ""
+            
+            msg = (
+                f"💰 *СДЕЛКА ПРОДАНА!*\n\n"
+                f"🪙 Токен: `{symbol}`\n"
+                f"📊 Количество: `{format_quantity(sell['quantity'], 2)}`\n"
+                f"💰 Цена продажи: `{format_price(sell['sell_price'], 4)}` USDT\n"
+                f"💵 Сумма: `{sell['amount_usdt']:.2f}` USDT\n"
+                f"{profit_emoji} Прибыль: `{profit_color}{sell['profit_usdt']:.2f}` USDT (`{profit_color}{sell['profit_percent']:.2f}%`)\n"
+                f"🕐 Время: `{sell['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                f"❗ *Все ордера в статистике DCA по этому токену были проданы!*\n"
+                f"*Очистить историю покупок?*"
+            )
+            
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🗑 Очистить статистику", callback_data=f"clear_stats_{symbol}"),
+                    InlineKeyboardButton("⏭ Позже", callback_data=f"skip_clear_{symbol}")
+                ]
+            ])
+            
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=msg,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+                logger.info(f"Sent notification for completed sell {sell['order_id']}")
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
+        
+        return new_completed
     
     async def get_recommended_purchase(self, symbol: str) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
@@ -1708,14 +1976,12 @@ class DCAStrategy:
         missing_orders = []
         
         for order in all_orders:
-            # Если ордер уже обработан - пропускаем
             if order['order_id'] in processed_order_ids:
                 continue
             
             price_key = round(order['price'], 4)
             qty_key = round(order['quantity'], 6)
             
-            # Если ордер уже есть в статистике - отмечаем как обработанный
             if f"{price_key}_{qty_key}" in added_orders:
                 self.db.add_executed_order(
                     order['order_id'],
@@ -1728,7 +1994,6 @@ class DCAStrategy:
                 self.db.mark_order_as_added(order['order_id'])
                 continue
             
-            # Проверяем, есть ли уже запись в executed_orders
             existing = False
             for record in executed_records:
                 if record[0] == order['order_id']:
@@ -1748,7 +2013,6 @@ class DCAStrategy:
             missing_orders.append(order)
             logger.info(f"Missing order found: {order['order_id']} at {order['price']} on {order['executed_at']}")
         
-        # Отправляем уведомления о пропущенных ордерах
         for order in missing_orders:
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -1847,7 +2111,6 @@ class DCAStrategy:
             qty_key = round(order['quantity'], 6)
             if f"{price_key}_{qty_key}" in added_orders:
                 already_added.append(order)
-                # Исправляем статус
                 try:
                     self.db.add_executed_order(
                         order['order_id'],
@@ -1879,7 +2142,6 @@ class DCAStrategy:
                     )
                 missing_orders.append(order)
         
-        # Отправляем уведомления о пропущенных ордерах
         for order in missing_orders[:10]:
             msg = (
                 f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -2022,14 +2284,16 @@ class FastDCABot:
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         dca_button = "⏹ Остановить Авто DCA" if is_active else "🚀 Запустить Авто DCA"
         order_execution = self.db.get_order_execution_notify()
+        sell_tracking = self.db.get_sell_tracking_enabled()
         order_execution_button = "✅ Отслеживание ордеров Вкл" if order_execution else "⏳ Отслеживание ордеров Выкл"
+        sell_tracking_button = "💰 Отслеживание продаж Вкл" if sell_tracking else "⏳ Отслеживание продаж Выкл"
         keyboard = [
             [KeyboardButton("📊 Мой Портфель"), KeyboardButton(dca_button)],
             [KeyboardButton("💰 Ручная покупка (лимит)"), KeyboardButton("📈 Статистика DCA")],
             [KeyboardButton("➕ Добавить покупку вручную"), KeyboardButton("✏️ Редактировать покупки")],
             [KeyboardButton("⚙️ Настройки"), KeyboardButton("📋 Статус бота")],
             [KeyboardButton("📝 Управление ордерами"), KeyboardButton(order_execution_button)],
-            [KeyboardButton("🏠 Главное меню")],
+            [KeyboardButton(sell_tracking_button), KeyboardButton("🏠 Главное меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2042,13 +2306,21 @@ class FastDCABot:
     
     def get_tracking_settings_keyboard(self):
         current_status = self.db.get_order_execution_notify()
+        sell_tracking = self.db.get_sell_tracking_enabled()
+        
         if current_status:
-            tracking_button = "✅ Отслеживание включено"
+            tracking_button = "✅ Отслеживание ордеров Вкл"
         else:
-            tracking_button = "❌ Отслеживание выключено"
+            tracking_button = "❌ Отслеживание ордеров Выкл"
+        
+        if sell_tracking:
+            sell_tracking_button = "💰 Отслеживание продаж Вкл"
+        else:
+            sell_tracking_button = "⏳ Отслеживание продаж Выкл"
         
         keyboard = [
             [KeyboardButton(tracking_button)],
+            [KeyboardButton(sell_tracking_button)],
             [KeyboardButton("⏱ Изменить интервал проверки")],
             [KeyboardButton("🔍 Тест отслеживания")],
             [KeyboardButton("🔙 Назад в настройки")],
@@ -2104,6 +2376,12 @@ class FastDCABot:
     def get_confirm_delete_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, удалить"), KeyboardButton("❌ Нет, отмена")]], resize_keyboard=True)
     
+    def get_clear_stats_keyboard(self):
+        return ReplyKeyboardMarkup([
+            [KeyboardButton("✅ Да, очистить статистику")],
+            [KeyboardButton("❌ Нет, оставить")]
+        ], resize_keyboard=True)
+    
     def get_purchases_list_keyboard(self, purchases):
         keyboard = []
         for p in purchases:
@@ -2136,7 +2414,6 @@ class FastDCABot:
         context.user_data.clear()
         self.import_waiting = False
         
-        # Завершаем все активные диалоги
         for conv_name in ['manual_add_conversation', 'manual_buy_conversation', 'main_conversation', 
                          'ladder_conversation', 'edit_purchases_conversation', 'tracking_conversation',
                          'cancel_order_conversation']:
@@ -2333,7 +2610,6 @@ class FastDCABot:
                 )
             
             context.user_data.pop('pending_sell_data', None)
-            # После продажи сбрасываем состояние
             await self._reset_bot_state(context)
     
     async def toggle_order_execution(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2357,6 +2633,24 @@ class FastDCABot:
             reply_markup=self.get_main_keyboard()
         )
     
+    async def toggle_sell_tracking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_user_fast(update):
+            return
+        
+        current = self.db.get_sell_tracking_enabled()
+        new_status = not current
+        self.db.set_sell_tracking_enabled(new_status)
+        
+        status_text = "✅ Включено" if new_status else "⏹ Выключено"
+        
+        await update.message.reply_text(
+            f"💰 *Отслеживание выполненных продаж*: {status_text}\n\n"
+            f"При включенной настройке бот проверяет выполненные ордера на продажу\n"
+            f"каждый час и уведомляет о сделках.",
+            parse_mode='Markdown',
+            reply_markup=self.get_main_keyboard()
+        )
+    
     async def tracking_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -2364,13 +2658,16 @@ class FastDCABot:
         await self._reset_bot_state(context)
         
         current_status = self.db.get_order_execution_notify()
+        sell_tracking = self.db.get_sell_tracking_enabled()
         current_interval = self.db.get_order_check_interval()
         
         status_text = "✅ Включено" if current_status else "⏹ Выключено"
+        sell_tracking_text = "💰 Включено" if sell_tracking else "⏹ Выключено"
         
         await update.message.reply_text(
-            f"⚙️ *Настройки отслеживания ордеров*\n\n"
-            f"📋 Статус: {status_text}\n"
+            f"⚙️ *Настройки отслеживания*\n\n"
+            f"📋 Отслеживание ордеров: {status_text}\n"
+            f"💰 Отслеживание продаж: {sell_tracking_text}\n"
             f"🕐 Интервал проверки: `{current_interval}` минут\n"
             f"📅 Полная проверка: ежедневно в 19:00\n\n"
             f"Выберите действие:",
@@ -2388,6 +2685,19 @@ class FastDCABot:
         
         await update.message.reply_text(
             f"📋 Отслеживание ордеров: {status_text}",
+            reply_markup=self.get_tracking_settings_keyboard()
+        )
+        return NOTIFICATION_SETTINGS_MENU
+    
+    async def toggle_sell_tracking_in_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        current = self.db.get_sell_tracking_enabled()
+        new_status = not current
+        self.db.set_sell_tracking_enabled(new_status)
+        
+        status_text = "💰 Включено" if new_status else "⏹ Выключено"
+        
+        await update.message.reply_text(
+            f"💰 Отслеживание продаж: {status_text}",
             reply_markup=self.get_tracking_settings_keyboard()
         )
         return NOTIFICATION_SETTINGS_MENU
@@ -2851,6 +3161,7 @@ class FastDCABot:
         invest_amount = float(self.db.get_setting('invest_amount', '1.1'))
         ladder_settings = self.db.get_ladder_settings(symbol)
         order_execution = self.db.get_order_execution_notify()
+        sell_tracking = self.db.get_sell_tracking_enabled()
         order_interval = self.db.get_order_check_interval()
         last_full_check = self.db.get_last_full_check_time()
         
@@ -2860,6 +3171,7 @@ class FastDCABot:
         message += f"💵 Сумма покупки: `{invest_amount}` USDT\n"
         message += f"📈 Цель: `{self.db.get_setting('profit_percent', '5')}%`\n"
         message += f"📋 Отслеживание ордеров: {'✅ Вкл' if order_execution else '⏹ Выкл'}\n"
+        message += f"💰 Отслеживание продаж: {'✅ Вкл' if sell_tracking else '⏹ Выкл'}\n"
         message += f"🕐 Интервал проверки: `{order_interval}` мин\n"
         if last_full_check:
             message += f"📅 Последняя полная проверка: `{last_full_check.strftime('%d.%m.%Y %H:%M')}`\n"
@@ -3396,7 +3708,6 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         
-        # Принудительно сбрасываем состояние перед началом диалога
         await self._reset_bot_state(context)
         
         self._init_bybit()
@@ -3435,17 +3746,15 @@ class FastDCABot:
     async def manual_add_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         
-        # Обработка команды отмены
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         
-        # Проверка: если сообщение начинается с кнопки меню - завершаем диалог
         menu_buttons = ["📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
                        "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
                        "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
                        "📝 Управление ордерами", "✅ Отслеживание ордеров Вкл", "⏳ Отслеживание ордеров Выкл",
-                       "🏠 Главное меню"]
+                       "💰 Отслеживание продаж Вкл", "⏳ Отслеживание продаж Выкл", "🏠 Главное меню"]
         
         if text in menu_buttons:
             await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
@@ -3486,17 +3795,15 @@ class FastDCABot:
     async def manual_add_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         
-        # Обработка команды отмены
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         
-        # Проверка: если сообщение начинается с кнопки меню - завершаем диалог
         menu_buttons = ["📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
                        "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
                        "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
                        "📝 Управление ордерами", "✅ Отслеживание ордеров Вкл", "⏳ Отслеживание ордеров Выкл",
-                       "🏠 Главное меню"]
+                       "💰 Отслеживание продаж Вкл", "⏳ Отслеживание продаж Выкл", "🏠 Главное меню"]
         
         if text in menu_buttons:
             await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
@@ -3798,6 +4105,45 @@ class FastDCABot:
             except Exception as e:
                 logger.error(f"DCA scheduler error: {e}")
     
+    async def sell_checker_loop(self):
+        """Проверка выполненных ордеров на продажу"""
+        logger.info("Sell checker loop started")
+        
+        await asyncio.sleep(60)
+        
+        while self.scheduler_running:
+            try:
+                if not self.db.get_sell_tracking_enabled():
+                    await asyncio.sleep(3600)  # Проверяем раз в час
+                    continue
+                
+                if not self.bybit_initialized:
+                    self._init_bybit()
+                
+                if not self.bybit_initialized:
+                    await asyncio.sleep(3600)
+                    continue
+                
+                symbol = self.db.get_setting('symbol', 'TONUSDT')
+                
+                if self.authorized_user_id:
+                    completed_sells = await self.strategy.check_completed_sells(
+                        symbol, 
+                        self.authorized_user_id, 
+                        self.application.bot
+                    )
+                    
+                    if completed_sells:
+                        logger.info(f"Found {len(completed_sells)} completed sell orders")
+                
+            except asyncio.CancelledError:
+                logger.info("Sell checker loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Sell checker error: {e}")
+            
+            await asyncio.sleep(3600)  # Проверяем раз в час
+    
     async def order_checker_loop(self):
         logger.info("Order checker loop started")
         
@@ -3846,6 +4192,7 @@ class FastDCABot:
         self.scheduler_running = True
         asyncio.create_task(self.dca_scheduler_loop())
         asyncio.create_task(self.order_checker_loop())
+        asyncio.create_task(self.sell_checker_loop())
         logger.info("Bot initialized, scheduler loops started")
     
     async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3860,6 +4207,69 @@ class FastDCABot:
         elif data.startswith("skip_order_"):
             order_id = data.replace("skip_order_", "")
             await self.skip_executed_order(update, context, order_id)
+        elif data.startswith("clear_stats_"):
+            symbol = data.replace("clear_stats_", "")
+            await self.confirm_clear_stats(update, context, symbol)
+        elif data.startswith("skip_clear_"):
+            symbol = data.replace("skip_clear_", "")
+            await update.callback_query.edit_message_text(f"⏭ Очистка статистики для {symbol} отложена.")
+    
+    async def confirm_clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
+        """Подтверждение очистки статистики"""
+        query = update.callback_query
+        
+        stats = self.db.get_dca_stats(symbol)
+        if not stats:
+            await query.edit_message_text(f"❌ Нет данных для очистки по {symbol}")
+            return
+        
+        msg = (
+            f"🗑 *ПОДТВЕРЖДЕНИЕ ОЧИСТКИ*\n\n"
+            f"🪙 Токен: `{symbol}`\n"
+            f"📊 Всего покупок: `{stats['total_purchases']}`\n"
+            f"💰 Вложено: `{stats['total_usdt']:.2f}` USDT\n\n"
+            f"❗ *ВНИМАНИЕ! Все покупки по {symbol} будут удалены из статистики!*\n\n"
+            f"*Подтвердите действие:*"
+        )
+        
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да, очистить всё", callback_data=f"do_clear_{symbol}"),
+                InlineKeyboardButton("❌ Нет, отмена", callback_data=f"cancel_clear_{symbol}")
+            ]
+        ])
+        
+        await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=keyboard)
+    
+    async def clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
+        """Очистка статистики покупок"""
+        query = update.callback_query
+        
+        deleted_count = self.db.clear_all_purchases(symbol)
+        
+        if deleted_count > 0:
+            self.db.log_action('STATS_CLEARED', symbol, f"Удалено {deleted_count} покупок")
+            await query.edit_message_text(
+                f"✅ *Статистика очищена!*\n\n"
+                f"🪙 Токен: `{symbol}`\n"
+                f"🗑 Удалено покупок: `{deleted_count}`\n\n"
+                f"Статистика DCA по {symbol} очищена. Можно начинать новый цикл.",
+                parse_mode='Markdown',
+                reply_markup=None
+            )
+            
+            # Также сбрасываем настройки лестницы
+            ladder = self.db.get_ladder_settings(symbol)
+            ladder['current_drop_percent'] = 0
+            self.db.save_ladder_settings(ladder)
+            
+            await self.application.bot.send_message(
+                chat_id=self.authorized_user_id,
+                text=f"🔄 Лестница для {symbol} сброшена. Стартовая цена осталась прежней.",
+                parse_mode='Markdown'
+            )
+        else:
+            await query.edit_message_text(f"❌ Ошибка при очистке статистики для {symbol}")
     
     async def add_executed_order_to_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         conn = sqlite3.connect(self.db.db_file, timeout=5)
@@ -3988,7 +4398,7 @@ class FastDCABot:
         logger.info("Setting up handlers...")
         
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
-        self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_)'))
+        self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_)'))
         
         self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.show_settings_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
@@ -3998,11 +4408,15 @@ class FastDCABot:
         
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
         
+        # Кнопки управления отслеживанием продаж в главном меню
+        self.application.add_handler(MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking))
+        
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
             states={
                 NOTIFICATION_SETTINGS_MENU: [
-                    MessageHandler(filters.Regex('^(✅ Отслеживание включено|❌ Отслеживание выключено)$'), self.toggle_tracking),
+                    MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|❌ Отслеживание ордеров Выкл)$'), self.toggle_tracking),
+                    MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking_in_settings),
                     MessageHandler(filters.Regex('^(⏱ Изменить интервал проверки)$'), self.set_tracking_interval_start),
                     MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
                     MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
