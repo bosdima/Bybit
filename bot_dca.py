@@ -2,9 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 2.5 (11.04.2026)
-ИСПРАВЛЕНО: ОТСЛЕЖИВАНИЕ ПРОДАЖ, АВТООЧИСТКА СТАТИСТИКИ
-ДОБАВЛЕНО: ЕЖЕДНЕВНЫЕ УВЕДОМЛЕНИЯ О ПОКУПКЕ
+Версия 2.6 (11.04.2026)
+ИСПРАВЛЕНО: ТЕСТ ОТСЛЕЖИВАНИЯ, УБРАНЫ ЛИШНИЕ ФУНКЦИИ
 """
 
 import os
@@ -64,9 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "2.5 (11.04.2026)"
-BOT_VERSION_FILE = "bot_version.txt"
-UPDATE_INFO_FILE = "obnovlenie.txt"
+BOT_VERSION = "2.6 (11.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -125,40 +122,6 @@ MAIN_MENU_BUTTONS = [
     "💰 Отслеживание продаж Вкл", "⏳ Отслеживание продаж Выкл", "🏠 Главное меню",
     "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку"
 ]
-
-
-def get_update_info() -> str:
-    """Читает информацию об обновлении из файла obnovlenie.txt"""
-    if os.path.exists(UPDATE_INFO_FILE):
-        try:
-            with open(UPDATE_INFO_FILE, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                if content:
-                    return content
-                return "• Исправлены ошибки\n• Улучшена стабильность работы"
-        except Exception as e:
-            logger.error(f"Error reading update info: {e}")
-    return "• Исправлены ошибки\n• Улучшена стабильность работы"
-
-
-def get_saved_version() -> str:
-    """Читает сохраненную версию бота"""
-    if os.path.exists(BOT_VERSION_FILE):
-        try:
-            with open(BOT_VERSION_FILE, 'r', encoding='utf-8') as f:
-                return f.read().strip()
-        except Exception:
-            pass
-    return ""
-
-
-def save_current_version():
-    """Сохраняет текущую версию бота"""
-    try:
-        with open(BOT_VERSION_FILE, 'w', encoding='utf-8') as f:
-            f.write(BOT_VERSION)
-    except Exception as e:
-        logger.error(f"Error saving version: {e}")
 
 
 def format_price(price: float, decimals: int = 4) -> str:
@@ -1570,7 +1533,7 @@ class BybitClient:
             logger.error(f"Error getting executed orders: {e}")
             return []
     
-    async def get_completed_sell_orders(self, symbol: str = None, hours: int = 48) -> List[Dict]:
+    async def get_completed_sell_orders(self, symbol: str = None, hours: int = 72) -> List[Dict]:
         """Получает выполненные ордера на продажу за последние N часов"""
         try:
             check_time = datetime.now() - timedelta(hours=hours)
@@ -1796,10 +1759,10 @@ class DCAStrategy:
         last_check = self.db.get_last_sell_check_time()
         
         if last_check is None:
-            last_check = datetime.now() - timedelta(hours=48)
+            last_check = datetime.now() - timedelta(hours=72)
         
         hours_to_check = max(1, int((datetime.now() - last_check).total_seconds() / 3600) + 1)
-        hours_to_check = min(hours_to_check, 72)
+        hours_to_check = min(hours_to_check, 96)
         
         logger.info(f"Checking completed sells since {last_check.strftime('%Y-%m-%d %H:%M:%S')} (looking back {hours_to_check} hours)")
         
@@ -2158,6 +2121,7 @@ class DCAStrategy:
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
     
     async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
+        """Принудительная полная проверка всех ордеров за 90 дней"""
         logger.info(f"Force checking all executed orders for {symbol} (last 90 days)")
         
         all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
@@ -2274,6 +2238,102 @@ class DCAStrategy:
             'missing': missing_orders,
             'check_date': datetime.now() - timedelta(days=90),
             'notified_count': notified_count
+        }
+    
+    async def force_check_completed_sells(self, symbol: str, bot, user_id: int) -> Dict:
+        """Принудительная полная проверка всех продаж за последние 90 дней"""
+        logger.info(f"Force checking all completed sell orders for {symbol} (last 90 days)")
+        
+        all_completed = await self.bybit.get_completed_sell_orders(symbol, hours=2160)  # 90 дней
+        logger.info(f"Total completed sells found: {len(all_completed)}")
+        
+        purchases = self.db.get_purchases(symbol)
+        
+        already_processed = self.db.get_completed_sells_not_notified(symbol)
+        processed_order_ids = set([s['order_id'] for s in already_processed])
+        
+        active_sell_orders = self.db.get_active_sell_orders(symbol)
+        active_order_ids = {o['order_id'] for o in active_sell_orders}
+        
+        missing_sells = []
+        
+        for sell in all_completed:
+            if sell['order_id'] in processed_order_ids:
+                continue
+            
+            was_our_order = sell['order_id'] in active_order_ids
+            
+            if not was_our_order:
+                continue
+            
+            stats = self.db.get_dca_stats(symbol)
+            if stats and stats['total_quantity'] > 0:
+                avg_price = stats['avg_price']
+                profit_percent = ((sell['sell_price'] - avg_price) / avg_price) * 100
+                profit_usdt = (sell['sell_price'] - avg_price) * sell['quantity']
+            else:
+                profit_percent = 0
+                profit_usdt = 0
+            
+            self.db.add_completed_sell(
+                symbol=symbol,
+                order_id=sell['order_id'],
+                quantity=sell['quantity'],
+                sell_price=sell['sell_price'],
+                profit_percent=profit_percent,
+                profit_usdt=profit_usdt
+            )
+            
+            missing_sells.append({
+                'order_id': sell['order_id'],
+                'quantity': sell['quantity'],
+                'sell_price': sell['sell_price'],
+                'amount_usdt': sell['amount_usdt'],
+                'executed_at': sell['executed_at'],
+                'profit_percent': profit_percent,
+                'profit_usdt': profit_usdt
+            })
+            
+            self.db.update_sell_order_status(sell['order_id'], 'completed')
+        
+        # Отправляем уведомления о пропущенных продажах
+        for sell in missing_sells:
+            profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
+            profit_color = "+" if sell['profit_usdt'] >= 0 else ""
+            
+            msg = (
+                f"💰 *СДЕЛКА ПРОДАНА!*\n\n"
+                f"🪙 Токен: `{symbol}`\n"
+                f"📊 Количество: `{format_quantity(sell['quantity'], 2)}`\n"
+                f"💰 Цена продажи: `{format_price(sell['sell_price'], 4)}` USDT\n"
+                f"💵 Сумма: `{sell['amount_usdt']:.2f}` USDT\n"
+                f"{profit_emoji} Прибыль: `{profit_color}{sell['profit_usdt']:.2f}` USDT (`{profit_color}{sell['profit_percent']:.2f}%`)\n"
+                f"🕐 Время: `{sell['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                f"🗑 *Статистика DCA автоматически очищена!*\n"
+                f"📊 Начинаем новый цикл накопления."
+            )
+            
+            # АВТОМАТИЧЕСКАЯ ОЧИСТКА СТАТИСТИКИ
+            deleted_count = self.db.clear_all_purchases(symbol)
+            self.db.log_action('AUTO_STATS_CLEARED', symbol, f"Автоочистка после продажи, удалено {deleted_count} покупок")
+            
+            ladder = self.db.get_ladder_settings(symbol)
+            ladder['current_drop_percent'] = 0
+            self.db.save_ladder_settings(ladder)
+            
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=msg,
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
+        
+        return {
+            'total_found': len(all_completed),
+            'already_processed': len(already_processed),
+            'missing': missing_sells
         }
     
     async def place_full_sell_order(self, update, symbol: str, profit_percent: float, auto_cancel_old: bool = True) -> Dict:
@@ -2402,6 +2462,7 @@ class FastDCABot:
     def get_tracking_settings_keyboard(self):
         current_status = self.db.get_order_execution_notify()
         sell_tracking = self.db.get_sell_tracking_enabled()
+        current_interval = self.db.get_order_check_interval()
         
         if current_status:
             tracking_button = "✅ Отслеживание ордеров Вкл"
@@ -2416,7 +2477,7 @@ class FastDCABot:
         keyboard = [
             [KeyboardButton(tracking_button)],
             [KeyboardButton(sell_tracking_button)],
-            [KeyboardButton("⏱ Изменить интервал проверки")],
+            [KeyboardButton(f"⏱ Интервал проверки Ордеров {current_interval} мин")],
             [KeyboardButton("🔍 Тест отслеживания")],
             [KeyboardButton("🔙 Назад в настройки")],
         ]
@@ -2433,7 +2494,7 @@ class FastDCABot:
         
         keyboard = [
             [KeyboardButton(status_button)],
-            [KeyboardButton("⏰ Время уведомления")],
+            [KeyboardButton(f"⏰ Время уведомления ({notify_time})")],
             [KeyboardButton("🔙 Назад в настройки")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -2507,65 +2568,6 @@ class FastDCABot:
     def get_manual_buy_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
-    async def check_and_send_version_notification(self, chat_id: int = None):
-        saved_version = get_saved_version()
-        current_version = BOT_VERSION
-        
-        if saved_version != current_version:
-            update_info = get_update_info()
-            
-            message = f"🔄 *БОТ ОБНОВЛЕН!*\n\n"
-            message += f"📌 *Новая версия:* `{current_version}`\n"
-            message += f"📅 *Предыдущая версия:* `{saved_version if saved_version else 'Новая установка'}`\n\n"
-            message += f"📋 *Что нового:*\n{update_info}\n\n"
-            message += f"✅ Бот успешно обновлен и готов к работе!"
-            
-            save_current_version()
-            logger.info(f"Bot updated from {saved_version} to {current_version}")
-            
-            if chat_id:
-                try:
-                    await self.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=message,
-                        parse_mode='Markdown'
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending version notification: {e}")
-            elif self.authorized_user_id:
-                try:
-                    await self.application.bot.send_message(
-                        chat_id=self.authorized_user_id,
-                        text=message,
-                        parse_mode='Markdown'
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending version notification: {e}")
-            
-            return True
-        return False
-    
-    async def cmd_version(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        
-        current_version = BOT_VERSION
-        saved_version = get_saved_version()
-        update_info = get_update_info()
-        
-        message = f"📌 *Информация о версии бота*\n\n"
-        message += f"🔹 *Текущая версия:* `{current_version}`\n"
-        message += f"🔹 *Сохраненная версия:* `{saved_version if saved_version else 'Не установлена'}`\n\n"
-        
-        if saved_version != current_version:
-            message += f"🔄 *Доступно обновление!*\n\n"
-            message += f"📋 *Что нового:*\n{update_info}\n\n"
-            message += f"✅ Перезапустите бота для применения обновления."
-        else:
-            message += f"✅ Бот работает на актуальной версии."
-        
-        await update.message.reply_text(message, parse_mode='Markdown')
-    
     async def _check_user_fast(self, update: Update) -> bool:
         user = update.effective_user
         username = f"@{user.username}" if user.username else f"ID:{user.id}"
@@ -2613,13 +2615,10 @@ class FastDCABot:
             return
         await self._reset_bot_state(context)
         
-        await self.check_and_send_version_notification(update.effective_chat.id)
-        
         await update.message.reply_text(
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
             f"📌 Версия: {BOT_VERSION}\n\n"
-            f"💡 Команда /version - информация о версии\n\n"
             f"Главное меню:",
             reply_markup=self.get_main_keyboard()
         )
@@ -2995,7 +2994,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return NOTIFICATION_SETTINGS_MENU
         
-        await update.message.reply_text("🔍 *Запускаю полную проверку отслеживания...*\n\nПроверяю все ордера за последние 90 дней...", parse_mode='Markdown')
+        await update.message.reply_text("🔍 *Запускаю полную проверку отслеживания...*\n\nПроверяю ордера на покупку и продажу за последние 90 дней...", parse_mode='Markdown')
         
         self._init_bybit()
         if not self.bybit_initialized:
@@ -3005,7 +3004,15 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         
         try:
-            result = await self.strategy.force_check_executed_orders(
+            # Проверяем ордера на покупку
+            buy_result = await self.strategy.force_check_executed_orders(
+                symbol, 
+                self.application.bot, 
+                self.authorized_user_id
+            )
+            
+            # Проверяем ордера на продажу
+            sell_result = await self.strategy.force_check_completed_sells(
                 symbol, 
                 self.application.bot, 
                 self.authorized_user_id
@@ -3014,27 +3021,27 @@ class FastDCABot:
             message = f"📊 *РЕЗУЛЬТАТ ПОЛНОЙ ПРОВЕРКИ*\n\n"
             message += f"🪙 Токен: `{symbol}`\n"
             message += f"📅 Проверка за последние 90 дней\n\n"
-            message += f"📋 Всего найдено ордеров: `{result['total_found']}`\n"
-            message += f"✅ Уже добавлено в статистику: `{result['already_added']}`\n"
-            message += f"❌ Отсутствуют в статистике: `{len(result['missing'])}`\n\n"
+            message += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            message += f"🟢 *ПОКУПКИ:*\n"
+            message += f"📋 Всего найдено: `{buy_result['total_found']}`\n"
+            message += f"✅ Уже в статистике: `{buy_result['already_added']}`\n"
+            message += f"❌ Отсутствуют: `{len(buy_result['missing'])}`\n"
+            message += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            message += f"🔴 *ПРОДАЖИ:*\n"
+            message += f"📋 Всего найдено: `{sell_result['total_found']}`\n"
+            message += f"✅ Уже обработано: `{sell_result['already_processed']}`\n"
+            message += f"❌ Отсутствуют: `{len(sell_result['missing'])}`\n"
+            message += f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             
-            if result['missing']:
-                message += f"*Ордера, которых нет в статистике:*\n"
-                for i, order in enumerate(result['missing'][:10], 1):
-                    message += f"{i}. Цена: {format_price(order['price'], 4)} USDT | Кол-во: {format_quantity(order['quantity'], 6)} | Сумма: {order['amount_usdt']:.2f} USDT\n"
-                    message += f"   📅 {order['executed_at'].strftime('%d.%m.%Y %H:%M')}\n"
-                if len(result['missing']) > 10:
-                    message += f"\n_...и еще {len(result['missing']) - 10} ордеров_"
-                
-                if result.get('notified_count', 0) > 0:
-                    message += f"\n\n✅ *Отправлено уведомлений: {result['notified_count']}*\n"
-                    message += f"💡 Проверьте уведомления выше и добавьте ордера в статистику!"
-                else:
-                    message += f"\n\n⚠️ *Ордера найдены, но уведомления не отправлены!*\n"
-                    message += f"💡 Проверьте настройки уведомлений."
+            if buy_result['missing'] or sell_result['missing']:
+                message += f"⚠️ *Найдены новые ордера!*\n"
+                if buy_result['missing']:
+                    message += f"🟢 Новых покупок: {len(buy_result['missing'])}\n"
+                if sell_result['missing']:
+                    message += f"🔴 Новых продаж: {len(sell_result['missing'])}\n"
+                message += f"\n✅ *Уведомления отправлены выше!*"
             else:
-                message += f"✨ *Отлично!* Все ордера уже добавлены в статистику.\n\n"
-                message += f"📌 Автоматическая проверка работает корректно."
+                message += f"✨ *Отлично!* Все ордера синхронизированы."
             
             await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_tracking_settings_keyboard())
             
@@ -4463,7 +4470,6 @@ class FastDCABot:
                 
                 current_date_str = now.strftime("%Y-%m-%d")
                 
-                # Проверяем, нужно ли отправлять уведомление сегодня
                 should_notify = False
                 notify_hour, notify_minute = map(int, notify_time_str.split(':'))
                 
@@ -4517,30 +4523,6 @@ class FastDCABot:
         asyncio.create_task(self.order_checker_loop())
         asyncio.create_task(self.sell_checker_loop())
         asyncio.create_task(self.purchase_notify_loop())
-        
-        saved_version = get_saved_version()
-        current_version = BOT_VERSION
-        
-        if saved_version != current_version:
-            update_info = get_update_info()
-            message = f"🔄 *БОТ ОБНОВЛЕН!*\n\n"
-            message += f"📌 *Новая версия:* `{current_version}`\n"
-            message += f"📅 *Предыдущая версия:* `{saved_version if saved_version else 'Новая установка'}`\n\n"
-            message += f"📋 *Что нового:*\n{update_info}\n\n"
-            message += f"✅ Бот успешно обновлен и готов к работе!"
-            
-            save_current_version()
-            logger.info(f"Bot updated from {saved_version} to {current_version}")
-            
-            if self.authorized_user_id:
-                try:
-                    await application.bot.send_message(
-                        chat_id=self.authorized_user_id,
-                        text=message,
-                        parse_mode='Markdown'
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending version notification: {e}")
         
         logger.info("Bot initialized, scheduler loops started")
     
@@ -4750,7 +4732,6 @@ class FastDCABot:
         logger.info("Setting up handlers...")
         
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
-        self.application.add_handler(CommandHandler("version", self.cmd_version))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_)'))
         
         self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.show_settings_menu))
@@ -4785,7 +4766,7 @@ class FastDCABot:
                 NOTIFICATION_SETTINGS_MENU: [
                     MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|❌ Отслеживание ордеров Выкл)$'), self.toggle_tracking),
                     MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking_in_settings),
-                    MessageHandler(filters.Regex('^(⏱ Изменить интервал проверки)$'), self.set_tracking_interval_start),
+                    MessageHandler(filters.Regex('^(⏱ Интервал проверки Ордеров \d+ мин)$'), self.set_tracking_interval_start),
                     MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
                     MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
                 ],
