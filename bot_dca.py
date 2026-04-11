@@ -2,8 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-ИСПРАВЛЕННАЯ ВЕРСИЯ - РАБОТАЮТ ВСЕ КНОПКИ
-С ОТСЛЕЖИВАНИЕМ ПРОДАННЫХ ОРДЕРОВ
+Версия 2.1 (11.04.2026)
 """
 
 import os
@@ -63,7 +62,9 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "2.0 (11.04.2026)"
+BOT_VERSION = "2.1 (11.04.2026)"
+BOT_VERSION_FILE = "bot_version.txt"
+UPDATE_INFO_FILE = "obnovlenie.txt"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -111,6 +112,37 @@ DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 MAX_DROP_DEPTH = 80
 STEP_PERCENT = 3
+
+
+def get_update_info() -> str:
+    """Читает информацию об обновлении из файла obnovlenie.txt"""
+    if os.path.exists(UPDATE_INFO_FILE):
+        try:
+            with open(UPDATE_INFO_FILE, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception as e:
+            logger.error(f"Error reading update info: {e}")
+    return ""
+
+
+def get_saved_version() -> str:
+    """Читает сохраненную версию бота"""
+    if os.path.exists(BOT_VERSION_FILE):
+        try:
+            with open(BOT_VERSION_FILE, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def save_current_version():
+    """Сохраняет текущую версию бота"""
+    try:
+        with open(BOT_VERSION_FILE, 'w', encoding='utf-8') as f:
+            f.write(BOT_VERSION)
+    except Exception as e:
+        logger.error(f"Error saving version: {e}")
 
 
 def format_price(price: float, decimals: int = 4) -> str:
@@ -1127,7 +1159,7 @@ class Database:
             
             export_data = {
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': '2.0 (11.04.2026)',
+                'version': BOT_VERSION,
                 'purchases': purchases,
                 'sell_orders': sell_orders,
                 'completed_sells': completed_sells,
@@ -2283,17 +2315,14 @@ class FastDCABot:
     def get_main_keyboard(self):
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         dca_button = "⏹ Остановить Авто DCA" if is_active else "🚀 Запустить Авто DCA"
-        order_execution = self.db.get_order_execution_notify()
-        sell_tracking = self.db.get_sell_tracking_enabled()
-        order_execution_button = "✅ Отслеживание ордеров Вкл" if order_execution else "⏳ Отслеживание ордеров Выкл"
-        sell_tracking_button = "💰 Отслеживание продаж Вкл" if sell_tracking else "⏳ Отслеживание продаж Выкл"
+        
+        # Убраны кнопки отслеживания ордеров и продаж, а также кнопка "Главное меню"
         keyboard = [
             [KeyboardButton("📊 Мой Портфель"), KeyboardButton(dca_button)],
             [KeyboardButton("💰 Ручная покупка (лимит)"), KeyboardButton("📈 Статистика DCA")],
             [KeyboardButton("➕ Добавить покупку вручную"), KeyboardButton("✏️ Редактировать покупки")],
             [KeyboardButton("⚙️ Настройки"), KeyboardButton("📋 Статус бота")],
-            [KeyboardButton("📝 Управление ордерами"), KeyboardButton(order_execution_button)],
-            [KeyboardButton(sell_tracking_button), KeyboardButton("🏠 Главное меню")],
+            [KeyboardButton("📝 Управление ордерами")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2324,7 +2353,6 @@ class FastDCABot:
             [KeyboardButton("⏱ Изменить интервал проверки")],
             [KeyboardButton("🔍 Тест отслеживания")],
             [KeyboardButton("🔙 Назад в настройки")],
-            [KeyboardButton("🏠 Главное меню")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2397,6 +2425,42 @@ class FastDCABot:
     def get_manual_buy_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
+    async def check_version_and_notify(self, update: Update = None):
+        """Проверяет версию бота и отправляет уведомление об обновлении"""
+        saved_version = get_saved_version()
+        current_version = BOT_VERSION
+        
+        if saved_version != current_version:
+            update_info = get_update_info()
+            
+            message = f"🔄 *БОТ ОБНОВЛЕН!*\n\n"
+            message += f"📌 *Новая версия:* `{current_version}`\n"
+            message += f"📅 *Предыдущая версия:* `{saved_version if saved_version else 'Новая установка'}`\n\n"
+            
+            if update_info:
+                message += f"📋 *Что нового:*\n{update_info}\n\n"
+            else:
+                message += f"📋 *Что нового:*\n• Улучшена стабильность работы\n• Исправлены мелкие ошибки\n• Оптимизирована работа с БД\n\n"
+            
+            message += f"✅ Бот успешно обновлен и готов к работе!"
+            
+            save_current_version()
+            
+            # Отправляем уведомление, если есть куда отправить
+            if update and update.effective_chat:
+                await update.message.reply_text(message, parse_mode='Markdown')
+            elif self.authorized_user_id:
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=self.authorized_user_id,
+                        text=message,
+                        parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending version notification: {e}")
+            
+            logger.info(f"Bot updated from {saved_version} to {current_version}")
+    
     async def _check_user_fast(self, update: Update) -> bool:
         user = update.effective_user
         username = f"@{user.username}" if user.username else f"ID:{user.id}"
@@ -2444,6 +2508,10 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return
         await self._reset_bot_state(context)
+        
+        # Проверяем версию и отправляем уведомление об обновлении
+        await self.check_version_and_notify(update)
+        
         await update.message.reply_text(
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
@@ -2630,7 +2698,7 @@ class FastDCABot:
             f"и предлагает добавить их в статистику.\n\n"
             f"*Полная проверка* всех ордеров за 90 дней выполняется автоматически каждый день в 19:00.",
             parse_mode='Markdown',
-            reply_markup=self.get_main_keyboard()
+            reply_markup=self.get_tracking_settings_keyboard()
         )
     
     async def toggle_sell_tracking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2648,7 +2716,7 @@ class FastDCABot:
             f"При включенной настройке бот проверяет выполненные ордера на продажу\n"
             f"каждый час и уведомляет о сделках.",
             parse_mode='Markdown',
-            reply_markup=self.get_main_keyboard()
+            reply_markup=self.get_tracking_settings_keyboard()
         )
     
     async def tracking_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3753,8 +3821,7 @@ class FastDCABot:
         menu_buttons = ["📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
                        "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
                        "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
-                       "📝 Управление ордерами", "✅ Отслеживание ордеров Вкл", "⏳ Отслеживание ордеров Выкл",
-                       "💰 Отслеживание продаж Вкл", "⏳ Отслеживание продаж Выкл", "🏠 Главное меню"]
+                       "📝 Управление ордерами", "🏠 Главное меню"]
         
         if text in menu_buttons:
             await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
@@ -3802,8 +3869,7 @@ class FastDCABot:
         menu_buttons = ["📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
                        "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
                        "✏️ Редактировать покупки", "⚙️ Настройки", "📋 Статус бота",
-                       "📝 Управление ордерами", "✅ Отслеживание ордеров Вкл", "⏳ Отслеживание ордеров Выкл",
-                       "💰 Отслеживание продаж Вкл", "⏳ Отслеживание продаж Выкл", "🏠 Главное меню"]
+                       "📝 Управление ордерами", "🏠 Главное меню"]
         
         if text in menu_buttons:
             await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
@@ -4114,7 +4180,7 @@ class FastDCABot:
         while self.scheduler_running:
             try:
                 if not self.db.get_sell_tracking_enabled():
-                    await asyncio.sleep(3600)  # Проверяем раз в час
+                    await asyncio.sleep(3600)
                     continue
                 
                 if not self.bybit_initialized:
@@ -4142,7 +4208,7 @@ class FastDCABot:
             except Exception as e:
                 logger.error(f"Sell checker error: {e}")
             
-            await asyncio.sleep(3600)  # Проверяем раз в час
+            await asyncio.sleep(3600)
     
     async def order_checker_loop(self):
         logger.info("Order checker loop started")
@@ -4193,6 +4259,38 @@ class FastDCABot:
         asyncio.create_task(self.dca_scheduler_loop())
         asyncio.create_task(self.order_checker_loop())
         asyncio.create_task(self.sell_checker_loop())
+        
+        # Проверяем версию при запуске (без update, так как нет контекста)
+        saved_version = get_saved_version()
+        current_version = BOT_VERSION
+        
+        if saved_version != current_version:
+            update_info = get_update_info()
+            message = f"🔄 *БОТ ОБНОВЛЕН!*\n\n"
+            message += f"📌 *Новая версия:* `{current_version}`\n"
+            message += f"📅 *Предыдущая версия:* `{saved_version if saved_version else 'Новая установка'}`\n\n"
+            
+            if update_info:
+                message += f"📋 *Что нового:*\n{update_info}\n\n"
+            else:
+                message += f"📋 *Что нового:*\n• Улучшена стабильность работы\n• Исправлены мелкие ошибки\n• Оптимизирована работа с БД\n\n"
+            
+            message += f"✅ Бот успешно обновлен и готов к работе!"
+            
+            save_current_version()
+            logger.info(f"Bot updated from {saved_version} to {current_version}")
+            
+            # Отправляем уведомление админу
+            if self.authorized_user_id:
+                try:
+                    await application.bot.send_message(
+                        chat_id=self.authorized_user_id,
+                        text=message,
+                        parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending version notification: {e}")
+        
         logger.info("Bot initialized, scheduler loops started")
     
     async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4212,7 +4310,13 @@ class FastDCABot:
             await self.confirm_clear_stats(update, context, symbol)
         elif data.startswith("skip_clear_"):
             symbol = data.replace("skip_clear_", "")
-            await update.callback_query.edit_message_text(f"⏭ Очистка статистики для {symbol} отложена.")
+            await query.edit_message_text(f"⏭ Очистка статистики для {symbol} отложена.")
+        elif data.startswith("do_clear_"):
+            symbol = data.replace("do_clear_", "")
+            await self.clear_stats(update, context, symbol)
+        elif data.startswith("cancel_clear_"):
+            symbol = data.replace("cancel_clear_", "")
+            await query.edit_message_text(f"❌ Очистка статистики для {symbol} отменена.")
     
     async def confirm_clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
         """Подтверждение очистки статистики"""
@@ -4408,8 +4512,7 @@ class FastDCABot:
         
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
         
-        # Кнопки управления отслеживанием продаж в главном меню
-        self.application.add_handler(MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking))
+        # Кнопки управления отслеживанием продаж в главном меню - УБРАНЫ
         
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
@@ -4420,7 +4523,6 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(⏱ Изменить интервал проверки)$'), self.set_tracking_interval_start),
                     MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
                     MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
-                    MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
                 ],
                 WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_tracking_interval_done)],
             },
@@ -4556,7 +4658,7 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
         self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
-        self.application.add_handler(MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main))
+        self.application.add_handler(MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking))
         
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
