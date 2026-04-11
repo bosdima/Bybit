@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 2.8 (11.04.2026)
-ИСПРАВЛЕНО: ПОРЯДОК ВЫВОДА ИНФОРМАЦИИ, ФИКС КНОПКИ ОЧИСТКИ
+Версия 3.0 (11.04.2026)
+НОВАЯ ВЕРСИЯ: РАСЧЕТ ОТ СРЕДНЕЙ ЦЕНЫ
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "2.8 (11.04.2026)"
+BOT_VERSION = "3.0 (11.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -146,11 +146,12 @@ def round_quantity_for_sell(quantity: float) -> float:
     return math.floor(quantity * 100) / 100
 
 
-def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
+def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) -> Tuple[int, float]:
+    """Рассчитывает уровень и коэффициент мартингейла от процента падения"""
     if drop_percent <= 0:
         return 0, 0
     level = int(drop_percent / STEP_PERCENT)
-    max_level = int(MAX_DROP_DEPTH / STEP_PERCENT)
+    max_level = int(max_depth / STEP_PERCENT)
     if level > max_level:
         level = max_level
     
@@ -163,11 +164,12 @@ def get_ladder_levels(drop_percent: float) -> Tuple[int, float]:
     return level, ratio
 
 
-def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float) -> float:
+def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
+    """Рассчитывает сумму покупки в зависимости от падения"""
     if drop_percent <= 0:
         return base_amount
     
-    level, ratio = get_ladder_levels(drop_percent)
+    level, ratio = get_ladder_levels(drop_percent, max_depth)
     
     if ratio >= 3:
         amount = max_amount
@@ -177,6 +179,19 @@ def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: floa
         amount = base_amount + (max_amount - base_amount) * (ratio / 3)
     
     return min(amount, max_amount)
+
+
+def calculate_current_drop(current_price: float, avg_price: float) -> float:
+    """Рассчитывает текущее падение от средней цены"""
+    if avg_price <= 0:
+        return 0
+    drop = ((avg_price - current_price) / avg_price) * 100
+    return max(0, drop)
+
+
+def get_recommended_purchase_amount(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
+    """Получает рекомендованную сумму покупки"""
+    return get_amount_by_drop(drop_percent, base_amount, max_amount, max_depth)
 
 
 class Database:
@@ -273,13 +288,10 @@ class Database:
                 CREATE TABLE IF NOT EXISTS ladder_settings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
-                    start_price REAL NOT NULL,
                     step_percent REAL NOT NULL,
                     max_depth REAL NOT NULL,
                     base_amount REAL NOT NULL,
                     max_amount REAL NOT NULL,
-                    current_drop_percent REAL DEFAULT 0,
-                    last_buy_price REAL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -335,7 +347,6 @@ class Database:
                 ('ladder_step_percent', '3'),
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '3.3'),
-                ('ladder_start_price', '0'),
                 ('order_execution_notify', 'true'),
                 ('order_check_interval_minutes', '60'),
                 ('sell_tracking_enabled', 'true'),
@@ -345,6 +356,7 @@ class Database:
                 ('last_full_check_time', ''),
                 ('last_sell_check_time', ''),
                 ('last_purchase_notify_date', ''),
+                ('first_order_date', ''),
             ]
             
             for key, value in defaults:
@@ -387,6 +399,34 @@ class Database:
         except Exception as e:
             logger.error(f"Error setting {key}: {e}")
     
+    def get_first_order_date(self) -> Optional[datetime]:
+        """Получает дату первого ордера в статистике"""
+        date_str = self.get_setting('first_order_date', '')
+        if date_str:
+            try:
+                return datetime.fromisoformat(date_str)
+            except:
+                return None
+        return None
+    
+    def set_first_order_date(self, date: datetime):
+        """Устанавливает дату первого ордера"""
+        self.set_setting('first_order_date', date.isoformat())
+    
+    def update_first_order_date(self):
+        """Обновляет дату первого ордера из покупок"""
+        purchases = self.get_purchases()
+        if purchases:
+            first_purchase = min(purchases, key=lambda x: x['date'])
+            try:
+                first_date = datetime.strptime(first_purchase['date'], "%Y-%m-%d %H:%M:%S")
+                self.set_first_order_date(first_date)
+                logger.info(f"First order date updated to {first_date}")
+            except Exception as e:
+                logger.error(f"Error updating first order date: {e}")
+        else:
+            self.set_setting('first_order_date', '')
+    
     def add_purchase(self, symbol: str, amount_usdt: float, price: float, 
                      quantity: float, multiplier: float = 1.0, drop_percent: float = 0,
                      step_level: int = 0, date: str = None):
@@ -403,6 +443,10 @@ class Database:
             purchase_id = cursor.lastrowid
             conn.commit()
             conn.close()
+            
+            # Обновляем дату первого ордера
+            self.update_first_order_date()
+            
             return purchase_id
         except Exception as e:
             logger.error(f"Error adding purchase: {e}")
@@ -456,6 +500,11 @@ class Database:
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
+            
+            # Обновляем дату первого ордера
+            if success:
+                self.update_first_order_date()
+            
             return success
         except Exception as e:
             logger.error(f"Error updating purchase {purchase_id}: {e}")
@@ -475,6 +524,10 @@ class Database:
             if success and purchase:
                 self.reset_executed_order_status(purchase['price'], purchase['quantity'], purchase['symbol'])
                 logger.info(f"Reset executed order status for purchase {purchase_id}: price={purchase['price']}, qty={purchase['quantity']}")
+            
+            # Обновляем дату первого ордера
+            if success:
+                self.update_first_order_date()
             
             return success
         except Exception as e:
@@ -517,13 +570,6 @@ class Database:
             'total_quantity': total_qty,
             'avg_price': avg_price,
         }
-    
-    def get_highest_price(self, symbol: str) -> float:
-        purchases = self.get_purchases(symbol)
-        if not purchases:
-            return 0
-        highest_price = max(p['price'] for p in purchases)
-        return highest_price
     
     def add_sell_order(self, symbol: str, order_id: str, quantity: float, 
                        target_price: float, profit_percent: float):
@@ -657,6 +703,10 @@ class Database:
             conn.commit()
             conn.close()
             logger.info(f"Deleted {deleted_count} purchases for {symbol}")
+            
+            # Обновляем дату первого ордера
+            self.update_first_order_date()
+            
             return deleted_count
         except Exception as e:
             logger.error(f"Error clearing purchases: {e}")
@@ -736,25 +786,19 @@ class Database:
             else:
                 return {
                     'symbol': symbol,
-                    'start_price': float(self.get_setting('ladder_start_price', '0')),
                     'step_percent': float(self.get_setting('ladder_step_percent', '3')),
                     'max_depth': float(self.get_setting('ladder_max_depth', '80')),
                     'base_amount': float(self.get_setting('ladder_base_amount', '1.1')),
                     'max_amount': float(self.get_setting('ladder_max_amount', '3.3')),
-                    'current_drop_percent': 0,
-                    'last_buy_price': float(self.get_setting('ladder_start_price', '0')) if float(self.get_setting('ladder_start_price', '0')) > 0 else None
                 }
         except Exception as e:
             logger.error(f"Error getting ladder settings: {e}")
             return {
                 'symbol': symbol,
-                'start_price': 0,
                 'step_percent': 3,
                 'max_depth': 80,
                 'base_amount': 1.1,
                 'max_amount': 3.3,
-                'current_drop_percent': 0,
-                'last_buy_price': None
             }
     
     def save_ladder_settings(self, settings: Dict):
@@ -764,22 +808,18 @@ class Database:
             cursor.execute('DELETE FROM ladder_settings WHERE symbol = ?', (settings['symbol'],))
             cursor.execute('''
                 INSERT INTO ladder_settings 
-                (symbol, start_price, step_percent, max_depth, base_amount, max_amount, current_drop_percent, last_buy_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (symbol, step_percent, max_depth, base_amount, max_amount)
+                VALUES (?, ?, ?, ?, ?)
             ''', (
                 settings['symbol'],
-                settings['start_price'],
                 settings['step_percent'],
                 settings['max_depth'],
                 settings['base_amount'],
                 settings['max_amount'],
-                settings.get('current_drop_percent', 0),
-                settings.get('last_buy_price', None)
             ))
             conn.commit()
             conn.close()
             
-            self.set_setting('ladder_start_price', str(settings['start_price']))
             self.set_setting('ladder_step_percent', str(settings['step_percent']))
             self.set_setting('ladder_max_depth', str(settings['max_depth']))
             self.set_setting('ladder_base_amount', str(settings['base_amount']))
@@ -788,30 +828,32 @@ class Database:
             logger.error(f"Error saving ladder settings: {e}")
     
     def calculate_ladder_purchase(self, current_price: float, symbol: str = None) -> Dict:
+        """Рассчитывает необходимость покупки на основе средней цены"""
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
         
-        settings = self.get_ladder_settings(symbol)
-        
-        if settings['start_price'] <= 0:
+        stats = self.get_dca_stats(symbol)
+        if not stats or stats['total_quantity'] <= 0:
             return {
-                'should_buy': False,
+                'should_buy': True,
                 'step_level': 0,
-                'amount_usdt': 0,
-                'target_price': 0,
-                'reason': 'Не задана начальная цена лестницы'
+                'amount_usdt': self.get_ladder_settings(symbol)['base_amount'],
+                'target_price': current_price,
+                'drop_percent': 0,
+                'reason': 'Первая покупка'
             }
         
+        settings = self.get_ladder_settings(symbol)
+        avg_price = stats['avg_price']
+        current_drop = calculate_current_drop(current_price, avg_price)
+        
         purchases = self.get_purchases(symbol)
-        last_purchases = sorted([p for p in purchases if p.get('step_level', 0) > 0], key=lambda x: x['date'], reverse=True)
+        last_purchases = sorted([p for p in purchases if p.get('drop_percent', 0) > 0], key=lambda x: x['date'], reverse=True)
         
         max_drop = 0
-        
         for p in last_purchases:
             if p.get('drop_percent', 0) > max_drop:
                 max_drop = p.get('drop_percent', 0)
-        
-        current_drop = ((settings['start_price'] - current_price) / settings['start_price']) * 100
         
         step_percent = settings['step_percent']
         next_level = int((max_drop + step_percent) / step_percent) * step_percent
@@ -820,24 +862,12 @@ class Database:
             next_level = step_percent
         
         if current_drop >= next_level and next_level > max_drop:
-            level, ratio = get_ladder_levels(next_level)
-            
-            base_amount = settings['base_amount']
-            max_amount = settings['max_amount']
-            
-            if ratio >= 3:
-                amount_usdt = max_amount
-            elif ratio <= 0:
-                amount_usdt = base_amount
-            else:
-                amount_usdt = base_amount + (max_amount - base_amount) * (ratio / 3)
-            
-            amount_usdt = min(amount_usdt, max_amount)
+            amount_usdt = get_recommended_purchase_amount(next_level, settings['base_amount'], settings['max_amount'], settings['max_depth'])
             
             if next_level > settings['max_depth']:
                 return {
                     'should_buy': False,
-                    'step_level': level,
+                    'step_level': int(next_level / step_percent),
                     'amount_usdt': amount_usdt,
                     'target_price': current_price,
                     'reason': f'Достигнута максимальная глубина ({settings["max_depth"]}%)'
@@ -845,14 +875,15 @@ class Database:
             
             return {
                 'should_buy': True,
-                'step_level': level,
+                'step_level': int(next_level / step_percent),
                 'amount_usdt': amount_usdt,
                 'target_price': current_price,
                 'drop_percent': next_level,
-                'reason': f'Падение {next_level:.1f}%, коэффициент {ratio:.2f}'
+                'current_drop': current_drop,
+                'reason': f'Падение {next_level:.1f}% от средней цены'
             }
         
-        next_price = settings['start_price'] * (1 - next_level / 100)
+        next_price = avg_price * (1 - next_level / 100)
         
         return {
             'should_buy': False,
@@ -861,33 +892,46 @@ class Database:
             'target_price': next_price,
             'current_drop': current_drop,
             'next_drop': next_level,
-            'reason': f'Ждем падения до {next_level:.1f}% ({format_price(next_price)})'
+            'reason': f'Ждем падения до {next_level:.1f}% ({format_price(next_price)}) от средней цены {format_price(avg_price)}'
         }
     
-    def get_recommendation_for_current_drop(self, drop_percent: float, symbol: str = None) -> Dict:
+    def get_recommendation_for_current_drop(self, current_price: float, symbol: str = None) -> Dict:
+        """Получает рекомендацию для ручного добавления покупки"""
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
         
+        stats = self.get_dca_stats(symbol)
         settings = self.get_ladder_settings(symbol)
         
-        if settings['start_price'] <= 0:
+        if not stats or stats['total_quantity'] <= 0:
             return {
-                'success': False,
-                'error': 'Не задана начальная цена лестницы'
+                'success': True,
+                'drop_percent': 0,
+                'ratio': 0,
+                'amount_usdt': settings['base_amount'],
+                'level': 0,
+                'avg_price': 0,
+                'is_first': True
             }
+        
+        avg_price = stats['avg_price']
+        drop_percent = calculate_current_drop(current_price, avg_price)
         
         step_percent = settings['step_percent']
         level_drop = int(drop_percent / step_percent) * step_percent
         
-        amount = get_amount_by_drop(level_drop, settings['base_amount'], settings['max_amount'])
-        level, ratio = get_ladder_levels(level_drop)
+        amount = get_recommended_purchase_amount(level_drop, settings['base_amount'], settings['max_amount'], settings['max_depth'])
+        level, ratio = get_ladder_levels(level_drop, settings['max_depth'])
         
         return {
             'success': True,
             'drop_percent': level_drop,
             'ratio': ratio,
             'amount_usdt': amount,
-            'level': level
+            'level': level,
+            'avg_price': avg_price,
+            'current_drop': drop_percent,
+            'is_first': False
         }
     
     def get_ladder_summary(self, symbol: str = None, current_price: float = None) -> Dict:
@@ -895,6 +939,9 @@ class Database:
             symbol = self.get_setting('symbol', 'TONUSDT')
         
         settings = self.get_ladder_settings(symbol)
+        stats = self.get_dca_stats(symbol)
+        avg_price = stats['avg_price'] if stats else 0
+        
         purchases = self.get_purchases(symbol)
         
         levels = {}
@@ -911,33 +958,26 @@ class Database:
         
         for i in range(max_level + 1):
             drop_percent = i * settings['step_percent']
-            level, ratio = get_ladder_levels(drop_percent)
+            level, ratio = get_ladder_levels(drop_percent, settings['max_depth'])
             
-            base_amount = settings['base_amount']
-            max_amount = settings['max_amount']
-            if ratio >= 3:
-                amount = max_amount
-            elif ratio <= 0:
-                amount = base_amount
-            else:
-                amount = base_amount + (max_amount - base_amount) * (ratio / 3)
+            amount = get_recommended_purchase_amount(drop_percent, settings['base_amount'], settings['max_amount'], settings['max_depth'])
             
             if i in levels:
                 step_purchases = levels[i]
                 total_amount = sum(p['amount_usdt'] for p in step_purchases)
                 total_qty = sum(p['quantity'] for p in step_purchases)
-                avg_price = total_amount / total_qty if total_qty > 0 else 0
+                step_avg_price = total_amount / total_qty if total_qty > 0 else 0
                 steps.append({
                     'step': i + 1,
                     'drop_percent': drop_percent,
                     'ratio': ratio,
-                    'price': avg_price,
+                    'price': step_avg_price,
                     'amount': amount,
                     'quantity': total_qty,
                     'status': 'completed'
                 })
             else:
-                target_price = settings['start_price'] * (1 - drop_percent / 100)
+                target_price = avg_price * (1 - drop_percent / 100) if avg_price > 0 else 0
                 steps.append({
                     'step': i + 1,
                     'drop_percent': drop_percent,
@@ -952,13 +992,12 @@ class Database:
         current_step = int(max_purchase_drop / settings['step_percent']) if max_purchase_drop > 0 else 0
         
         current_drop = 0
-        if current_price and settings['start_price'] > 0:
-            current_drop = ((settings['start_price'] - current_price) / settings['start_price']) * 100
-            current_drop = max(0, current_drop)
+        if current_price and avg_price > 0:
+            current_drop = calculate_current_drop(current_price, avg_price)
         
         return {
             'symbol': symbol,
-            'start_price': settings['start_price'],
+            'avg_price': avg_price,
             'step_percent': settings['step_percent'],
             'max_depth': settings['max_depth'],
             'base_amount': settings['base_amount'],
@@ -970,24 +1009,20 @@ class Database:
         }
     
     def reset_ladder(self, symbol: str = None):
+        """Сброс лестницы (очищает статистику)"""
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
-        settings = self.get_ladder_settings(symbol)
-        settings['current_drop_percent'] = 0
-        settings['last_buy_price'] = settings['start_price']
-        self.save_ladder_settings(settings)
+        self.clear_all_purchases(symbol)
     
-    def get_drop_percent_from_start_price(self, price: float, symbol: str = None) -> float:
-        if symbol is None:
-            symbol = self.get_setting('symbol', 'TONUSDT')
-        
-        settings = self.get_ladder_settings(symbol)
-        
-        if settings['start_price'] <= 0:
-            return 0
-        
-        drop_percent = ((settings['start_price'] - price) / settings['start_price']) * 100
-        return max(0, drop_percent)
+    def log_action(self, action: str, symbol: str = None, details: str = None):
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO history (action, symbol, details) VALUES (?, ?, ?)', (action, symbol, details))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error logging action: {e}")
     
     def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float, executed_at: str = None) -> bool:
         try:
@@ -1121,14 +1156,11 @@ class Database:
                 ladder_settings.append({
                     'id': row[0],
                     'symbol': row[1],
-                    'start_price': row[2],
-                    'step_percent': row[3],
-                    'max_depth': row[4],
-                    'base_amount': row[5],
-                    'max_amount': row[6],
-                    'current_drop_percent': row[7],
-                    'last_buy_price': row[8],
-                    'created_at': row[9]
+                    'step_percent': row[2],
+                    'max_depth': row[3],
+                    'base_amount': row[4],
+                    'max_amount': row[5],
+                    'created_at': row[6]
                 })
             
             cursor.execute('SELECT * FROM executed_orders')
@@ -1306,18 +1338,15 @@ class Database:
                 try:
                     cursor.execute('''
                         INSERT OR REPLACE INTO ladder_settings 
-                        (id, symbol, start_price, step_percent, max_depth, base_amount, max_amount, current_drop_percent, last_buy_price, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, symbol, step_percent, max_depth, base_amount, max_amount, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         ladder.get('id'),
                         ladder.get('symbol', 'TONUSDT'),
-                        ladder.get('start_price', 0),
                         ladder.get('step_percent', 3),
                         ladder.get('max_depth', 80),
                         ladder.get('base_amount', 1.1),
                         ladder.get('max_amount', 3.3),
-                        ladder.get('current_drop_percent', 0),
-                        ladder.get('last_buy_price'),
                         ladder.get('created_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     ))
                 except Exception as e:
@@ -1350,6 +1379,10 @@ class Database:
             
             conn.commit()
             conn.close()
+            
+            # Обновляем дату первого ордера
+            self.update_first_order_date()
+            
             return True, f"Импортировано: {purchases_imported} покупок, {orders_imported} ордеров"
         except Exception as e:
             logger.error(f"Error importing database: {e}")
@@ -1480,9 +1513,10 @@ class BybitClient:
             logger.error(f"Error getting order history: {e}")
             return []
     
-    async def get_all_executed_orders(self, symbol: str, days: int = 90) -> List[Dict]:
+    async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
+        """Получает исполненные ордера на покупку с указанной даты"""
         try:
-            check_date = datetime.now() - timedelta(days=days)
+            check_date = from_date if from_date else datetime.now() - timedelta(days=90)
             orders = await self.get_order_history(symbol, limit=500)
             executed = []
             
@@ -1533,14 +1567,14 @@ class BybitClient:
             logger.error(f"Error getting executed orders: {e}")
             return []
     
-    async def get_completed_sell_orders(self, symbol: str = None, hours: int = 72) -> List[Dict]:
-        """Получает выполненные ордера на продажу за последние N часов"""
+    async def get_completed_sell_orders(self, symbol: str = None, from_date: datetime = None) -> List[Dict]:
+        """Получает выполненные ордера на продажу с указанной даты"""
         try:
-            check_time = datetime.now() - timedelta(hours=hours)
+            check_date = from_date if from_date else datetime.now() - timedelta(days=90)
             orders = await self.get_order_history(symbol, limit=500)
             completed = []
             
-            logger.info(f"Searching for completed sell orders since {check_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"Searching for completed sell orders since {check_date.strftime('%Y-%m-%d %H:%M:%S')}")
             
             for order in orders:
                 order_status = order.get('orderStatus', '')
@@ -1553,7 +1587,7 @@ class BybitClient:
                             created_time_ms = int(created_time_str)
                             created_time = datetime.fromtimestamp(created_time_ms / 1000)
                             
-                            if created_time > check_time:
+                            if created_time >= check_date:
                                 avg_price = float(order.get('avgPrice', 0))
                                 if avg_price == 0:
                                     avg_price = float(order.get('price', 0))
@@ -1757,16 +1791,17 @@ class DCAStrategy:
     async def check_completed_sells(self, symbol: str, user_id: int, bot) -> List[Dict]:
         """Проверяет выполненные ордера на продажу и уведомляет о них с запросом подтверждения"""
         last_check = self.db.get_last_sell_check_time()
+        first_order_date = self.db.get_first_order_date()
         
-        if last_check is None:
-            last_check = datetime.now() - timedelta(hours=72)
+        if first_order_date is None:
+            first_order_date = datetime.now() - timedelta(days=30)
         
-        hours_to_check = max(1, int((datetime.now() - last_check).total_seconds() / 3600) + 1)
-        hours_to_check = min(hours_to_check, 96)
+        check_date = last_check if last_check and last_check > first_order_date else first_order_date
+        check_date = check_date - timedelta(hours=24)
         
-        logger.info(f"Checking completed sells since {last_check.strftime('%Y-%m-%d %H:%M:%S')} (looking back {hours_to_check} hours)")
+        logger.info(f"Checking completed sells since {check_date.strftime('%Y-%m-%d %H:%M:%S')} (first order: {first_order_date.strftime('%Y-%m-%d') if first_order_date else 'None'})")
         
-        all_completed = await self.bybit.get_completed_sell_orders(symbol, hours=hours_to_check)
+        all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
         
         self.db.set_last_sell_check_time(datetime.now())
         
@@ -1818,7 +1853,6 @@ class DCAStrategy:
             
             self.db.update_sell_order_status(sell['order_id'], 'completed')
         
-        # Отправляем уведомления о новых продажах с запросом подтверждения
         for sell in new_completed:
             profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
             profit_color = "+" if sell['profit_usdt'] >= 0 else ""
@@ -1866,11 +1900,11 @@ class DCAStrategy:
             return {'success': True, 'should_buy': True, 'amount_usdt': ladder_info['amount_usdt'],
                    'step_level': ladder_info['step_level'], 'target_price': ladder_info['target_price'],
                    'drop_percent': ladder_info.get('drop_percent', 0), 'reason': ladder_info['reason'], 
-                   'current_price': current_price}
+                   'current_price': current_price, 'current_drop': ladder_info.get('current_drop', 0)}
         else:
             return {'success': True, 'should_buy': False, 'reason': ladder_info['reason'],
                    'current_price': current_price, 'next_buy_price': ladder_info['target_price'],
-                   'next_drop': ladder_info.get('next_drop', 0)}
+                   'next_drop': ladder_info.get('next_drop', 0), 'current_drop': ladder_info.get('current_drop', 0)}
     
     def calculate_target_info(self, stats: Dict, profit_percent: float) -> Dict:
         if not stats or stats['total_quantity'] <= 0:
@@ -1894,13 +1928,16 @@ class DCAStrategy:
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
         last_check = self.db.get_last_incremental_check_time()
+        first_order_date = self.db.get_first_order_date()
         
-        if last_check is None:
-            last_check = datetime.now() - timedelta(hours=24)
+        if first_order_date is None:
+            first_order_date = datetime.now() - timedelta(days=30)
         
-        logger.info(f"Incremental check for new orders since {last_check.strftime('%Y-%m-%d %H:%M:%S')}")
+        check_date = last_check if last_check and last_check > first_order_date else first_order_date
         
-        all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
+        logger.info(f"Incremental check for new orders since {check_date.strftime('%Y-%m-%d %H:%M:%S')} (first order: {first_order_date.strftime('%Y-%m-%d') if first_order_date else 'None'})")
+        
+        all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         
         self.db.set_last_incremental_check_time(datetime.now())
         
@@ -1948,7 +1985,7 @@ class DCAStrategy:
                 self.db.mark_order_as_added(order['order_id'])
                 continue
             
-            if order['executed_at'] > last_check:
+            if order['executed_at'] > check_date:
                 self.db.add_executed_order(
                     order['order_id'],
                     symbol,
@@ -1992,9 +2029,16 @@ class DCAStrategy:
         return new_orders
     
     async def full_check_missing_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        logger.info(f"Performing full check for missing orders for {symbol}")
+        first_order_date = self.db.get_first_order_date()
         
-        all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
+        if first_order_date is None:
+            first_order_date = datetime.now() - timedelta(days=90)
+        
+        check_date = first_order_date - timedelta(days=1)
+        
+        logger.info(f"Performing full check for missing orders for {symbol} since {check_date.strftime('%Y-%m-%d')}")
+        
+        all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         logger.info(f"Found {len(all_orders)} total executed orders from exchange")
         
         purchases = self.db.get_purchases(symbol)
@@ -2121,10 +2165,17 @@ class DCAStrategy:
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
     
     async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
-        """Принудительная полная проверка всех ордеров за 90 дней"""
-        logger.info(f"Force checking all executed orders for {symbol} (last 90 days)")
+        """Принудительная полная проверка всех ордеров с даты первого ордера"""
+        first_order_date = self.db.get_first_order_date()
         
-        all_orders = await self.bybit.get_all_executed_orders(symbol, days=90)
+        if first_order_date is None:
+            first_order_date = datetime.now() - timedelta(days=90)
+        
+        check_date = first_order_date - timedelta(days=1)
+        
+        logger.info(f"Force checking all executed orders for {symbol} since {check_date.strftime('%Y-%m-%d')} (first order: {first_order_date.strftime('%Y-%m-%d') if first_order_date else 'None'})")
+        
+        all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         logger.info(f"Total orders found: {len(all_orders)}")
         
         purchases = self.db.get_purchases(symbol)
@@ -2236,18 +2287,23 @@ class DCAStrategy:
             'total_found': len(all_orders),
             'already_added': len(already_added),
             'missing': missing_orders,
-            'check_date': datetime.now() - timedelta(days=90),
+            'check_date': check_date,
             'notified_count': notified_count
         }
     
     async def force_check_completed_sells(self, symbol: str, bot, user_id: int) -> Dict:
-        """Принудительная полная проверка всех продаж за последние 90 дней"""
-        logger.info(f"Force checking all completed sell orders for {symbol} (last 90 days)")
+        """Принудительная полная проверка всех продаж с даты первого ордера"""
+        first_order_date = self.db.get_first_order_date()
         
-        all_completed = await self.bybit.get_completed_sell_orders(symbol, hours=2160)  # 90 дней
+        if first_order_date is None:
+            first_order_date = datetime.now() - timedelta(days=90)
+        
+        check_date = first_order_date - timedelta(days=1)
+        
+        logger.info(f"Force checking all completed sell orders for {symbol} since {check_date.strftime('%Y-%m-%d')}")
+        
+        all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
         logger.info(f"Total completed sells found: {len(all_completed)}")
-        
-        purchases = self.db.get_purchases(symbol)
         
         already_processed = self.db.get_completed_sells_not_notified(symbol)
         processed_order_ids = set([s['order_id'] for s in already_processed])
@@ -2297,7 +2353,6 @@ class DCAStrategy:
             
             self.db.update_sell_order_status(sell['order_id'], 'completed')
         
-        # Отправляем уведомления о пропущенных продажах с запросом подтверждения
         for sell in missing_sells:
             profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
             profit_color = "+" if sell['profit_usdt'] >= 0 else ""
@@ -2334,7 +2389,8 @@ class DCAStrategy:
         return {
             'total_found': len(all_completed),
             'already_processed': len(already_processed),
-            'missing': missing_sells
+            'missing': missing_sells,
+            'check_date': check_date
         }
     
     async def place_full_sell_order(self, update, symbol: str, profit_percent: float, auto_cancel_old: bool = True) -> Dict:
@@ -2522,10 +2578,10 @@ class FastDCABot:
     
     def get_ladder_settings_keyboard(self):
         keyboard = [
-            [KeyboardButton("💰 Цена старта"), KeyboardButton("📊 Шаг падения (%)")],
-            [KeyboardButton("📉 Глубина просадки (%)"), KeyboardButton("💵 Базовая сумма")],
-            [KeyboardButton("💰 Максимальная сумма"), KeyboardButton("📋 Текущие настройки")],
-            [KeyboardButton("🔄 Сбросить лестницу"), KeyboardButton("🔙 Назад в меню")],
+            [KeyboardButton("📊 Шаг падения (%)"), KeyboardButton("📉 Глубина просадки (%)")],
+            [KeyboardButton("💵 Базовая сумма"), KeyboardButton("💰 Максимальная сумма")],
+            [KeyboardButton("📋 Текущие настройки"), KeyboardButton("🔄 Сбросить лестницу")],
+            [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2995,7 +3051,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return NOTIFICATION_SETTINGS_MENU
         
-        await update.message.reply_text("🔍 *Запускаю полную проверку отслеживания...*\n\nПроверяю ордера на покупку и продажу за последние 90 дней...", parse_mode='Markdown')
+        await update.message.reply_text("🔍 *Запускаю полную проверку отслеживания...*\n\nПроверяю ордера на покупку и продажу...", parse_mode='Markdown')
         
         self._init_bybit()
         if not self.bybit_initialized:
@@ -3003,6 +3059,19 @@ class FastDCABot:
             return NOTIFICATION_SETTINGS_MENU
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
+        first_order_date = self.db.get_first_order_date()
+        
+        if first_order_date:
+            check_date_str = first_order_date.strftime('%d.%m.%Y')
+        else:
+            check_date_str = "начала торгов"
+        
+        await update.message.reply_text(
+            f"🔍 *Запускаю полную проверку отслеживания...*\n\n"
+            f"📅 Проверка с даты первого ордера: `{check_date_str}`\n\n"
+            f"Проверяю ордера на покупку и продажу...",
+            parse_mode='Markdown'
+        )
         
         # Сначала проверяем продажи
         sell_result = await self.strategy.force_check_completed_sells(
@@ -3021,7 +3090,7 @@ class FastDCABot:
         # Формируем итоговое сообщение
         message = f"📊 *РЕЗУЛЬТАТ ПОЛНОЙ ПРОВЕРКИ*\n\n"
         message += f"🪙 Токен: `{symbol}`\n"
-        message += f"📅 Проверка за последние 90 дней\n\n"
+        message += f"📅 Проверка с даты первого ордера: `{check_date_str}`\n\n"
         message += f"━━━━━━━━━━━━━━━━━━━━━━\n"
         message += f"🟢 *ПОКУПКИ:*\n"
         message += f"📋 Всего найдено: `{buy_result['total_found']}`\n"
@@ -3379,8 +3448,10 @@ class FastDCABot:
             text += f"📈 Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
             
             if current_price:
+                current_drop = calculate_current_drop(current_price, avg_price)
                 text += f"\n📊 *ТЕКУЩАЯ СИТУАЦИЯ*\n"
                 text += f"📉 Текущая цена: `{format_price(current_price, 4)}` USDT\n"
+                text += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n"
                 text += f"💰 Текущая стоимость: `{current_value:.2f}` USDT\n"
                 emoji = "📈" if pnl >= 0 else "📉"
                 text += f"{emoji} Текущий PnL: `{pnl:.2f}` USDT ({pnl_percent:+.2f}%)\n"
@@ -3399,10 +3470,10 @@ class FastDCABot:
                     text += f"Нужен рост: `{increase_needed:+.2f}%` от текущей цены"
             
             ladder_settings = self.db.get_ladder_settings(symbol)
-            if ladder_settings['start_price'] > 0:
+            if ladder_settings:
                 text += f"\n\n🪜 *ЛЕСТНИЦА*\n"
-                text += f"Стартовая цена: `{format_price(ladder_settings['start_price'], 4)}` USDT\n"
                 text += f"Шаг падения: `{ladder_settings['step_percent']}%`\n"
+                text += f"Глубина просадки: `{ladder_settings['max_depth']}%`\n"
                 text += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
                 text += f"Максимальная сумма: `{ladder_settings['max_amount']}` USDT"
             
@@ -3427,6 +3498,7 @@ class FastDCABot:
         purchase_notify_time = self.db.get_purchase_notify_time()
         order_interval = self.db.get_order_check_interval()
         last_full_check = self.db.get_last_full_check_time()
+        first_order_date = self.db.get_first_order_date()
         
         message = f"📋 *Статус бота*\n\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
@@ -3437,10 +3509,13 @@ class FastDCABot:
         message += f"💰 Отслеживание продаж: {'✅ Вкл' if sell_tracking else '⏹ Выкл'}\n"
         message += f"🔔 Уведомления о покупке: {'✅ Вкл' if purchase_notify else '⏹ Выкл'} ({purchase_notify_time})\n"
         message += f"🕐 Интервал проверки: `{order_interval}` мин\n"
+        if first_order_date:
+            message += f"📅 Первый ордер: `{first_order_date.strftime('%d.%m.%Y %H:%M')}`\n"
         if last_full_check:
             message += f"📅 Последняя полная проверка: `{last_full_check.strftime('%d.%m.%Y %H:%M')}`\n"
         message += f"\n🪜 *Лестница:*\n"
-        message += f"Стартовая цена: `{format_price(ladder_settings['start_price'], 4)}` USDT\n"
+        message += f"Шаг падения: `{ladder_settings['step_percent']}%`\n"
+        message += f"Глубина просадки: `{ladder_settings['max_depth']}%`\n"
         message += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
         message += f"Макс. сумма: `{ladder_settings['max_amount']}` USDT\n"
         
@@ -3471,33 +3546,28 @@ class FastDCABot:
                 await update.message.reply_text("❌ Не удалось получить цену")
                 return
             
-            highest_price = self.db.get_highest_price(symbol)
-            ladder_settings = self.db.get_ladder_settings(symbol)
+            stats = self.db.get_dca_stats(symbol)
+            avg_price = stats['avg_price'] if stats else 0
             
-            if highest_price > 0:
-                ladder_settings['start_price'] = highest_price
-                await update.message.reply_text(f"🪜 Установлена стартовая цена: {format_price(highest_price, 4)} USDT\n(по самой высокой цене покупки)")
-            elif ladder_settings['start_price'] <= 0:
-                ladder_settings['start_price'] = current_price
-                await update.message.reply_text(f"🪜 Установлена стартовая цена: {format_price(current_price, 4)} USDT")
+            if avg_price > 0:
+                await update.message.reply_text(f"🪜 Расчет лестницы от средней цены: {format_price(avg_price, 4)} USDT")
             else:
-                await update.message.reply_text(f"🪜 Стартовая цена: {format_price(ladder_settings['start_price'], 4)} USDT")
-            
-            ladder_settings['last_buy_price'] = ladder_settings['start_price']
-            self.db.save_ladder_settings(ladder_settings)
+                await update.message.reply_text(f"🪜 Первая покупка будет по текущей цене: {format_price(current_price, 4)} USDT")
             
             self.db.set_setting('dca_active', 'true')
             self.db.set_setting('initial_reference_price', str(current_price))
             self.db.set_dca_start(symbol, current_price)
             
             invest_amount = float(self.db.get_setting('invest_amount', '1.1'))
+            ladder_settings = self.db.get_ladder_settings(symbol)
+            
             await update.message.reply_text(
                 f"✅ DCA запущен!\n\n"
                 f"🪙 {symbol}\n"
-                f"💰 Стартовая цена: {format_price(ladder_settings['start_price'], 4)} USDT\n"
+                f"💰 Средняя цена: {format_price(avg_price, 4) if avg_price > 0 else '—'} USDT\n"
                 f"💵 Базовая сумма: {invest_amount} USDT\n"
-                f"📊 Шаг падения: {STEP_PERCENT}%\n"
-                f"📉 Макс. просадка: {MAX_DROP_DEPTH}%",
+                f"📊 Шаг падения: {ladder_settings['step_percent']}%\n"
+                f"📉 Макс. просадка: {ladder_settings['max_depth']}%",
                 reply_markup=self.get_main_keyboard()
             )
     
@@ -3674,20 +3744,8 @@ class FastDCABot:
         self.db.set_setting('symbol', symbol)
         self.db.set_setting('initial_reference_price', str(price))
         
-        highest_price = self.db.get_highest_price(symbol)
-        ladder = self.db.get_ladder_settings(symbol)
-        
-        if highest_price > 0:
-            ladder['start_price'] = highest_price
-            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT\n🪜 Стартовая цена лестницы: {format_price(highest_price, 4)} USDT (по самой высокой цене покупки)")
-        elif ladder['start_price'] <= 0:
-            ladder['start_price'] = price
-            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT\n🪜 Стартовая цена лестницы: {format_price(price, 4)} USDT")
-        else:
-            await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT")
-        
-        ladder['last_buy_price'] = ladder['start_price']
-        self.db.save_ladder_settings(ladder)
+        self.db.set_setting('symbol', symbol)
+        await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT")
         
         return SELECTING_ACTION
     
@@ -3699,11 +3757,11 @@ class FastDCABot:
         
         await update.message.reply_text(
             "🪜 *Настройка лестницы (Мартингейл)*\n\n"
-            "Стратегия: при каждом падении цены на 3% от стартовой цены\n"
-            "происходит докупка с линейным ростом суммы от базовой до максимальной.\n\n"
+            "Стратегия: при каждом падении цены на заданный процент\n"
+            "от средней цены происходит докупка с линейным ростом суммы.\n\n"
             "Параметры:\n"
-            "• Шаг падения: 3% (фиксированный)\n"
-            "• Глубина просадки: до 80%\n"
+            "• Шаг падения: процент для следующего уровня\n"
+            "• Глубина просадки: максимальный процент падения\n"
             "• Рост суммы: от базовой до максимальной",
             reply_markup=self.get_ladder_settings_keyboard(),
             parse_mode='Markdown'
@@ -3721,21 +3779,22 @@ class FastDCABot:
         
         text = f"🪜 *ТЕКУЩИЕ НАСТРОЙКИ ЛЕСТНИЦЫ*\n\n"
         text += f"🪙 Токен: `{symbol}`\n"
-        text += f"💰 Стартовая цена: `{format_price(ladder['start_price'], 4)}` USDT\n"
+        if summary['avg_price'] > 0:
+            text += f"💰 Средняя цена: `{format_price(summary['avg_price'], 4)}` USDT\n"
         text += f"📊 Шаг падения: `{ladder['step_percent']}%`\n"
         text += f"📉 Глубина просадки: `{ladder['max_depth']}%`\n"
         text += f"💵 Базовая сумма: `{ladder['base_amount']}` USDT\n"
         text += f"💰 Максимальная сумма: `{ladder['max_amount']}` USDT\n"
         
-        if current_price and ladder['start_price'] > 0:
-            current_drop = ((ladder['start_price'] - current_price) / ladder['start_price']) * 100
-            current_drop = max(0, current_drop)
+        if current_price and summary['avg_price'] > 0:
+            current_drop = calculate_current_drop(current_price, summary['avg_price'])
             text += f"📊 Текущее падение: `{current_drop:.1f}%`\n"
         
-        text += f"\n*План покупок:*\n"
+        text += f"\n*План покупок (от средней цены):*\n"
         for step in summary['steps'][:15]:
             status_emoji = "✅" if step['status'] == 'completed' else "⏳"
-            text += f"{status_emoji} {step['drop_percent']:.0f}%: {step['amount']:.2f} USDT (коэф. {step['ratio']:.2f})\n"
+            target_price_str = format_price(step['price'], 4) if step['price'] > 0 else "—"
+            text += f"{status_emoji} {step['drop_percent']:.0f}%: {step['amount']:.2f} USDT (коэф. {step['ratio']:.2f}) → {target_price_str}\n"
         
         if len(summary['steps']) > 15:
             text += f"_...и еще {len(summary['steps']) - 15} уровней_"
@@ -3743,36 +3802,10 @@ class FastDCABot:
         await update.message.reply_text(text, parse_mode='Markdown', reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
     
-    async def set_ladder_start_price_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return LADDER_MENU
-        await update.message.reply_text("💰 Введите новую стартовую цену (USDT):\n\nПример: 2.35", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
-        return SET_LADDER_START_PRICE
-    
-    async def set_ladder_start_price_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_ladder_settings_keyboard())
-            return LADDER_MENU
-        try:
-            start_price = float(text.replace(',', '.'))
-            if start_price <= 0:
-                raise ValueError
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
-            ladder = self.db.get_ladder_settings(symbol)
-            ladder['start_price'] = start_price
-            ladder['last_buy_price'] = start_price
-            self.db.save_ladder_settings(ladder)
-            await update.message.reply_text(f"✅ Стартовая цена установлена: {format_price(start_price, 4)} USDT", reply_markup=self.get_ladder_settings_keyboard())
-            return LADDER_MENU
-        except ValueError:
-            await update.message.reply_text("❌ Некорректная цена. Введите положительное число.", reply_markup=self.get_cancel_keyboard())
-            return SET_LADDER_START_PRICE
-    
     async def set_ladder_step_percent_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text("📊 Введите шаг падения в процентах (1-5%):\n*Рекомендуется 3%*\n\nПример: 3", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("📊 Введите шаг падения в процентах (1-10%):\n*Рекомендуется 3%*\n\nПример: 3", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_STEP_PERCENT
     
     async def set_ladder_step_percent_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3845,37 +3878,12 @@ class FastDCABot:
             await update.message.reply_text("❌ Некорректная сумма (мин 1).", reply_markup=self.get_cancel_keyboard())
             return SET_LADDER_BASE_AMOUNT
     
-    async def set_ladder_max_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return LADDER_MENU
-        await update.message.reply_text("💰 Введите максимальную сумму (USDT):\n*Сумма последнего ордера*\n\nПример: 3.3", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
-        return SET_LADDER_BASE_AMOUNT
-    
-    async def set_ladder_max_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text == "❌ Отмена":
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_ladder_settings_keyboard())
-            return LADDER_MENU
-        try:
-            max_amount = float(text.replace(',', '.'))
-            if max_amount < 1:
-                raise ValueError
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
-            ladder = self.db.get_ladder_settings(symbol)
-            ladder['max_amount'] = max_amount
-            self.db.save_ladder_settings(ladder)
-            await update.message.reply_text(f"✅ Максимальная сумма: {max_amount} USDT", reply_markup=self.get_ladder_settings_keyboard())
-            return LADDER_MENU
-        except ValueError:
-            await update.message.reply_text("❌ Некорректная сумма (мин 1).", reply_markup=self.get_cancel_keyboard())
-            return SET_LADDER_BASE_AMOUNT
-    
     async def reset_ladder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         self.db.reset_ladder(symbol)
-        await update.message.reply_text("🔄 Лестница сброшена!", reply_markup=self.get_ladder_settings_keyboard())
+        await update.message.reply_text("🔄 Статистика DCA очищена! Лестница сброшена.", reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
     
     async def manual_buy_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3899,9 +3907,16 @@ class FastDCABot:
         context.user_data['manual_buy_recommendation'] = recommendation
         msg = f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
         if recommendation['success'] and recommendation['should_buy']:
-            msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Сейчас хороший момент!\n📉 Падение {recommendation.get('drop_percent', 0):.1f}%\n📊 Сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+            msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Сейчас хороший момент!\n"
+            if recommendation.get('current_drop', 0) > 0:
+                msg += f"📉 Падение от средней цены: `{recommendation['current_drop']:.1f}%`\n"
+            msg += f"📊 Сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
         elif recommendation['success']:
-            msg += f"⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения\n📉 Следующее падение: `{recommendation.get('next_drop', 0):.1f}%`\n💰 Следующая цена: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n\n"
+            msg += f"⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения\n"
+            if recommendation.get('current_drop', 0) > 0:
+                msg += f"📉 Текущее падение: `{recommendation['current_drop']:.1f}%`\n"
+            msg += f"📉 Следующее падение: `{recommendation.get('next_drop', 0):.1f}%`\n"
+            msg += f"💰 Следующая цена: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n\n"
         msg += f"Введите цену лимитного ордера (или нажмите Отмена):"
         await update.message.reply_text(msg, reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
         return MANUAL_BUY_PRICE
@@ -3958,7 +3973,7 @@ class FastDCABot:
                     self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'], quantity=result['quantity'], target_price=target_price, profit_percent=profit_percent)
                 msg = f"✅ *Лимитный ордер создан!*\n\nЦена: `{format_price(price, 4)}` USDT\nСумма: `{amount:.2f}` USDT\nКоличество: `{format_quantity(result['quantity'], 2)}`\n"
                 if drop_percent > 0:
-                    msg += f"📉 Падение: `{drop_percent:.1f}%`\n"
+                    msg += f"📉 Падение: `{drop_percent:.1f}%` от средней цены\n"
                 msg += f"Цель продажи: `{format_price(target_price, 4)}` USDT ({profit_percent}%)"
                 await update.message.reply_text(msg, reply_markup=self.get_main_keyboard(), parse_mode='Markdown')
             else:
@@ -3981,26 +3996,28 @@ class FastDCABot:
         
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         current_price = await self.bybit.get_symbol_price(symbol)
+        stats = self.db.get_dca_stats(symbol)
         ladder_settings = self.db.get_ladder_settings(symbol)
         
-        drop_from_start = 0
-        if ladder_settings['start_price'] > 0 and current_price:
-            drop_from_start = ((ladder_settings['start_price'] - current_price) / ladder_settings['start_price']) * 100
-            drop_from_start = max(0, drop_from_start)
-        
-        recommendation = self.db.get_recommendation_for_current_drop(drop_from_start, symbol)
+        recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol)
         
         msg = f"➕ *Добавление покупки вручную*\n\n"
         msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
         
-        if ladder_settings['start_price'] > 0:
-            msg += f"📉 Падение от цены старта ({format_price(ladder_settings['start_price'], 4)}): `{drop_from_start:.1f}%`\n\n"
+        if stats and stats['avg_price'] > 0:
+            current_drop = calculate_current_drop(current_price, stats['avg_price'])
+            msg += f"📉 Средняя цена: `{format_price(stats['avg_price'], 4)}` USDT\n"
+            msg += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n\n"
         
         if recommendation['success']:
-            msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
-            msg += f"📉 Уровень падения: `{recommendation['drop_percent']:.0f}%`\n"
-            msg += f"📊 Коэффициент: `{recommendation['ratio']:.2f}`\n"
-            msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+            if recommendation['is_first']:
+                msg += f"🟢 *ПЕРВАЯ ПОКУПКА*\n"
+                msg += f"💰 Рекомендуемая сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+            else:
+                msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
+                msg += f"📉 Уровень падения: `{recommendation['drop_percent']:.0f}%`\n"
+                msg += f"📊 Коэффициент: `{recommendation['ratio']:.2f}`\n"
+                msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
         
         msg += f"Введите цену покупки (USDT):"
         
@@ -4029,19 +4046,31 @@ class FastDCABot:
             context.user_data['manual_price'] = price
             
             symbol = self.db.get_setting('symbol', 'TONUSDT')
-            drop_percent = self.db.get_drop_percent_from_start_price(price, symbol)
-            recommendation = self.db.get_recommendation_for_current_drop(drop_percent, symbol)
-            suggested_amount = recommendation.get('amount_usdt', 1.1) if recommendation['success'] else 1.1
+            stats = self.db.get_dca_stats(symbol)
             
-            await update.message.reply_text(
-                f"✅ Цена {format_price(price, 4)} USDT\n"
-                f"📉 Падение от цены старта: `{drop_percent:.1f}%`\n\n"
-                f"💰 Введите количество монет (в {symbol.replace('USDT', '')}):\n"
-                f"*Рекомендуемая сумма:* {suggested_amount:.2f} USDT\n"
-                f"*Минимальное количество:* 0.000001",
-                reply_markup=self.get_cancel_keyboard(),
-                parse_mode='Markdown'
-            )
+            if stats and stats['avg_price'] > 0:
+                drop_percent = calculate_current_drop(price, stats['avg_price'])
+                recommendation = self.db.get_recommendation_for_current_drop(price, symbol)
+                suggested_amount = recommendation.get('amount_usdt', 1.1) if recommendation['success'] else 1.1
+                
+                await update.message.reply_text(
+                    f"✅ Цена {format_price(price, 4)} USDT\n"
+                    f"📉 Падение от средней цены ({format_price(stats['avg_price'], 4)}): `{drop_percent:.1f}%`\n\n"
+                    f"💰 Введите количество монет (в {symbol.replace('USDT', '')}):\n"
+                    f"*Рекомендуемая сумма:* {suggested_amount:.2f} USDT\n"
+                    f"*Минимальное количество:* 0.000001",
+                    reply_markup=self.get_cancel_keyboard(),
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ Цена {format_price(price, 4)} USDT\n\n"
+                    f"💰 Введите количество монет (в {symbol.replace('USDT', '')}):\n"
+                    f"*Рекомендуемая сумма:* {ladder_settings['base_amount']:.2f} USDT\n"
+                    f"*Минимальное количество:* 0.000001",
+                    reply_markup=self.get_cancel_keyboard(),
+                    parse_mode='Markdown'
+                )
             return MANUAL_ADD_AMOUNT
         except ValueError as e:
             await update.message.reply_text(
@@ -4080,9 +4109,14 @@ class FastDCABot:
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             amount_usdt = price * quantity
             
-            drop_percent = self.db.get_drop_percent_from_start_price(price, symbol)
-            step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
-            step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
+            stats = self.db.get_dca_stats(symbol)
+            drop_percent = 0
+            step_level = 0
+            
+            if stats and stats['avg_price'] > 0:
+                drop_percent = calculate_current_drop(price, stats['avg_price'])
+                step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
+                step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
             
             purchase_id = self.db.add_purchase(
                 symbol=symbol,
@@ -4102,7 +4136,7 @@ class FastDCABot:
                 msg += f"📊 Количество: `{format_quantity(quantity, 2)}`\n"
                 msg += f"💵 Сумма: `{amount_usdt:.2f}` USDT"
                 if drop_percent > 0:
-                    msg += f"\n📉 Падение: `{drop_percent:.1f}%` от цены старта"
+                    msg += f"\n📉 Падение от средней цены: `{drop_percent:.1f}%`"
                 await update.message.reply_text(msg, reply_markup=self.get_main_keyboard(), parse_mode='Markdown')
             else:
                 await update.message.reply_text("❌ Ошибка сохранения в базу данных", reply_markup=self.get_main_keyboard())
@@ -4181,7 +4215,8 @@ class FastDCABot:
                 return ConversationHandler.END
             new_amount_usdt = new_price * purchase['quantity']
             symbol = self.db.get_setting('symbol', 'TONUSDT')
-            new_drop_percent = self.db.get_drop_percent_from_start_price(new_price, symbol)
+            stats = self.db.get_dca_stats(symbol)
+            new_drop_percent = calculate_current_drop(new_price, stats['avg_price']) if stats else 0
             if self.db.update_purchase(purchase_id, price=new_price, amount_usdt=new_amount_usdt, drop_percent=new_drop_percent):
                 await update.message.reply_text(f"✅ Цена обновлена: {format_price(new_price, 4)} USDT\n📉 Падение: {new_drop_percent:.1f}%")
             else:
@@ -4483,18 +4518,23 @@ class FastDCABot:
                     
                     if current_price:
                         ladder_info = self.db.calculate_ladder_purchase(current_price, symbol)
+                        stats = self.db.get_dca_stats(symbol)
                         
                         msg = f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ О ПОКУПКЕ*\n\n"
                         msg += f"🪙 Токен: `{symbol}`\n"
                         msg += f"💰 Текущая цена: `{format_price(current_price, 4)}` USDT\n"
                         
+                        if stats and stats['avg_price'] > 0:
+                            current_drop = calculate_current_drop(current_price, stats['avg_price'])
+                            msg += f"📉 Средняя цена: `{format_price(stats['avg_price'], 4)}` USDT\n"
+                            msg += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n"
+                        
                         if ladder_info['should_buy']:
-                            msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Сейчас хороший момент для покупки!\n"
-                            msg += f"📉 Падение: {ladder_info.get('drop_percent', 0):.1f}%\n"
+                            msg += f"\n🟢 *РЕКОМЕНДАЦИЯ:* Сейчас хороший момент для покупки!\n"
                             msg += f"📊 Рекомендуемая сумма: `{ladder_info['amount_usdt']:.2f}` USDT\n\n"
                             msg += f"💡 Используйте кнопку '💰 Ручная покупка (лимит)' для создания ордера"
                         else:
-                            msg += f"⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения цены\n"
+                            msg += f"\n⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения цены\n"
                             msg += f"📉 Следующее падение: `{ladder_info.get('next_drop', 0):.1f}%`\n"
                             msg += f"💰 Целевая цена: `{format_price(ladder_info['target_price'], 4)}` USDT"
                         
@@ -4567,18 +4607,14 @@ class FastDCABot:
         """Выполняет очистку статистики после подтверждения"""
         query = update.callback_query
         
-        # Очищаем статистику
         deleted_count = self.db.clear_all_purchases(symbol)
         
         if deleted_count > 0:
             self.db.log_action('CONFIRMED_STATS_CLEARED', symbol, f"Подтвержденная очистка после продажи, удалено {deleted_count} покупок")
-            
-            # Отмечаем, что статистика очищена
             self.db.mark_completed_sell_stats_cleared(sell_id)
             
-            # Сбрасываем лестницу
+            # Сбрасываем лестницу (очищаем статистику)
             ladder = self.db.get_ladder_settings(symbol)
-            ladder['current_drop_percent'] = 0
             self.db.save_ladder_settings(ladder)
             
             await query.edit_message_text(
@@ -4586,7 +4622,7 @@ class FastDCABot:
                 f"🪙 Токен: `{symbol}`\n"
                 f"🗑 Удалено покупок: `{deleted_count}`\n\n"
                 f"📊 Начинаем новый цикл накопления.\n"
-                f"🪜 Лестница сброшена.",
+                f"🪜 Расчет от новой средней цены.",
                 parse_mode='Markdown'
             )
         else:
@@ -4605,7 +4641,7 @@ class FastDCABot:
         await query.edit_message_text(
             f"⏭ Очистка статистики для {symbol} отложена.\n\n"
             f"📊 Статистика DCA сохранена.\n"
-            f"💡 Вы можете очистить её позже вручную через раздел '✏️ Редактировать покупки'.",
+            f"💡 Вы можете очистить её позже вручную через раздел '✏️ Редактировать покупки' или '🪜 Настройка лестницы' → 'Сбросить лестницу'.",
             parse_mode='Markdown'
         )
     
@@ -4652,12 +4688,11 @@ class FastDCABot:
             )
             
             ladder = self.db.get_ladder_settings(symbol)
-            ladder['current_drop_percent'] = 0
             self.db.save_ladder_settings(ladder)
             
             await self.application.bot.send_message(
                 chat_id=self.authorized_user_id,
-                text=f"🔄 Лестница для {symbol} сброшена. Стартовая цена осталась прежней.",
+                text=f"🔄 Статистика для {symbol} очищена. Расчет от новой средней цены.",
                 parse_mode='Markdown'
             )
         else:
@@ -4694,14 +4729,21 @@ class FastDCABot:
         else:
             purchase_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        drop_percent = self.db.get_drop_percent_from_start_price(order_dict['price'], order_dict['symbol'])
-        step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
-        step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
+        symbol = order_dict['symbol']
+        price = order_dict['price']
+        stats = self.db.get_dca_stats(symbol)
+        
+        drop_percent = 0
+        step_level = 0
+        if stats and stats['avg_price'] > 0:
+            drop_percent = calculate_current_drop(price, stats['avg_price'])
+            step_percent = float(self.db.get_setting('ladder_step_percent', '3'))
+            step_level = int(drop_percent / step_percent) if drop_percent > 0 else 0
         
         purchase_id = self.db.add_purchase(
-            symbol=order_dict['symbol'],
+            symbol=symbol,
             amount_usdt=order_dict['amount_usdt'],
-            price=order_dict['price'],
+            price=price,
             quantity=order_dict['quantity'],
             multiplier=1.0,
             drop_percent=drop_percent,
@@ -4712,21 +4754,20 @@ class FastDCABot:
         if purchase_id:
             self.db.mark_order_as_added(order_id)
             
-            await update.callback_query.edit_message_text(
-                f"✅ *Покупка добавлена в статистику!*\n\n"
-                f"🪙 Токен: `{order_dict['symbol']}`\n"
-                f"💰 Цена: `{format_price(order_dict['price'], 4)}` USDT\n"
-                f"📊 Количество: `{format_quantity(order_dict['quantity'], 2)}`\n"
-                f"💵 Сумма: `{order_dict['amount_usdt']:.2f}` USDT\n"
-                f"📅 Дата: `{purchase_date}`\n"
-                f"📉 Падение: `{drop_percent:.1f}%`\n"
-                f"📊 Уровень: {step_level}\n"
-                f"🆔 ID покупки: `{purchase_id}`",
-                parse_mode='Markdown'
-            )
+            msg = f"✅ *Покупка добавлена в статистику!*\n\n"
+            msg += f"🪙 Токен: `{symbol}`\n"
+            msg += f"💰 Цена: `{format_price(price, 4)}` USDT\n"
+            msg += f"📊 Количество: `{format_quantity(order_dict['quantity'], 2)}`\n"
+            msg += f"💵 Сумма: `{order_dict['amount_usdt']:.2f}` USDT\n"
+            msg += f"📅 Дата: `{purchase_date}`\n"
+            if drop_percent > 0:
+                msg += f"📉 Падение от средней цены: `{drop_percent:.1f}%`\n"
+            msg += f"🆔 ID покупки: `{purchase_id}`"
             
-            self.db.log_action('EXECUTED_ORDER_ADDED', order_dict['symbol'], 
-                              f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {order_dict['price']} от {purchase_date}")
+            await update.callback_query.edit_message_text(msg, parse_mode='Markdown')
+            
+            self.db.log_action('EXECUTED_ORDER_ADDED', symbol, 
+                              f"Ордер {order_id}: {order_dict['amount_usdt']:.2f} USDT по {price} от {purchase_date}")
             
             await self.send_sell_recommendation_from_callback(update, context)
             
@@ -4895,22 +4936,16 @@ class FastDCABot:
             entry_points=[MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu)],
             states={
                 LADDER_MENU: [
-                    MessageHandler(filters.Regex('^(💰 Цена старта)$'), self.set_ladder_start_price_start),
                     MessageHandler(filters.Regex('^(📊 Шаг падения \(%\))$'), self.set_ladder_step_percent_start),
                     MessageHandler(filters.Regex('^(📉 Глубина просадки \(%\))$'), self.set_ladder_max_depth_start),
                     MessageHandler(filters.Regex('^(💵 Базовая сумма)$'), self.set_ladder_base_amount_start),
-                    MessageHandler(filters.Regex('^(💰 Максимальная сумма)$'), self.set_ladder_max_amount_start),
                     MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_ladder_settings),
                     MessageHandler(filters.Regex('^(🔄 Сбросить лестницу)$'), self.reset_ladder),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
                 ],
-                SET_LADDER_START_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_start_price_save)],
                 SET_LADDER_STEP_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_step_percent_save)],
                 SET_LADDER_DEPTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_max_depth_save)],
-                SET_LADDER_BASE_AMOUNT: [
-                    MessageHandler(filters.Regex('^(💰 Максимальная сумма)$'), self.set_ladder_max_amount_save),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save),
-                ],
+                SET_LADDER_BASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save)],
             },
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="ladder_conversation",
