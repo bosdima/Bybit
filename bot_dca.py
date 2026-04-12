@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 3.0 (11.04.2026)
-НОВАЯ ВЕРСИЯ: РАСЧЕТ ОТ СРЕДНЕЙ ЦЕНЫ
+Версия 3.1 (12.04.2026)
+ИСПРАВЛЕНО: ДОБАВЛЕНИЕ ПОКУПОК ВРУЧНУЮ
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "3.0 (11.04.2026)"
+BOT_VERSION = "3.1 (12.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -96,7 +96,6 @@ CONVERSATION_TIMEOUT = 180
     WAITING_IMPORT_FILE,
     SELECTING_SYMBOL,
     LADDER_MENU,
-    SET_LADDER_START_PRICE,
     SET_LADDER_STEP_PERCENT,
     SET_LADDER_DEPTH,
     SET_LADDER_BASE_AMOUNT,
@@ -1013,16 +1012,6 @@ class Database:
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
         self.clear_all_purchases(symbol)
-    
-    def log_action(self, action: str, symbol: str = None, details: str = None):
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO history (action, symbol, details) VALUES (?, ?, ?)', (action, symbol, details))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.error(f"Error logging action: {e}")
     
     def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float, executed_at: str = None) -> bool:
         try:
@@ -2579,9 +2568,8 @@ class FastDCABot:
     def get_ladder_settings_keyboard(self):
         keyboard = [
             [KeyboardButton("📊 Шаг падения (%)"), KeyboardButton("📉 Глубина просадки (%)")],
-            [KeyboardButton("💵 Базовая сумма"), KeyboardButton("💰 Максимальная сумма")],
-            [KeyboardButton("📋 Текущие настройки"), KeyboardButton("🔄 Сбросить лестницу")],
-            [KeyboardButton("🔙 Назад в меню")],
+            [KeyboardButton("💵 Базовая сумма"), KeyboardButton("📋 Текущие настройки")],
+            [KeyboardButton("🔄 Сбросить лестницу"), KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -4047,6 +4035,7 @@ class FastDCABot:
             
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             stats = self.db.get_dca_stats(symbol)
+            ladder_settings = self.db.get_ladder_settings(symbol)
             
             if stats and stats['avg_price'] > 0:
                 drop_percent = calculate_current_drop(price, stats['avg_price'])
