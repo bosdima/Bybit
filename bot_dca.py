@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.2 (12.04.2026)
-ИСПРАВЛЕНО: Ошибка обработки кнопок настроек, конфликт хендлеров
+Версия 3.4.3 (12.04.2026)
+ИСПРАВЛЕНО: Конфликт обработчиков настроек, удалён дублирующийся хендлер
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "3.4.2 (12.04.2026)"
+BOT_VERSION = "3.4.3 (12.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -2469,27 +2469,6 @@ class FastDCABot:
             reply_markup=self.get_main_keyboard()
         )
     
-    async def show_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        await self._reset_bot_state(context)
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        invest_amount = self.db.get_setting('invest_amount', '1.1')
-        profit_percent = self.db.get_setting('profit_percent', '5')
-        schedule_time = self.db.get_setting('schedule_time', '09:00')
-        frequency_hours = self.db.get_setting('frequency_hours', '24')
-        await update.message.reply_text(
-            f"⚙️ *Настройки*\n\n"
-            f"🪙 Токен: `{symbol}`\n"
-            f"💵 Сумма: `{invest_amount}` USDT\n"
-            f"📈 Прибыль: `{profit_percent}%`\n"
-            f"⏰ Время: `{schedule_time}`\n"
-            f"🔄 Частота: `{frequency_hours}`ч\n\n"
-            f"Выберите параметр для изменения:",
-            reply_markup=self.get_settings_keyboard(),
-            parse_mode='Markdown'
-        )
-    
     # ============= Управление уведомлениями о покупке =============
     async def purchase_notify_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3299,7 +3278,7 @@ class FastDCABot:
             return SELECTING_SYMBOL
         self.db.set_setting('symbol', symbol)
         self.db.set_setting('initial_reference_price', str(price))
-        await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT")
+        await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT", reply_markup=self.get_settings_keyboard())
         return SELECTING_ACTION
     
     async def ladder_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4185,7 +4164,6 @@ class FastDCABot:
         logger.info("Setting up handlers...")
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_|confirm_clear_stats_|skip_clear_stats_)'))
-        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.show_settings_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
         self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start))
         self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
@@ -4216,9 +4194,30 @@ class FastDCABot:
         )
         self.application.add_handler(edit_purchases_conv)
         
+        # ВАЖНО: Основной ConversationHandler для настроек - убран дублирующийся entry_points
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
-            states={SELECTING_ACTION: [MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start), MessageHandler(filters.Regex('^(💵 Сумма покупки)$'), self.set_amount_start), MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start), MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start), MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start), MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start), MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu), MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings), MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings), MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main)], SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)], SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)], SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done)], SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)], SET_MAX_DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_drop_done)], SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done)], SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done)]},
+            states={
+                SELECTING_ACTION: [
+                    MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start),
+                    MessageHandler(filters.Regex('^(💵 Сумма покупки)$'), self.set_amount_start),
+                    MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start),
+                    MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start),
+                    MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start),
+                    MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start),
+                    MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu),
+                    MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
+                    MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings),
+                    MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
+                ],
+                SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
+                SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)],
+                SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done)],
+                SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)],
+                SET_MAX_DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_drop_done)],
+                SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done)],
+                SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done)],
+            },
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="main_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
@@ -4265,6 +4264,8 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking))
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
+        
+        # Универсальный обработчик для неизвестных команд должен быть ПОСЛЕДНИМ
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
     
