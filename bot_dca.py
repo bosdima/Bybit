@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.1 (12.04.2026)
-ИСПРАВЛЕНО: Ошибка unpacking states (34 -> 33)
+Версия 3.4.2 (12.04.2026)
+ИСПРАВЛЕНО: Ошибка обработки кнопок настроек, конфликт хендлеров
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "3.4.1 (12.04.2026)"
+BOT_VERSION = "3.4.2 (12.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -120,30 +120,27 @@ MAIN_MENU_BUTTONS = [
     "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку"
 ]
 
+# ============= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =============
 
 def format_price(price: float, decimals: int = 4) -> str:
     if price is None:
         return "N/A"
     return f"{price:.{decimals}f}"
 
-
 def format_quantity(qty: float, decimals: int = 2) -> str:
     if qty is None:
         return "N/A"
     return f"{qty:.{decimals}f}"
 
-
 def round_price_up(price: float) -> float:
     """Округляет цену вверх до сотых долей"""
     return math.ceil(price * 100) / 100
-
 
 def round_quantity_for_sell(quantity: float, min_qty: float = 0.01) -> float:
     rounded = math.floor(quantity * 100) / 100
     if rounded < min_qty:
         rounded = min_qty
     return rounded
-
 
 def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) -> Tuple[int, float]:
     """
@@ -160,7 +157,6 @@ def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) ->
     
     return level, ratio
 
-
 def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
     """
     Рассчитывает сумму покупки в зависимости от падения (плавно, на каждый процент).
@@ -173,13 +169,11 @@ def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: floa
     amount = base_amount + (max_amount - base_amount) * fraction
     return min(amount, max_amount)
 
-
 def calculate_current_drop(current_price: float, avg_price: float) -> float:
     if avg_price <= 0:
         return 0
     drop = ((avg_price - current_price) / avg_price) * 100
     return max(0, drop)
-
 
 def get_recommended_purchase_amount(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
     return get_amount_by_drop(drop_percent, base_amount, max_amount, max_depth)
@@ -4200,7 +4194,7 @@ class FastDCABot:
         
         purchase_notify_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings)],
-            states={WAITING_PURCHASE_NOTIFY_TIME: [MessageHandler(filters.Regex('^(🔔 Уведомления Вкл|🔕 Уведомления Выкл)$'), self.toggle_purchase_notify), MessageHandler(filters.Regex('^(⏰ Время уведомления)$'), self.set_purchase_notify_time_start), MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings_from_purchase), MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_purchase_notify_time_done)]},
+            states={WAITING_PURCHASE_NOTIFY_TIME: [MessageHandler(filters.Regex('^(🔔 Уведомления Вкл|🔕 Уведомления Выкл)$'), self.toggle_purchase_notify), MessageHandler(filters.Regex('^(⏰ Время уведомления \(\d{2}:\d{2}\)|⏰ Время уведомления)$'), self.set_purchase_notify_time_start), MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings_from_purchase), MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_purchase_notify_time_done)]},
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="purchase_notify_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
@@ -4224,7 +4218,7 @@ class FastDCABot:
         
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
-            states={SELECTING_ACTION: [MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start), MessageHandler(filters.Regex('^(💵 Сумма покупки)$'), self.set_amount_start), MessageHandler(filters.Regex('📊 Процент прибыли'), self.set_profit_start), MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start), MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start), MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start), MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu), MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings), MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings), MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main)], SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)], SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)], SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done)], SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)], SET_MAX_DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_drop_done)], SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done)], SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done)]},
+            states={SELECTING_ACTION: [MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start), MessageHandler(filters.Regex('^(💵 Сумма покупки)$'), self.set_amount_start), MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start), MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start), MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start), MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start), MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu), MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings), MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings), MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main)], SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)], SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)], SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done)], SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)], SET_MAX_DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_drop_done)], SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done)], SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done)]},
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="main_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
@@ -4276,7 +4270,7 @@ class FastDCABot:
     
     def run(self):
         print(f"\n{Fore.CYAN}{'='*60}")
-        print(f"{Fore.CYAN}🚀 ЗАПУСК DCA BYBIT BOT (МАРТИНГЕЙЛ ЛЕСЕНКОЙ)")
+        print(f"{Fore.CYAN}🚀 ЗАПУСК DCA BYBIT BOT (МАРТИНГЕЙЛ ЛЕСТНИЦОЙ)")
         print(f"{Fore.CYAN}Версия: {BOT_VERSION}")
         print(f"{Fore.CYAN}{'='*60}")
         if not TELEGRAM_TOKEN:
