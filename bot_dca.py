@@ -68,7 +68,7 @@ BOT_VERSION = "3.4.1 (12.04.2026)"
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
 
-# Состояния для ConversationHandler (33 состояния)
+# Состояния для ConversationHandler (34 состояния)
 (
     SELECTING_ACTION,
     SET_SYMBOL,
@@ -103,7 +103,8 @@ CONVERSATION_TIMEOUT = 180
     WAITING_ORDER_ID_TO_CANCEL,
     WAITING_SELL_CONFIRMATION,
     WAITING_CLEAR_STATS_CONFIRMATION,
-) = range(33)
+    WAITING_PURCHASE_NOTIFY_TIME,
+) = range(34)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
