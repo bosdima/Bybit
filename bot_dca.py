@@ -346,7 +346,7 @@ class Database:
                 ('order_execution_notify', 'true'),
                 ('order_check_interval_minutes', '60'),
                 ('sell_tracking_enabled', 'true'),
-                ('purchase_notify_enabled', 'false'),
+                ('purchase_notify_enabled', 'true'),
                 ('purchase_notify_time', '06:00'),
                 ('last_order_check_time', ''),
                 ('last_full_check_time', ''),
