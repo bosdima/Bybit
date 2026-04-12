@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 3.2 (12.04.2026)
-ИСПРАВЛЕНО: Ошибка минимальной суммы ордера при продаже + баг редактирования
+Версия 3.3 (12.04.2026)
+ИСПРАВЛЕНО: Обработка ошибки минимальной суммы ордера + отложенные продажи
 """
 
 import os
@@ -63,7 +63,7 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "3.2 (12.04.2026)"
+BOT_VERSION = "3.3 (12.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
@@ -242,6 +242,19 @@ class Database:
                     profit_percent REAL NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     status TEXT DEFAULT 'active'
+                )
+            ''')
+            
+            # Таблица для отложенных ордеров на продажу
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pending_sell_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    target_price REAL NOT NULL,
+                    profit_percent REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'pending'
                 )
             ''')
             
@@ -596,6 +609,63 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error adding sell order: {e}")
+    
+    def add_pending_sell_order(self, symbol: str, quantity: float, target_price: float, profit_percent: float) -> int:
+        """Добавляет отложенный ордер на продажу"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO pending_sell_orders (symbol, quantity, target_price, profit_percent, status)
+                VALUES (?, ?, ?, ?, 'pending')
+            ''', (symbol, quantity, target_price, profit_percent))
+            order_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            logger.info(f"Added pending sell order for {symbol}: {quantity} @ {target_price}")
+            return order_id
+        except Exception as e:
+            logger.error(f"Error adding pending sell order: {e}")
+            return 0
+    
+    def get_pending_sell_orders(self, symbol: str = None) -> List[Dict]:
+        """Получает отложенные ордера на продажу"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if symbol:
+                cursor.execute('SELECT * FROM pending_sell_orders WHERE symbol = ? AND status = "pending" ORDER BY created_at ASC', (symbol,))
+            else:
+                cursor.execute('SELECT * FROM pending_sell_orders WHERE status = "pending" ORDER BY created_at ASC')
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting pending sell orders: {e}")
+            return []
+    
+    def update_pending_sell_order_status(self, order_id: int, status: str):
+        """Обновляет статус отложенного ордера"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE pending_sell_orders SET status = ? WHERE id = ?', (status, order_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error updating pending sell order: {e}")
+    
+    def delete_pending_sell_order(self, order_id: int):
+        """Удаляет отложенный ордер"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM pending_sell_orders WHERE id = ?', (order_id,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error deleting pending sell order: {e}")
     
     def get_active_sell_orders(self, symbol: str = None) -> List[Dict]:
         try:
@@ -1119,6 +1189,7 @@ class Database:
         try:
             purchases = self.get_purchases()
             sell_orders = self.get_active_sell_orders()
+            pending_sells = self.get_pending_sell_orders()
             completed_sells = self.get_completed_sells_not_notified()
             settings = {}
             
@@ -1196,6 +1267,7 @@ class Database:
                 'version': BOT_VERSION,
                 'purchases': purchases,
                 'sell_orders': sell_orders,
+                'pending_sell_orders': pending_sells,
                 'completed_sells': completed_sells,
                 'settings': settings,
                 'notifications': notifications,
@@ -1224,6 +1296,7 @@ class Database:
             
             cursor.execute("DELETE FROM dca_purchases")
             cursor.execute("DELETE FROM sell_orders")
+            cursor.execute("DELETE FROM pending_sell_orders")
             cursor.execute("DELETE FROM completed_sells")
             cursor.execute("DELETE FROM settings")
             cursor.execute("DELETE FROM dca_start")
@@ -1276,6 +1349,25 @@ class Database:
                     orders_imported += 1
                 except Exception as e:
                     logger.warning(f"Error importing order: {e}")
+                    continue
+            
+            for pending in data.get('pending_sell_orders', []):
+                try:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO pending_sell_orders 
+                        (id, symbol, quantity, target_price, profit_percent, created_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        pending.get('id'),
+                        pending.get('symbol', 'TONUSDT'),
+                        pending.get('quantity', 0),
+                        pending.get('target_price', 0),
+                        pending.get('profit_percent', 5),
+                        pending.get('created_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        pending.get('status', 'pending')
+                    ))
+                except Exception as e:
+                    logger.warning(f"Error importing pending order: {e}")
                     continue
             
             for sell in data.get('completed_sells', []):
@@ -1520,15 +1612,15 @@ class BybitClient:
                 price_filter = info.get('priceFilter', {})
                 return {
                     'min_qty': float(lot_size_filter.get('minOrderQty', 0.01)),
-                    'min_amt': float(lot_size_filter.get('minOrderAmt', 1)),
+                    'min_amt': float(lot_size_filter.get('minOrderAmt', 10)),  # По умолчанию 10 USDT
                     'qty_step': float(lot_size_filter.get('qtyStep', 0.01)),
                     'tick_size': float(price_filter.get('tickSize', 0.0001)),
                     'base_precision': int(lot_size_filter.get('basePrecision', 2)),
                 }
-            return {'min_qty': 0.01, 'min_amt': 1, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+            return {'min_qty': 0.01, 'min_amt': 10, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
         except Exception as e:
             logger.error(f"Error getting instrument info: {e}")
-            return {'min_qty': 0.01, 'min_amt': 1, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+            return {'min_qty': 0.01, 'min_amt': 10, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         """Получает исполненные ордера на покупку с указанной даты"""
@@ -1688,7 +1780,11 @@ class BybitClient:
             if order_value < min_amt:
                 return {
                     'success': False,
-                    'error': f'Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT). Увеличьте количество.'
+                    'error': f'min_amount_error',
+                    'min_amt': min_amt,
+                    'order_value': order_value,
+                    'quantity': rounded_quantity,
+                    'price': price
                 }
             
             logger.info(f"Placing sell order: {symbol}, original qty: {quantity}, rounded qty: {rounded_quantity}, price: {price}, value: {order_value:.2f}")
@@ -1704,6 +1800,18 @@ class BybitClient:
             )
             if response['retCode'] == 0:
                 return {'success': True, 'order_id': response['result']['orderId'], 'quantity': rounded_quantity, 'price': price}
+            
+            # Проверяем специфическую ошибку минимальной суммы
+            if response['retCode'] == 170140:
+                return {
+                    'success': False,
+                    'error': f'min_amount_error',
+                    'min_amt': min_amt,
+                    'order_value': order_value,
+                    'quantity': rounded_quantity,
+                    'price': price
+                }
+            
             return {'success': False, 'error': f"{response['retMsg']} (Код: {response['retCode']})"}
         except Exception as e:
             return {'success': False, 'error': str(e)}
@@ -1814,6 +1922,16 @@ class DCAStrategy:
                                       profit_percent=profit_percent)
                 result['sell_order_id'] = sell_result['order_id']
                 result['target_price'] = target_price_sell
+            elif sell_result.get('error') == 'min_amount_error':
+                # Сохраняем отложенный ордер
+                pending_id = self.db.add_pending_sell_order(
+                    symbol=symbol,
+                    quantity=result['quantity'],
+                    target_price=target_price_sell,
+                    profit_percent=profit_percent
+                )
+                result['pending_order_id'] = pending_id
+                result['sell_warning'] = f"Сумма ордера ({sell_result['order_value']:.2f} USDT) меньше минимальной ({sell_result['min_amt']} USDT). Ордер отложен до достижения нужной цены."
             else:
                 result['sell_warning'] = sell_result.get('error', 'Не удалось создать ордер на продажу')
             
@@ -1824,6 +1942,74 @@ class DCAStrategy:
             self.db.log_action('LADDER_PURCHASE', symbol, f"Уровень {drop_percent:.1f}%: {result['total_usdt']:.2f} USDT")
         
         return result
+    
+    async def check_pending_sell_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Проверяет отложенные ордера на продажу и пытается их выполнить при достижении цены"""
+        pending_orders = self.db.get_pending_sell_orders(symbol)
+        executed_orders = []
+        
+        if not pending_orders:
+            return []
+        
+        current_price = await self.bybit.get_symbol_price(symbol)
+        if not current_price:
+            return []
+        
+        instrument_info = await self.bybit.get_instrument_info(symbol)
+        min_amt = instrument_info['min_amt']
+        
+        for order in pending_orders:
+            # Проверяем, достигнута ли целевая цена (или цена стала выше)
+            if current_price >= order['target_price']:
+                # Рассчитываем новую цену с тем же процентом прибыли от текущей цены
+                new_target_price = current_price * (1 + order['profit_percent'] / 100)
+                rounded_price = round_price_up(new_target_price)
+                
+                # Проверяем минимальную сумму
+                order_value = order['quantity'] * rounded_price
+                
+                if order_value >= min_amt:
+                    # Пытаемся выставить ордер
+                    result = await self.bybit.place_limit_sell(symbol, order['quantity'], rounded_price)
+                    
+                    if result['success']:
+                        self.db.add_sell_order(
+                            symbol=symbol,
+                            order_id=result['order_id'],
+                            quantity=result['quantity'],
+                            target_price=rounded_price,
+                            profit_percent=order['profit_percent']
+                        )
+                        self.db.delete_pending_sell_order(order['id'])
+                        
+                        executed_orders.append({
+                            'id': order['id'],
+                            'quantity': order['quantity'],
+                            'target_price': rounded_price,
+                            'profit_percent': order['profit_percent']
+                        })
+                        
+                        # Отправляем уведомление
+                        msg = (
+                            f"✅ *ОТЛОЖЕННЫЙ ОРДЕР ВЫПОЛНЕН!*\n\n"
+                            f"🪙 Токен: `{symbol}`\n"
+                            f"📊 Количество: `{format_quantity(order['quantity'], 2)}`\n"
+                            f"💰 Цена продажи: `{format_price(rounded_price, 4)}` USDT\n"
+                            f"📈 Целевая прибыль: `{order['profit_percent']}%`\n\n"
+                            f"💵 Сумма ордера: `{order_value:.2f}` USDT\n\n"
+                            f"✅ Ордер успешно выставлен!"
+                        )
+                        try:
+                            await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+                        except Exception as e:
+                            logger.error(f"Error sending pending order notification: {e}")
+                    else:
+                        logger.warning(f"Failed to execute pending order {order['id']}: {result.get('error')}")
+                else:
+                    # Обновляем целевую цену для отложенного ордера
+                    logger.info(f"Pending order {order['id']} value {order_value:.2f} still below min {min_amt}, updating target price")
+        
+        return executed_orders
     
     async def check_and_update_sell_orders(self, symbol: str):
         active_orders = self.db.get_active_sell_orders(symbol)
@@ -2474,13 +2660,42 @@ class DCAStrategy:
             
             # Проверяем минимальную сумму ордера
             order_value = rounded_quantity * rounded_price
+            
             if order_value < min_amt:
+                # Сохраняем отложенный ордер
+                pending_id = self.db.add_pending_sell_order(
+                    symbol=symbol,
+                    quantity=rounded_quantity,
+                    target_price=rounded_price,
+                    profit_percent=profit_percent
+                )
+                
+                # Рассчитываем, до какой цены нужно подняться
+                required_price = min_amt / rounded_quantity
+                
+                msg = (
+                    f"⏳ *ОРДЕР ОТЛОЖЕН*\n\n"
+                    f"🪙 Токен: `{symbol}`\n"
+                    f"📊 Количество: `{format_quantity(rounded_quantity, 2)}` {coin}\n"
+                    f"💰 Целевая цена: `{format_price(rounded_price, 4)}` USDT\n"
+                    f"📈 Целевая прибыль: `{profit_percent}%`\n\n"
+                    f"⚠️ *Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)*\n\n"
+                    f"🔄 Ордер будет автоматически выставлен, когда цена достигнет или превысит:\n"
+                    f"💰 `{format_price(rounded_price, 4)}` USDT\n\n"
+                    f"📈 ИЛИ когда цена поднимется до `{format_price(required_price, 4)}` USDT\n"
+                    f"(при которой сумма ордера достигнет минимальной)\n\n"
+                    f"✅ Ордер сохранен и будет проверяться автоматически."
+                )
+                
+                if update and hasattr(update, 'message'):
+                    await update.message.reply_text(msg, parse_mode='Markdown')
+                
                 return {
-                    'success': False, 
-                    'error': f'Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT).\n'
-                             f'Нужно увеличить количество для продажи или подождать большего роста цены.\n'
-                             f'Текущее количество: {format_quantity(total_quantity, 2)} {coin}\n'
-                             f'Цена продажи: {format_price(rounded_price, 4)} USDT'
+                    'success': False,
+                    'pending': True,
+                    'pending_id': pending_id,
+                    'error': f'min_amount_error',
+                    'message': msg
                 }
             
             logger.info(f"Place full sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, price: {rounded_price}, value: {order_value:.2f}")
@@ -2525,6 +2740,41 @@ class DCAStrategy:
                     'price': rounded_price,
                     'raw_price': raw_price,
                     'profit_percent': profit_percent
+                }
+            elif result.get('error') == 'min_amount_error':
+                # Сохраняем отложенный ордер
+                pending_id = self.db.add_pending_sell_order(
+                    symbol=symbol,
+                    quantity=rounded_quantity,
+                    target_price=rounded_price,
+                    profit_percent=profit_percent
+                )
+                
+                required_price = min_amt / rounded_quantity
+                
+                msg = (
+                    f"⏳ *ОРДЕР ОТЛОЖЕН*\n\n"
+                    f"🪙 Токен: `{symbol}`\n"
+                    f"📊 Количество: `{format_quantity(rounded_quantity, 2)}` {coin}\n"
+                    f"💰 Целевая цена: `{format_price(rounded_price, 4)}` USDT\n"
+                    f"📈 Целевая прибыль: `{profit_percent}%`\n\n"
+                    f"⚠️ *Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)*\n\n"
+                    f"🔄 Ордер будет автоматически выставлен, когда цена достигнет или превысит:\n"
+                    f"💰 `{format_price(rounded_price, 4)}` USDT\n\n"
+                    f"📈 ИЛИ когда цена поднимется до `{format_price(required_price, 4)}` USDT\n"
+                    f"(при которой сумма ордера достигнет минимальной)\n\n"
+                    f"✅ Ордер сохранен и будет проверяться автоматически."
+                )
+                
+                if update and hasattr(update, 'message'):
+                    await update.message.reply_text(msg, parse_mode='Markdown')
+                
+                return {
+                    'success': False,
+                    'pending': True,
+                    'pending_id': pending_id,
+                    'error': result.get('error'),
+                    'message': msg
                 }
             else:
                 return {'success': False, 'error': result.get('error', 'Ошибка создания ордера')}
@@ -2975,6 +3225,9 @@ class FastDCABot:
                 await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=self.get_main_keyboard())
                 self.db.log_action('SELL_ORDER_PLACED', sell_data['symbol'], 
                                    f"Ордер на продажу {result['quantity']:.2f} по {result['price']:.4f} USDT")
+            elif result.get('pending'):
+                # Ордер отложен, сообщение уже отправлено в place_full_sell_order
+                pass
             else:
                 await update.message.reply_text(
                     f"❌ *Ошибка при создании ордера на продажу*\n\n"
@@ -4037,6 +4290,21 @@ class FastDCABot:
                 sell_result = await self.bybit.place_limit_sell(symbol, result['quantity'], target_price)
                 if sell_result['success']:
                     self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'], quantity=result['quantity'], target_price=target_price, profit_percent=profit_percent)
+                elif sell_result.get('error') == 'min_amount_error':
+                    pending_id = self.db.add_pending_sell_order(
+                        symbol=symbol,
+                        quantity=result['quantity'],
+                        target_price=target_price,
+                        profit_percent=profit_percent
+                    )
+                    await update.message.reply_text(
+                        f"⚠️ *ОРДЕР НА ПРОДАЖУ ОТЛОЖЕН*\n\n"
+                        f"Сумма ордера ({sell_result['order_value']:.2f} USDT) меньше минимальной ({sell_result['min_amt']} USDT).\n\n"
+                        f"✅ Ордер сохранен и будет автоматически выставлен при достижении нужной цены.",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await update.message.reply_text(f"⚠️ Не удалось создать ордер на продажу: {sell_result.get('error', 'Unknown')}")
                 msg = f"✅ *Лимитный ордер создан!*\n\nЦена: `{format_price(price, 4)}` USDT\nСумма: `{amount:.2f}` USDT\nКоличество: `{format_quantity(result['quantity'], 2)}`\n"
                 if drop_percent > 0:
                     msg += f"📉 Падение: `{drop_percent:.1f}%` от средней цены\n"
@@ -4454,6 +4722,8 @@ class FastDCABot:
                         result = await self.strategy.execute_ladder_purchase(symbol, profit_percent)
                         if result['success'] and self.authorized_user_id:
                             msg = f"🪜 *ПОКУПКА!*\n📉 Падение: {result.get('drop_percent', 0):.1f}%\n💰 Сумма: {result['total_usdt']:.2f} USDT\n💵 Цена: {format_price(result['price'], 4)} USDT"
+                            if result.get('sell_warning'):
+                                msg += f"\n\n⚠️ {result['sell_warning']}"
                             try:
                                 await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
                             except:
@@ -4502,6 +4772,41 @@ class FastDCABot:
                 logger.error(f"Sell checker error: {e}")
             
             await asyncio.sleep(3600)
+    
+    async def pending_sell_checker_loop(self):
+        """Проверка отложенных ордеров на продажу"""
+        logger.info("Pending sell checker loop started")
+        
+        await asyncio.sleep(120)
+        
+        while self.scheduler_running:
+            try:
+                if not self.bybit_initialized:
+                    self._init_bybit()
+                
+                if not self.bybit_initialized:
+                    await asyncio.sleep(1800)
+                    continue
+                
+                symbol = self.db.get_setting('symbol', 'TONUSDT')
+                
+                if self.authorized_user_id:
+                    executed = await self.strategy.check_pending_sell_orders(
+                        symbol, 
+                        self.authorized_user_id, 
+                        self.application.bot
+                    )
+                    
+                    if executed:
+                        logger.info(f"Executed {len(executed)} pending sell orders")
+                
+            except asyncio.CancelledError:
+                logger.info("Pending sell checker loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Pending sell checker error: {e}")
+            
+            await asyncio.sleep(1800)  # Проверяем каждые 30 минут
     
     async def order_checker_loop(self):
         logger.info("Order checker loop started")
@@ -4629,6 +4934,7 @@ class FastDCABot:
         asyncio.create_task(self.dca_scheduler_loop())
         asyncio.create_task(self.order_checker_loop())
         asyncio.create_task(self.sell_checker_loop())
+        asyncio.create_task(self.pending_sell_checker_loop())
         asyncio.create_task(self.purchase_notify_loop())
         
         logger.info("Bot initialized, scheduler loops started")
