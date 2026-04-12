@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4 (12.04.2026)
-Убрана настройка "Шаг падения %", добавлен коэффициент в ежедневное уведомление
+Версия 3.4.1 (12.04.2026)
+ИСПРАВЛЕНО: Ошибка unpacking states (34 -> 33)
 """
 
 import os
@@ -63,12 +63,12 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "3.4 (12.04.2026)"
+BOT_VERSION = "3.4.1 (12.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
 
-# Состояния для ConversationHandler (убраны состояния для шага падения)
+# Состояния для ConversationHandler (33 состояния)
 (
     SELECTING_ACTION,
     SET_SYMBOL,
@@ -103,8 +103,7 @@ CONVERSATION_TIMEOUT = 180
     WAITING_ORDER_ID_TO_CANCEL,
     WAITING_SELL_CONFIRMATION,
     WAITING_CLEAR_STATS_CONFIRMATION,
-    WAITING_PURCHASE_NOTIFY_TIME,
-) = range(35)
+) = range(33)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
@@ -3989,7 +3988,6 @@ class FastDCABot:
                             msg += f"📉 Средняя цена: `{format_price(stats['avg_price'], 4)}` USDT\n"
                             msg += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n"
                         if ladder_info['should_buy']:
-                            # Рассчитываем коэффициент и сумму для текущего падения
                             settings = self.db.get_ladder_settings(symbol)
                             drop_for_buy = ladder_info.get('current_drop', 0)
                             level, ratio = get_ladder_levels(drop_for_buy, settings['max_depth'])
