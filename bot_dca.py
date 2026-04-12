@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 С линейным ростом коэффициента от 0 до 3
-Версия 3.1 (12.04.2026)
-ИСПРАВЛЕНО: ДОБАВЛЕНИЕ ПОКУПОК ВРУЧНУЮ
+Версия 3.2 (12.04.2026)
+ИСПРАВЛЕНО: Ошибка минимальной суммы ордера при продаже + баг редактирования
 """
 
 import os
@@ -63,12 +63,12 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "3.1 (12.04.2026)"
+BOT_VERSION = "3.2 (12.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
 
-# Состояния для ConversationHandler (35 состояний)
+# Состояния для ConversationHandler
 (
     SELECTING_ACTION,
     SET_SYMBOL,
@@ -140,9 +140,15 @@ def round_price_up(price: float) -> float:
     return math.ceil(price * 100) / 100
 
 
-def round_quantity_for_sell(quantity: float) -> float:
-    """Округляет количество для продажи до 2 знаков после запятой (в меньшую сторону)"""
-    return math.floor(quantity * 100) / 100
+def round_quantity_for_sell(quantity: float, min_qty: float = 0.01) -> float:
+    """
+    Округляет количество для продажи до 2 знаков после запятой (в меньшую сторону)
+    и проверяет минимальное количество
+    """
+    rounded = math.floor(quantity * 100) / 100
+    if rounded < min_qty:
+        rounded = min_qty
+    return rounded
 
 
 def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) -> Tuple[int, float]:
@@ -1502,6 +1508,28 @@ class BybitClient:
             logger.error(f"Error getting order history: {e}")
             return []
     
+    async def get_instrument_info(self, symbol: str) -> Dict:
+        """Получает информацию о торговом инструменте (minQty, minAmt, tickSize)"""
+        try:
+            if not self.session:
+                self._init_session()
+            response = self.session.get_instruments_info(category="spot", symbol=symbol)
+            if response['retCode'] == 0 and response['result']['list']:
+                info = response['result']['list'][0]
+                lot_size_filter = info.get('lotSizeFilter', {})
+                price_filter = info.get('priceFilter', {})
+                return {
+                    'min_qty': float(lot_size_filter.get('minOrderQty', 0.01)),
+                    'min_amt': float(lot_size_filter.get('minOrderAmt', 1)),
+                    'qty_step': float(lot_size_filter.get('qtyStep', 0.01)),
+                    'tick_size': float(price_filter.get('tickSize', 0.0001)),
+                    'base_precision': int(lot_size_filter.get('basePrecision', 2)),
+                }
+            return {'min_qty': 0.01, 'min_amt': 1, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+        except Exception as e:
+            logger.error(f"Error getting instrument info: {e}")
+            return {'min_qty': 0.01, 'min_amt': 1, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+    
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         """Получает исполненные ордера на покупку с указанной даты"""
         try:
@@ -1636,13 +1664,34 @@ class BybitClient:
             if not self.session:
                 self._init_session()
             
-            rounded_quantity = round_quantity_for_sell(quantity)
+            # Получаем информацию об инструменте
+            instrument_info = await self.get_instrument_info(symbol)
+            min_qty = instrument_info['min_qty']
+            min_amt = instrument_info['min_amt']
+            qty_step = instrument_info['qty_step']
             
+            # Округляем количество в соответствии с шагом
+            rounded_quantity = math.floor(quantity / qty_step) * qty_step
             if rounded_quantity <= 0:
-                rounded_quantity = 0.01
+                rounded_quantity = min_qty
                 logger.warning(f"Quantity was zero, using min qty: {rounded_quantity}")
             
-            logger.info(f"Placing sell order: {symbol}, original qty: {quantity}, rounded qty: {rounded_quantity}, price: {price}")
+            # Проверяем минимальное количество
+            if rounded_quantity < min_qty:
+                return {
+                    'success': False, 
+                    'error': f'Минимальное количество для продажи: {min_qty} {symbol.replace("USDT", "")}'
+                }
+            
+            # Проверяем минимальную сумму ордера
+            order_value = rounded_quantity * price
+            if order_value < min_amt:
+                return {
+                    'success': False,
+                    'error': f'Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT). Увеличьте количество.'
+                }
+            
+            logger.info(f"Placing sell order: {symbol}, original qty: {quantity}, rounded qty: {rounded_quantity}, price: {price}, value: {order_value:.2f}")
             
             response = self.session.place_order(
                 category="spot", 
@@ -1663,21 +1712,25 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            instrument = self.session.get_instruments_info(category="spot", symbol=symbol)
-            if instrument['retCode'] != 0:
-                return {'success': False, 'error': instrument['retMsg']}
-            lot_size = float(instrument['result']['list'][0]['lotSizeFilter']['basePrecision'])
-            min_qty = float(instrument['result']['list'][0]['lotSizeFilter']['minOrderQty'])
-            min_order_amt = float(instrument['result']['list'][0]['lotSizeFilter'].get('minOrderAmt', 1))
-            if amount_usdt < min_order_amt:
-                return {'success': False, 'error': f'Минимальная сумма: {min_order_amt} USDT'}
+            
+            instrument_info = await self.get_instrument_info(symbol)
+            min_qty = instrument_info['min_qty']
+            min_amt = instrument_info['min_amt']
+            qty_step = instrument_info['qty_step']
+            
+            if amount_usdt < min_amt:
+                return {'success': False, 'error': f'Минимальная сумма: {min_amt} USDT'}
+            
             price = await self.get_symbol_price(symbol)
             if not price:
                 return {'success': False, 'error': 'Не удалось получить цену'}
+            
             quantity = amount_usdt / price
-            quantity = Decimal(str(quantity)).quantize(Decimal(str(lot_size)), rounding=ROUND_DOWN)
-            if float(quantity) < min_qty:
+            quantity = math.floor(quantity / qty_step) * qty_step
+            
+            if quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty}'}
+            
             response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Market", qty=str(quantity))
             if response['retCode'] == 0:
                 order_id = response['result']['orderId']
@@ -1695,18 +1748,21 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            instrument = self.session.get_instruments_info(category="spot", symbol=symbol)
-            if instrument['retCode'] != 0:
-                return {'success': False, 'error': instrument['retMsg']}
-            lot_size = float(instrument['result']['list'][0]['lotSizeFilter']['basePrecision'])
-            min_qty = float(instrument['result']['list'][0]['lotSizeFilter']['minOrderQty'])
-            min_order_amt = float(instrument['result']['list'][0]['lotSizeFilter'].get('minOrderAmt', 1))
-            if amount_usdt < min_order_amt:
-                return {'success': False, 'error': f'Минимальная сумма: {min_order_amt} USDT'}
+            
+            instrument_info = await self.get_instrument_info(symbol)
+            min_qty = instrument_info['min_qty']
+            min_amt = instrument_info['min_amt']
+            qty_step = instrument_info['qty_step']
+            
+            if amount_usdt < min_amt:
+                return {'success': False, 'error': f'Минимальная сумма: {min_amt} USDT'}
+            
             quantity = amount_usdt / price
-            quantity = Decimal(str(quantity)).quantize(Decimal(str(lot_size)), rounding=ROUND_DOWN)
-            if float(quantity) < min_qty:
+            quantity = math.floor(quantity / qty_step) * qty_step
+            
+            if quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty}'}
+            
             response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Limit", qty=str(quantity), price=str(price), timeInForce="GTC")
             if response['retCode'] == 0:
                 return {'success': True, 'order_id': response['result']['orderId'], 'quantity': float(quantity), 'price': price, 'total_usdt': amount_usdt}
@@ -1758,6 +1814,8 @@ class DCAStrategy:
                                       profit_percent=profit_percent)
                 result['sell_order_id'] = sell_result['order_id']
                 result['target_price'] = target_price_sell
+            else:
+                result['sell_warning'] = sell_result.get('error', 'Не удалось создать ордер на продажу')
             
             result['step_level'] = step_level
             result['amount_usdt'] = amount_usdt
@@ -2396,25 +2454,43 @@ class DCAStrategy:
             rounded_price = round_price_up(raw_price)
             
             coin = symbol.replace('USDT', '')
-            balance = await self.bybit.get_balance(coin)
             
-            if not balance or balance.get('equity', 0) <= 0:
-                return {'success': False, 'error': f'Нет монет {coin} для продажи'}
-            
-            total_quantity = balance.get('equity', 0)
+            # Используем количество из статистики, а не из баланса
+            total_quantity = stats['total_quantity']
             
             if total_quantity <= 0:
                 return {'success': False, 'error': f'Количество {coin} равно 0'}
             
-            rounded_quantity = round_quantity_for_sell(total_quantity)
+            # Получаем информацию об инструменте для правильного округления
+            instrument_info = await self.bybit.get_instrument_info(symbol)
+            qty_step = instrument_info['qty_step']
+            min_qty = instrument_info['min_qty']
+            min_amt = instrument_info['min_amt']
             
-            logger.info(f"Place full sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, price: {rounded_price}")
+            # Округляем количество в соответствии с шагом
+            rounded_quantity = math.floor(total_quantity / qty_step) * qty_step
+            if rounded_quantity <= 0:
+                rounded_quantity = min_qty
+            
+            # Проверяем минимальную сумму ордера
+            order_value = rounded_quantity * rounded_price
+            if order_value < min_amt:
+                return {
+                    'success': False, 
+                    'error': f'Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT).\n'
+                             f'Нужно увеличить количество для продажи или подождать большего роста цены.\n'
+                             f'Текущее количество: {format_quantity(total_quantity, 2)} {coin}\n'
+                             f'Цена продажи: {format_price(rounded_price, 4)} USDT'
+                }
+            
+            logger.info(f"Place full sell order: {symbol}, total_quantity: {total_quantity}, rounded: {rounded_quantity}, price: {rounded_price}, value: {order_value:.2f}")
             
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
             
             if existing_sell_orders and auto_cancel_old:
-                await update.message.reply_text("🔄 Обнаружены старые ордера на продажу. Отменяю их...")
+                if update and hasattr(update, 'message'):
+                    await update.message.reply_text("🔄 Обнаружены старые ордера на продажу. Отменяю их...")
                 
                 cancelled_count, cancelled_ids = await self.bybit.cancel_all_sell_orders(symbol)
                 
@@ -2422,9 +2498,11 @@ class DCAStrategy:
                     for order_id in cancelled_ids:
                         self.db.update_sell_order_status(order_id, 'cancelled')
                     
-                    await update.message.reply_text(f"✅ Отменено {cancelled_count} старых ордеров. Выставляю новый...")
+                    if update and hasattr(update, 'message'):
+                        await update.message.reply_text(f"✅ Отменено {cancelled_count} старых ордеров. Выставляю новый...")
                 else:
-                    await update.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
+                    if update and hasattr(update, 'message'):
+                        await update.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
                     return {'success': False, 'error': 'Не удалось отменить старые ордера'}
             
             result = await self.bybit.place_limit_sell(symbol, rounded_quantity, rounded_price)
@@ -4781,10 +4859,9 @@ class FastDCABot:
         rounded_price = round_price_up(raw_price)
         
         coin = symbol.replace('USDT', '')
-        balance = await self.bybit.get_balance(coin)
-        total_quantity = balance.get('equity', 0) if balance else 0
+        total_quantity = stats['total_quantity']
         
-        display_quantity = round_quantity_for_sell(total_quantity)
+        display_quantity = total_quantity
         
         msg = (
             f"📊 *РЕКОМЕНДАЦИЯ ПО ПРОДАЖЕ*\n\n"
