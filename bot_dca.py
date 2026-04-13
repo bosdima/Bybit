@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.3 (12.04.2026)
-ИСПРАВЛЕНО: Конфликт обработчиков настроек, удалён дублирующийся хендлер
+Версия 3.4.4 (13.04.2026)
+ИСПРАВЛЕНО: Добавлена поддержка московского часового пояса (UTC+3) для уведомлений
 """
 
 import os
@@ -19,6 +19,13 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Dict, List, Optional, Tuple
 from colorama import init, Fore, Style
+
+# ДОБАВЛЕНО: Поддержка часовых поясов
+try:
+    import pytz
+except ImportError:
+    os.system(f"{sys.executable} -m pip install pytz")
+    import pytz
 
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
@@ -63,10 +70,21 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "3.4.3 (12.04.2026)"
+BOT_VERSION = "3.4.4 (13.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
+
+# ДОБАВЛЕНО: Московский часовой пояс
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+
+def get_moscow_time() -> datetime:
+    """Возвращает текущее московское время"""
+    return datetime.now(MOSCOW_TZ)
+
+def get_moscow_time_naive() -> datetime:
+    """Возвращает текущее московское время без информации о часовом поясе (для совместимости с SQLite)"""
+    return datetime.now(MOSCOW_TZ).replace(tzinfo=None)
 
 # Состояния для ConversationHandler (34 состояния)
 (
@@ -412,7 +430,7 @@ class Database:
                      quantity: float, multiplier: float = 1.0, drop_percent: float = 0,
                      step_level: int = 0, date: str = None):
         if date is None:
-            date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             cursor = conn.cursor()
@@ -1171,7 +1189,7 @@ class Database:
             conn.close()
             
             export_data = {
-                'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'export_date': get_moscow_time_naive().strftime('%Y-%m-%d %H:%M:%S'),
                 'version': BOT_VERSION,
                 'purchases': purchases,
                 'sell_orders': sell_orders,
@@ -1229,8 +1247,8 @@ class Database:
                         purchase.get('multiplier', 1.0),
                         purchase.get('drop_percent', 0),
                         purchase.get('step_level', 0),
-                        purchase.get('date', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                        purchase.get('created_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                        purchase.get('date', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
+                        purchase.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S"))
                     ))
                     purchases_imported += 1
                 except Exception as e:
@@ -1251,7 +1269,7 @@ class Database:
                         order.get('quantity', 0),
                         order.get('target_price', 0),
                         order.get('profit_percent', 5),
-                        order.get('created_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        order.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
                         order.get('status', 'active')
                     ))
                     orders_imported += 1
@@ -1271,7 +1289,7 @@ class Database:
                         pending.get('quantity', 0),
                         pending.get('target_price', 0),
                         pending.get('profit_percent', 5),
-                        pending.get('created_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        pending.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
                         pending.get('status', 'pending')
                     ))
                 except Exception as e:
@@ -1292,7 +1310,7 @@ class Database:
                         sell.get('sell_price', 0),
                         sell.get('profit_percent', 0),
                         sell.get('profit_usdt', 0),
-                        sell.get('sold_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        sell.get('sold_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
                         sell.get('notified', 0),
                         sell.get('stats_cleared', 0)
                     ))
@@ -1341,7 +1359,7 @@ class Database:
                         ladder.get('max_depth', 80),
                         ladder.get('base_amount', 1.1),
                         ladder.get('max_amount', 3.3),
-                        ladder.get('created_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                        ladder.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S"))
                     ))
                 except Exception as e:
                     logger.warning(f"Error importing ladder: {e}")
@@ -1360,7 +1378,7 @@ class Database:
                         executed.get('price', 0),
                         executed.get('quantity', 0),
                         executed.get('amount_usdt', 0),
-                        executed.get('executed_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        executed.get('executed_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
                         executed.get('added_to_stats', 0),
                         executed.get('skipped', 0),
                         executed.get('notified_at')
@@ -1524,7 +1542,7 @@ class BybitClient:
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
-            check_date = from_date if from_date else datetime.now() - timedelta(days=90)
+            check_date = from_date if from_date else get_moscow_time_naive() - timedelta(days=90)
             orders = await self.get_order_history(symbol, limit=500)
             executed = []
             for order in orders:
@@ -1566,7 +1584,7 @@ class BybitClient:
     
     async def get_completed_sell_orders(self, symbol: str = None, from_date: datetime = None) -> List[Dict]:
         try:
-            check_date = from_date if from_date else datetime.now() - timedelta(days=90)
+            check_date = from_date if from_date else get_moscow_time_naive() - timedelta(days=90)
             orders = await self.get_order_history(symbol, limit=500)
             completed = []
             for order in orders:
@@ -1737,12 +1755,12 @@ class DCAStrategy:
         result = await self.bybit.place_market_buy(symbol, amount_usdt)
         
         if result['success']:
-            current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            current_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
             self.db.add_purchase(symbol=symbol, amount_usdt=result['total_usdt'], price=result['price'],
                                 quantity=result['quantity'], multiplier=1.0, drop_percent=drop_percent,
                                 step_level=step_level, date=current_date)
             self.db.set_setting('last_purchase_price', str(result['price']))
-            self.db.set_setting('last_purchase_time', str(datetime.now().timestamp()))
+            self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
             target_price_sell = result['price'] * (1 + profit_percent / 100)
             sell_result = await self.bybit.place_limit_sell(symbol, result['quantity'], target_price_sell)
@@ -1837,12 +1855,12 @@ class DCAStrategy:
         last_check = self.db.get_last_sell_check_time()
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
-            first_order_date = datetime.now() - timedelta(days=30)
+            first_order_date = get_moscow_time_naive() - timedelta(days=30)
         check_date = last_check if last_check and last_check > first_order_date else first_order_date
         check_date = check_date - timedelta(hours=24)
         
         all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
-        self.db.set_last_sell_check_time(datetime.now())
+        self.db.set_last_sell_check_time(get_moscow_time_naive())
         
         already_processed = self.db.get_completed_sells_not_notified(symbol)
         processed_order_ids = set([s['order_id'] for s in already_processed])
@@ -1943,10 +1961,10 @@ class DCAStrategy:
         last_check = self.db.get_last_incremental_check_time()
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
-            first_order_date = datetime.now() - timedelta(days=30)
+            first_order_date = get_moscow_time_naive() - timedelta(days=30)
         check_date = last_check if last_check and last_check > first_order_date else first_order_date
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
-        self.db.set_last_incremental_check_time(datetime.now())
+        self.db.set_last_incremental_check_time(get_moscow_time_naive())
         
         purchases = self.db.get_purchases(symbol)
         added_orders = set()
@@ -2000,7 +2018,7 @@ class DCAStrategy:
     async def full_check_missing_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
-            first_order_date = datetime.now() - timedelta(days=90)
+            first_order_date = get_moscow_time_naive() - timedelta(days=90)
         check_date = first_order_date - timedelta(days=1)
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         
@@ -2057,12 +2075,12 @@ class DCAStrategy:
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
         
-        self.db.set_last_full_check_time(datetime.now())
+        self.db.set_last_full_check_time(get_moscow_time_naive())
         return missing_orders
     
     async def auto_check_and_notify(self, symbol: str, user_id: int, bot) -> Dict:
         last_full_check = self.db.get_last_full_check_time()
-        now = datetime.now()
+        now = get_moscow_time_naive()
         need_full_check = False
         if last_full_check is None:
             need_full_check = True
@@ -2085,7 +2103,7 @@ class DCAStrategy:
     async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
-            first_order_date = datetime.now() - timedelta(days=90)
+            first_order_date = get_moscow_time_naive() - timedelta(days=90)
         check_date = first_order_date - timedelta(days=1)
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         purchases = self.db.get_purchases(symbol)
@@ -2149,7 +2167,7 @@ class DCAStrategy:
     async def force_check_completed_sells(self, symbol: str, bot, user_id: int) -> Dict:
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
-            first_order_date = datetime.now() - timedelta(days=90)
+            first_order_date = get_moscow_time_naive() - timedelta(days=90)
         check_date = first_order_date - timedelta(days=1)
         all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
         already_processed = self.db.get_completed_sells_not_notified(symbol)
@@ -2461,10 +2479,12 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return
         await self._reset_bot_state(context)
+        current_time = get_moscow_time()
         await update.message.reply_text(
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
-            f"📌 Версия: {BOT_VERSION}\n\n"
+            f"📌 Версия: {BOT_VERSION}\n"
+            f"🕐 Московское время: {current_time.strftime('%H:%M')}\n\n"
             f"Главное меню:",
             reply_markup=self.get_main_keyboard()
         )
@@ -2477,10 +2497,12 @@ class FastDCABot:
         enabled = self.db.get_purchase_notify_enabled()
         notify_time = self.db.get_purchase_notify_time()
         status_text = "🔔 Включены" if enabled else "🔕 Выключены"
+        current_time = get_moscow_time()
         await update.message.reply_text(
             f"🔔 *Уведомления о покупке*\n\n"
             f"📋 Статус: {status_text}\n"
-            f"⏰ Время уведомления: `{notify_time}`\n\n"
+            f"⏰ Время уведомления: `{notify_time}` (МСК)\n"
+            f"🕐 Текущее московское время: `{current_time.strftime('%H:%M')}`\n\n"
             f"В указанное время бот будет присылать рекомендацию\n"
             f"о покупке по текущей цене.\n\n"
             f"Выберите действие:",
@@ -2499,9 +2521,11 @@ class FastDCABot:
     
     async def set_purchase_notify_time_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_time = self.db.get_purchase_notify_time()
+        moscow_time = get_moscow_time()
         await update.message.reply_text(
             f"⏰ Введите время уведомления (формат ЧЧ:ММ):\n"
-            f"*Текущее время:* `{current_time}`\n\n"
+            f"*Текущее время:* `{current_time}` (МСК)\n"
+            f"*Текущее московское время:* `{moscow_time.strftime('%H:%M')}`\n\n"
             f"Пример: 06:00 или 18:30",
             reply_markup=self.get_cancel_keyboard(),
             parse_mode='Markdown'
@@ -2516,7 +2540,7 @@ class FastDCABot:
         try:
             datetime.strptime(text, "%H:%M")
             self.db.set_purchase_notify_time(text)
-            await update.message.reply_text(f"✅ Время уведомления установлено: {text}", reply_markup=self.get_purchase_notify_settings_keyboard())
+            await update.message.reply_text(f"✅ Время уведомления установлено: {text} (МСК)", reply_markup=self.get_purchase_notify_settings_keyboard())
             return WAITING_PURCHASE_NOTIFY_TIME
         except ValueError:
             await update.message.reply_text("❌ Некорректный формат. Используйте ЧЧ:ММ (например: 06:00)", reply_markup=self.get_cancel_keyboard())
@@ -2535,7 +2559,7 @@ class FastDCABot:
             await update.message.reply_text(f"✅ Экспортировано! Записей: {count}")
             try:
                 with open(file_path, 'rb') as f:
-                    await update.message.reply_document(document=InputFile(f, filename=DB_EXPORT_FILE), caption=f"💾 Файл базы данных от {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+                    await update.message.reply_document(document=InputFile(f, filename=DB_EXPORT_FILE), caption=f"💾 Файл базы данных от {get_moscow_time_naive().strftime('%d.%m.%Y %H:%M')}")
             except Exception as e:
                 await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
         else:
@@ -2569,7 +2593,7 @@ class FastDCABot:
         try:
             await update.message.reply_text("⏳ Импортирую данные...")
             file = await context.bot.get_file(update.message.document.file_id)
-            temp_file = f"temp_import_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+            temp_file = f"temp_import_{get_moscow_time_naive().strftime('%Y%m%d%H%M%S')}.json"
             await file.download_to_drive(temp_file)
             success, message = self.db.import_database(temp_file)
             if os.path.exists(temp_file):
@@ -2644,7 +2668,7 @@ class FastDCABot:
             f"🕐 Интервал проверки: {interval} минут\n\n"
             f"При включенной настройке бот каждые {interval} минут проверяет новые исполненные ордера\n"
             f"и предлагает добавить их в статистику.\n\n"
-            f"*Полная проверка* всех ордеров за 90 дней выполняется автоматически каждый день в 19:00.",
+            f"*Полная проверка* всех ордеров за 90 дней выполняется автоматически каждый день в 19:00 (МСК).",
             parse_mode='Markdown',
             reply_markup=self.get_tracking_settings_keyboard()
         )
@@ -2678,7 +2702,7 @@ class FastDCABot:
             f"📋 Отслеживание ордеров: {status_text}\n"
             f"💰 Отслеживание продаж: {sell_tracking_text}\n"
             f"🕐 Интервал проверки: `{current_interval}` минут\n"
-            f"📅 Полная проверка: ежедневно в 19:00\n\n"
+            f"📅 Полная проверка: ежедневно в 19:00 (МСК)\n\n"
             f"Выберите действие:",
             reply_markup=self.get_tracking_settings_keyboard(),
             parse_mode='Markdown'
@@ -3050,6 +3074,7 @@ class FastDCABot:
         order_interval = self.db.get_order_check_interval()
         last_full_check = self.db.get_last_full_check_time()
         first_order_date = self.db.get_first_order_date()
+        current_time = get_moscow_time()
         message = f"📋 *Статус бота*\n\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
         message += f"🪙 Токен: `{symbol}`\n"
@@ -3057,7 +3082,8 @@ class FastDCABot:
         message += f"📈 Цель: `{self.db.get_setting('profit_percent', '5')}%`\n"
         message += f"📋 Отслеживание ордеров: {'✅ Вкл' if order_execution else '⏹ Выкл'}\n"
         message += f"💰 Отслеживание продаж: {'✅ Вкл' if sell_tracking else '⏹ Выкл'}\n"
-        message += f"🔔 Уведомления о покупке: {'✅ Вкл' if purchase_notify else '⏹ Выкл'} ({purchase_notify_time})\n"
+        message += f"🔔 Уведомления о покупке: {'✅ Вкл' if purchase_notify else '⏹ Выкл'} ({purchase_notify_time} МСК)\n"
+        message += f"🕐 Текущее время (МСК): `{current_time.strftime('%H:%M')}`\n"
         message += f"🕐 Интервал проверки: `{order_interval}` мин\n"
         if first_order_date:
             message += f"📅 Первый ордер: `{first_order_date.strftime('%d.%m.%Y %H:%M')}`\n"
@@ -3459,7 +3485,7 @@ class FastDCABot:
             if result['success']:
                 profit_percent = float(self.db.get_setting('profit_percent', '5'))
                 target_price = price * (1 + profit_percent / 100)
-                current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                current_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
                 drop_percent = recommendation.get('drop_percent', 0) if recommendation.get('should_buy') else 0
                 step_level = recommendation.get('step_level', 0) if recommendation.get('should_buy') else 0
                 self.db.add_purchase(symbol=symbol, amount_usdt=amount, price=price, quantity=result['quantity'], multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=current_date)
@@ -3589,7 +3615,7 @@ class FastDCABot:
             if stats and stats['avg_price'] > 0:
                 drop_percent = calculate_current_drop(price, stats['avg_price'])
                 step_level = int(drop_percent)
-            purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=amount_usdt, price=price, quantity=quantity, multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=amount_usdt, price=price, quantity=quantity, multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S"))
             if purchase_id:
                 msg = f"✅ *Покупка добавлена!*\n\n🆔 ID: `{purchase_id}`\n💰 Цена: `{format_price(price, 4)}` USDT\n📊 Количество: `{format_quantity(quantity, 2)}`\n💵 Сумма: `{amount_usdt:.2f}` USDT"
                 if drop_percent > 0:
@@ -3712,7 +3738,7 @@ class FastDCABot:
         patterns = [
             (r'^(\d{1,2})\.(\d{1,2})\.(\d{4})$', lambda m: (int(m.group(1)), int(m.group(2)), int(m.group(3)))),
             (r'^(\d{1,2})\.(\d{1,2})\.(\d{2})$', lambda m: (int(m.group(1)), int(m.group(2)), 2000 + int(m.group(3)))),
-            (r'^(\d{1,2})\.(\d{1,2})$', lambda m: (int(m.group(1)), int(m.group(2)), datetime.now().year)),
+            (r'^(\d{1,2})\.(\d{1,2})$', lambda m: (int(m.group(1)), int(m.group(2)), get_moscow_time_naive().year)),
         ]
         for pattern, extractor in patterns:
             match = re.match(pattern, date_str)
@@ -3927,7 +3953,8 @@ class FastDCABot:
             await asyncio.sleep(interval_minutes * 60)
     
     async def purchase_notify_loop(self):
-        logger.info("Purchase notify loop started")
+        """Цикл ежедневных уведомлений о покупке (использует московское время)"""
+        logger.info("Purchase notify loop started (Moscow timezone)")
         await asyncio.sleep(10)
         while self.scheduler_running:
             try:
@@ -3939,28 +3966,38 @@ class FastDCABot:
                 if not self.bybit_initialized:
                     await asyncio.sleep(60)
                     continue
-                now = datetime.now()
+                
+                # ИСПОЛЬЗУЕМ МОСКОВСКОЕ ВРЕМЯ
+                now = get_moscow_time()
                 notify_time_str = self.db.get_purchase_notify_time()
                 last_notify_date = self.db.get_last_purchase_notify_date()
                 current_date_str = now.strftime("%Y-%m-%d")
+                
                 should_notify = False
                 notify_hour, notify_minute = map(int, notify_time_str.split(':'))
+                
+                # Проверяем, наступило ли время уведомления (с погрешностью 5 минут)
                 if now.hour == notify_hour and now.minute >= notify_minute and now.minute < notify_minute + 5:
                     if last_notify_date != current_date_str:
                         should_notify = True
+                
                 if should_notify and self.authorized_user_id:
                     symbol = self.db.get_setting('symbol', 'TONUSDT')
                     current_price = await self.bybit.get_symbol_price(symbol)
                     if current_price:
                         ladder_info = self.db.calculate_ladder_purchase(current_price, symbol)
                         stats = self.db.get_dca_stats(symbol)
+                        
                         msg = f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ О ПОКУПКЕ*\n\n"
                         msg += f"🪙 Токен: `{symbol}`\n"
                         msg += f"💰 Текущая цена: `{format_price(current_price, 4)}` USDT\n"
+                        msg += f"🕐 Время (МСК): `{now.strftime('%H:%M')}`\n"
+                        
                         if stats and stats['avg_price'] > 0:
                             current_drop = calculate_current_drop(current_price, stats['avg_price'])
                             msg += f"📉 Средняя цена: `{format_price(stats['avg_price'], 4)}` USDT\n"
                             msg += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n"
+                        
                         if ladder_info['should_buy']:
                             settings = self.db.get_ladder_settings(symbol)
                             drop_for_buy = ladder_info.get('current_drop', 0)
@@ -3981,17 +4018,20 @@ class FastDCABot:
                             msg += f"📊 Коэффициент при падении: `{next_ratio:.4f}`\n"
                             msg += f"💰 Ожидаемая сумма покупки: `{amount_at_next:.2f}` USDT\n"
                             msg += f"💰 Целевая цена: `{format_price(ladder_info['target_price'], 4)}` USDT"
+                        
                         try:
                             await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
                             self.db.set_last_purchase_notify_date(current_date_str)
-                            logger.info(f"Sent daily purchase notification at {notify_time_str}")
+                            logger.info(f"Sent daily purchase notification at {notify_time_str} MSK")
                         except Exception as e:
                             logger.error(f"Error sending purchase notification: {e}")
+                
             except asyncio.CancelledError:
                 logger.info("Purchase notify loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Purchase notify loop error: {e}")
+            
             await asyncio.sleep(60)
     
     async def post_init(self, application):
@@ -4105,9 +4145,9 @@ class FastDCABot:
                     date_obj = executed_at
                 purchase_date = date_obj.strftime("%Y-%m-%d %H:%M:%S")
             except:
-                purchase_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                purchase_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
         else:
-            purchase_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            purchase_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
         symbol = order_dict['symbol']
         price = order_dict['price']
         stats = self.db.get_dca_stats(symbol)
@@ -4273,6 +4313,7 @@ class FastDCABot:
         print(f"\n{Fore.CYAN}{'='*60}")
         print(f"{Fore.CYAN}🚀 ЗАПУСК DCA BYBIT BOT (МАРТИНГЕЙЛ ЛЕСТНИЦОЙ)")
         print(f"{Fore.CYAN}Версия: {BOT_VERSION}")
+        print(f"{Fore.CYAN}Часовой пояс: Москва (UTC+3)")
         print(f"{Fore.CYAN}{'='*60}")
         if not TELEGRAM_TOKEN:
             print(f"{Fore.RED}❌ TELEGRAM_BOT_TOKEN не найден!")
@@ -4281,6 +4322,7 @@ class FastDCABot:
         print(f"{Fore.WHITE}👤 Пользователь: {AUTHORIZED_USER}")
         print(f"{Fore.WHITE}🌐 Testnet: {'Да' if BYBIT_TESTNET else 'Нет'}")
         print(f"{Fore.WHITE}💾 База данных: dca_bot.db (данные сохраняются)")
+        print(f"{Fore.WHITE}🕐 Московское время: {get_moscow_time().strftime('%H:%M')}")
         print(f"{Fore.CYAN}{'='*60}\n")
         self.application.post_init = self.post_init
         try:
