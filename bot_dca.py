@@ -2,7 +2,7 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.5 (13.04.2026)
+Версия 3.4.6 (13.04.2026)
 ИСПРАВЛЕНО: Обновлен формат ежедневного уведомления, уведомления включены по умолчанию
 """
 
@@ -2540,9 +2540,20 @@ class FastDCABot:
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_purchase_notify_settings_keyboard())
             return WAITING_PURCHASE_NOTIFY_TIME
         try:
-            datetime.strptime(text, "%H:%M")
-            self.db.set_purchase_notify_time(text)
-            await update.message.reply_text(f"✅ Время уведомления установлено: {text} (МСК)", reply_markup=self.get_purchase_notify_settings_keyboard())
+            new_time_str = text
+            datetime.strptime(new_time_str, "%H:%M")
+            self.db.set_purchase_notify_time(new_time_str)
+            
+            # Если новое время ещё не наступило сегодня, сбрасываем last_purchase_notify_date,
+            # чтобы бот мог отправить уведомление в новый час
+            now = get_moscow_time()
+            new_hour, new_minute = map(int, new_time_str.split(':'))
+            new_time_today = now.replace(hour=new_hour, minute=new_minute, second=0, microsecond=0)
+            if new_time_today > now:
+                self.db.set_last_purchase_notify_date('')
+                logger.info(f"Сброшен last_purchase_notify_date для повторной отправки сегодня в {new_time_str}")
+            
+            await update.message.reply_text(f"✅ Время уведомления установлено: {new_time_str} (МСК)", reply_markup=self.get_purchase_notify_settings_keyboard())
             return WAITING_PURCHASE_NOTIFY_TIME
         except ValueError:
             await update.message.reply_text("❌ Некорректный формат. Используйте ЧЧ:ММ (например: 06:00)", reply_markup=self.get_cancel_keyboard())
