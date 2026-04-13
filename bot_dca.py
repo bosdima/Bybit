@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.6 (13.04.2026)
-ИСПРАВЛЕНО: Обновлен формат ежедневного уведомления, уведомления включены по умолчанию
+Версия 3.4.7 (14.04.2026)
+ИСПРАВЛЕНО: Порядок хендлеров (кнопка "Настройки" снова работает)
 """
 
 import os
@@ -20,7 +20,6 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Dict, List, Optional, Tuple
 from colorama import init, Fore, Style
 
-# Поддержка часовых поясов
 try:
     import pytz
 except ImportError:
@@ -41,17 +40,12 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 from pybit.unified_trading import HTTP
 
-# Для Windows - устанавливаем политику событий
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# Инициализация colorama для цветного вывода
 init(autoreset=True)
-
-# Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
@@ -62,31 +56,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Константы
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-# Версия бота
-BOT_VERSION = "3.4.6 (13.04.2026)"
-
-# Таймаут для ConversationHandler (3 минуты)
+BOT_VERSION = "3.4.7 (14.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
-# Московский часовой пояс
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 def get_moscow_time() -> datetime:
-    """Возвращает текущее московское время"""
     return datetime.now(MOSCOW_TZ)
 
 def get_moscow_time_naive() -> datetime:
-    """Возвращает текущее московское время без информации о часовом поясе (для совместимости с SQLite)"""
     return datetime.now(MOSCOW_TZ).replace(tzinfo=None)
 
-# Состояния для ConversationHandler (34 состояния)
+# Состояния
 (
     SELECTING_ACTION,
     SET_SYMBOL,
@@ -128,7 +115,6 @@ DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 MAX_DROP_DEPTH = 80
 
-# Список кнопок главного меню для проверки
 MAIN_MENU_BUTTONS = [
     "📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
     "💰 Ручная покупка (лимит)", "📈 Статистика DCA", "➕ Добавить покупку вручную",
@@ -138,58 +124,39 @@ MAIN_MENU_BUTTONS = [
     "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку"
 ]
 
-# ============= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =============
-
 def format_price(price: float, decimals: int = 4) -> str:
-    if price is None:
-        return "N/A"
+    if price is None: return "N/A"
     return f"{price:.{decimals}f}"
 
 def format_quantity(qty: float, decimals: int = 2) -> str:
-    if qty is None:
-        return "N/A"
+    if qty is None: return "N/A"
     return f"{qty:.{decimals}f}"
 
 def round_price_up(price: float) -> float:
-    """Округляет цену вверх до сотых долей"""
     return math.ceil(price * 100) / 100
 
 def round_quantity_for_sell(quantity: float, min_qty: float = 0.01) -> float:
     rounded = math.floor(quantity * 100) / 100
-    if rounded < min_qty:
-        rounded = min_qty
+    if rounded < min_qty: rounded = min_qty
     return rounded
 
 def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) -> Tuple[int, float]:
-    """
-    Рассчитывает уровень (процент падения) и коэффициент мартингейла.
-    Коэффициент меняется на каждый процент падения.
-    """
-    if drop_percent <= 0:
-        return 0, 0.0
-    
+    if drop_percent <= 0: return 0, 0.0
     effective_drop = min(drop_percent, max_depth)
     ratio = (effective_drop / max_depth) * 3.0
     ratio = min(ratio, 3.0)
     level = int(effective_drop)
-    
     return level, ratio
 
 def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
-    """
-    Рассчитывает сумму покупки в зависимости от падения (плавно, на каждый процент).
-    """
-    if drop_percent <= 0:
-        return base_amount
-    
+    if drop_percent <= 0: return base_amount
     effective_drop = min(drop_percent, max_depth)
     fraction = effective_drop / max_depth
     amount = base_amount + (max_amount - base_amount) * fraction
     return min(amount, max_amount)
 
 def calculate_current_drop(current_price: float, avg_price: float) -> float:
-    if avg_price <= 0:
-        return 0
+    if avg_price <= 0: return 0
     drop = ((avg_price - current_price) / avg_price) * 100
     return max(0, drop)
 
@@ -339,7 +306,6 @@ class Database:
                 if 'added_to_stats' not in columns:
                     cursor.execute("ALTER TABLE executed_orders ADD COLUMN added_to_stats BOOLEAN DEFAULT 0")
             
-            # ВАЖНО: purchase_notify_enabled по умолчанию 'true' (включено)
             defaults = [
                 ('symbol', 'TONUSDT'),
                 ('invest_amount', '1.1'),
@@ -359,7 +325,7 @@ class Database:
                 ('order_execution_notify', 'true'),
                 ('order_check_interval_minutes', '60'),
                 ('sell_tracking_enabled', 'true'),
-                ('purchase_notify_enabled', 'true'),  # ВКЛЮЧЕНО ПО УМОЛЧАНИЮ
+                ('purchase_notify_enabled', 'true'),
                 ('purchase_notify_time', '06:00'),
                 ('last_order_check_time', ''),
                 ('last_full_check_time', ''),
@@ -761,7 +727,6 @@ class Database:
         self.set_setting('last_sell_check_time', check_time.isoformat())
     
     def get_purchase_notify_enabled(self) -> bool:
-        # По умолчанию ВКЛЮЧЕНО
         return self.get_setting('purchase_notify_enabled', 'true') == 'true'
     
     def set_purchase_notify_enabled(self, enabled: bool):
@@ -2491,7 +2456,6 @@ class FastDCABot:
             reply_markup=self.get_main_keyboard()
         )
     
-    # ============= Управление уведомлениями о покупке =============
     async def purchase_notify_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -2544,8 +2508,7 @@ class FastDCABot:
             datetime.strptime(new_time_str, "%H:%M")
             self.db.set_purchase_notify_time(new_time_str)
             
-            # Если новое время ещё не наступило сегодня, сбрасываем last_purchase_notify_date,
-            # чтобы бот мог отправить уведомление в новый час
+            # Сброс даты последнего уведомления, если новое время ещё не наступило сегодня
             now = get_moscow_time()
             new_hour, new_minute = map(int, new_time_str.split(':'))
             new_time_today = now.replace(hour=new_hour, minute=new_minute, second=0, microsecond=0)
@@ -3149,7 +3112,6 @@ class FastDCABot:
                 reply_markup=self.get_main_keyboard()
             )
     
-    # ============= НАСТРОЙКИ =============
     async def settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -3980,7 +3942,6 @@ class FastDCABot:
                     await asyncio.sleep(60)
                     continue
                 
-                # Используем московское время
                 now = get_moscow_time()
                 notify_time_str = self.db.get_purchase_notify_time()
                 last_notify_date = self.db.get_last_purchase_notify_date()
@@ -3989,7 +3950,6 @@ class FastDCABot:
                 should_notify = False
                 notify_hour, notify_minute = map(int, notify_time_str.split(':'))
                 
-                # Проверяем, наступило ли время уведомления (с погрешностью 5 минут)
                 if now.hour == notify_hour and now.minute >= notify_minute and now.minute < notify_minute + 5:
                     if last_notify_date != current_date_str:
                         should_notify = True
@@ -4001,7 +3961,6 @@ class FastDCABot:
                         stats = self.db.get_dca_stats(symbol)
                         settings = self.db.get_ladder_settings(symbol)
                         
-                        # НОВЫЙ ФОРМАТ УВЕДОМЛЕНИЯ
                         msg = f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ О ПОКУПКЕ*\n\n"
                         msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n"
                         msg += f"🕐 Время (МСК): `{now.strftime('%H:%M')}`\n\n"
@@ -4011,7 +3970,6 @@ class FastDCABot:
                             msg += f"📉 Средняя цена: `{format_price(stats['avg_price'], 4)}` USDT\n"
                             msg += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n\n"
                             
-                            # Получаем рекомендацию для текущего падения
                             recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol)
                             if recommendation['success']:
                                 msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
@@ -4021,7 +3979,6 @@ class FastDCABot:
                             else:
                                 msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Покупка не требуется\n"
                         else:
-                            # Первая покупка
                             msg += f"📊 *Статистика DCA отсутствует*\n\n"
                             msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
                             msg += f"📉 Уровень падения составляет: `0.0%`\n"
@@ -4303,6 +4260,7 @@ class FastDCABot:
         )
         self.application.add_handler(cancel_order_conv)
         
+        # Отдельные MessageHandler ДОЛЖНЫ БЫТЬ ПОСЛЕ ConversationHandler
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
@@ -4313,6 +4271,7 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
         
+        # Универсальный обработчик должен быть ПОСЛЕДНИМ
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
     
