@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.4 (13.04.2026)
-ИСПРАВЛЕНО: Добавлена поддержка московского часового пояса (UTC+3) для уведомлений
+Версия 3.4.5 (13.04.2026)
+ИСПРАВЛЕНО: Обновлен формат ежедневного уведомления, уведомления включены по умолчанию
 """
 
 import os
@@ -20,7 +20,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Dict, List, Optional, Tuple
 from colorama import init, Fore, Style
 
-# ДОБАВЛЕНО: Поддержка часовых поясов
+# Поддержка часовых поясов
 try:
     import pytz
 except ImportError:
@@ -70,12 +70,12 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
 # Версия бота
-BOT_VERSION = "3.4.4 (13.04.2026)"
+BOT_VERSION = "3.4.5 (13.04.2026)"
 
 # Таймаут для ConversationHandler (3 минуты)
 CONVERSATION_TIMEOUT = 180
 
-# ДОБАВЛЕНО: Московский часовой пояс
+# Московский часовой пояс
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 def get_moscow_time() -> datetime:
@@ -339,6 +339,7 @@ class Database:
                 if 'added_to_stats' not in columns:
                     cursor.execute("ALTER TABLE executed_orders ADD COLUMN added_to_stats BOOLEAN DEFAULT 0")
             
+            # ВАЖНО: purchase_notify_enabled по умолчанию 'true' (включено)
             defaults = [
                 ('symbol', 'TONUSDT'),
                 ('invest_amount', '1.1'),
@@ -358,7 +359,7 @@ class Database:
                 ('order_execution_notify', 'true'),
                 ('order_check_interval_minutes', '60'),
                 ('sell_tracking_enabled', 'true'),
-                ('purchase_notify_enabled', 'true'),
+                ('purchase_notify_enabled', 'true'),  # ВКЛЮЧЕНО ПО УМОЛЧАНИЮ
                 ('purchase_notify_time', '06:00'),
                 ('last_order_check_time', ''),
                 ('last_full_check_time', ''),
@@ -760,7 +761,8 @@ class Database:
         self.set_setting('last_sell_check_time', check_time.isoformat())
     
     def get_purchase_notify_enabled(self) -> bool:
-        return self.get_setting('purchase_notify_enabled', 'false') == 'true'
+        # По умолчанию ВКЛЮЧЕНО
+        return self.get_setting('purchase_notify_enabled', 'true') == 'true'
     
     def set_purchase_notify_enabled(self, enabled: bool):
         self.set_setting('purchase_notify_enabled', 'true' if enabled else 'false')
@@ -3533,8 +3535,8 @@ class FastDCABot:
                 msg += f"🟢 *ПЕРВАЯ ПОКУПКА*\n"
                 msg += f"💰 Рекомендуемая сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
             else:
-                msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО МАРТИНГЕЙЛУ:*\n"
-                msg += f"📉 Уровень падения: `{recommendation['drop_percent']:.1f}%`\n"
+                msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
+                msg += f"📉 Уровень падения составляет: `{recommendation['drop_percent']:.1f}%`\n"
                 msg += f"📊 Коэффициент: `{recommendation['ratio']:.4f}`\n"
                 msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
         msg += f"Введите цену покупки (USDT):"
@@ -3967,7 +3969,7 @@ class FastDCABot:
                     await asyncio.sleep(60)
                     continue
                 
-                # ИСПОЛЬЗУЕМ МОСКОВСКОЕ ВРЕМЯ
+                # Используем московское время
                 now = get_moscow_time()
                 notify_time_str = self.db.get_purchase_notify_time()
                 last_notify_date = self.db.get_last_purchase_notify_date()
@@ -3985,39 +3987,35 @@ class FastDCABot:
                     symbol = self.db.get_setting('symbol', 'TONUSDT')
                     current_price = await self.bybit.get_symbol_price(symbol)
                     if current_price:
-                        ladder_info = self.db.calculate_ladder_purchase(current_price, symbol)
                         stats = self.db.get_dca_stats(symbol)
+                        settings = self.db.get_ladder_settings(symbol)
                         
+                        # НОВЫЙ ФОРМАТ УВЕДОМЛЕНИЯ
                         msg = f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ О ПОКУПКЕ*\n\n"
-                        msg += f"🪙 Токен: `{symbol}`\n"
-                        msg += f"💰 Текущая цена: `{format_price(current_price, 4)}` USDT\n"
-                        msg += f"🕐 Время (МСК): `{now.strftime('%H:%M')}`\n"
+                        msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n"
+                        msg += f"🕐 Время (МСК): `{now.strftime('%H:%M')}`\n\n"
                         
                         if stats and stats['avg_price'] > 0:
                             current_drop = calculate_current_drop(current_price, stats['avg_price'])
                             msg += f"📉 Средняя цена: `{format_price(stats['avg_price'], 4)}` USDT\n"
-                            msg += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n"
-                        
-                        if ladder_info['should_buy']:
-                            settings = self.db.get_ladder_settings(symbol)
-                            drop_for_buy = ladder_info.get('current_drop', 0)
-                            level, ratio = get_ladder_levels(drop_for_buy, settings['max_depth'])
-                            amount = get_amount_by_drop(drop_for_buy, settings['base_amount'], settings['max_amount'], settings['max_depth'])
-                            msg += f"\n🟢 *РЕКОМЕНДАЦИЯ:* Сейчас хороший момент для покупки!\n"
-                            msg += f"📉 Текущее падение: `{drop_for_buy:.1f}%`\n"
-                            msg += f"📊 Коэффициент: `{ratio:.4f}`\n"
-                            msg += f"💰 Рекомендуемая сумма: `{amount:.2f}` USDT\n\n"
-                            msg += f"💡 Используйте кнопку '💰 Ручная покупка (лимит)' для создания ордера"
+                            msg += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n\n"
+                            
+                            # Получаем рекомендацию для текущего падения
+                            recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol)
+                            if recommendation['success']:
+                                msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
+                                msg += f"📉 Уровень падения составляет: `{recommendation['drop_percent']:.1f}%`\n"
+                                msg += f"📊 Коэффициент: `{recommendation['ratio']:.4f}`\n"
+                                msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT"
+                            else:
+                                msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Покупка не требуется\n"
                         else:
-                            settings = self.db.get_ladder_settings(symbol)
-                            next_drop = ladder_info.get('next_drop', 0)
-                            amount_at_next = get_amount_by_drop(next_drop, settings['base_amount'], settings['max_amount'], settings['max_depth'])
-                            next_ratio = (next_drop / settings['max_depth']) * 3
-                            msg += f"\n⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения цены\n"
-                            msg += f"📉 Следующее падение: `{next_drop:.1f}%`\n"
-                            msg += f"📊 Коэффициент при падении: `{next_ratio:.4f}`\n"
-                            msg += f"💰 Ожидаемая сумма покупки: `{amount_at_next:.2f}` USDT\n"
-                            msg += f"💰 Целевая цена: `{format_price(ladder_info['target_price'], 4)}` USDT"
+                            # Первая покупка
+                            msg += f"📊 *Статистика DCA отсутствует*\n\n"
+                            msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
+                            msg += f"📉 Уровень падения составляет: `0.0%`\n"
+                            msg += f"📊 Коэффициент: `0.0000`\n"
+                            msg += f"💰 Рекомендуемая сумма покупки: `{settings['base_amount']:.2f}` USDT"
                         
                         try:
                             await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
@@ -4234,7 +4232,6 @@ class FastDCABot:
         )
         self.application.add_handler(edit_purchases_conv)
         
-        # ВАЖНО: Основной ConversationHandler для настроек - убран дублирующийся entry_points
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
@@ -4305,7 +4302,6 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
         
-        # Универсальный обработчик для неизвестных команд должен быть ПОСЛЕДНИМ
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
     
