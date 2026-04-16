@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.9 (16.04.2026)
-ИСПРАВЛЕНО: Завершение ConversationHandler после удаления покупки, кнопка "Настройки" работает
+Версия 3.5.0 (16.04.2026)
+ИСПРАВЛЕНО: Принудительная отмена старых ордеров перед продажей, исправлен парсинг basePrecision
 """
 
 import os
@@ -62,7 +62,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "3.4.9 (16.04.2026)"
+BOT_VERSION = "3.5.0 (16.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -1450,7 +1450,7 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            params = {"category": "spot", "openOnly": 0}
+            params = {"category": "spot"}
             if symbol:
                 params['symbol'] = symbol
             response = self.session.get_open_orders(**params)
@@ -1495,12 +1495,20 @@ class BybitClient:
                 info = response['result']['list'][0]
                 lot_size_filter = info.get('lotSizeFilter', {})
                 price_filter = info.get('priceFilter', {})
+                
+                # Исправлен парсинг basePrecision
+                base_precision_str = lot_size_filter.get('basePrecision', '2')
+                try:
+                    base_precision = int(float(base_precision_str))
+                except (ValueError, TypeError):
+                    base_precision = 2
+                
                 return {
                     'min_qty': float(lot_size_filter.get('minOrderQty', 0.01)),
                     'min_amt': float(lot_size_filter.get('minOrderAmt', 10)),
                     'qty_step': float(lot_size_filter.get('qtyStep', 0.01)),
                     'tick_size': float(price_filter.get('tickSize', 0.0001)),
-                    'base_precision': int(lot_size_filter.get('basePrecision', 2)),
+                    'base_precision': base_precision,
                 }
             return {'min_qty': 0.01, 'min_amt': 10, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
         except Exception as e:
@@ -2186,7 +2194,26 @@ class DCAStrategy:
                 return {'success': False, 'error': 'Нет купленных активов для продажи'}
             
             coin = symbol.replace('USDT', '')
-            # Получаем реальный доступный баланс с биржи
+            
+            # 1. Сначала ОБЯЗАТЕЛЬНО отменяем все старые ордера на продажу
+            if auto_cancel_old:
+                open_orders = await self.bybit.get_open_orders(symbol)
+                existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
+                if existing_sell_orders:
+                    if update and hasattr(update, 'message'):
+                        await update.message.reply_text(f"🔄 Обнаружено {len(existing_sell_orders)} старых ордеров на продажу. Отменяю их...")
+                    cancelled_count, cancelled_ids = await self.bybit.cancel_all_sell_orders(symbol)
+                    if cancelled_count > 0:
+                        for order_id in cancelled_ids:
+                            self.db.update_sell_order_status(order_id, 'cancelled')
+                        if update and hasattr(update, 'message'):
+                            await update.message.reply_text(f"✅ Отменено {cancelled_count} старых ордеров.")
+                        # Ждём немного, чтобы биржа обновила баланс
+                        await asyncio.sleep(2)
+                    else:
+                        logger.warning("Не удалось отменить старые ордера, но продолжаем...")
+            
+            # 2. Получаем доступный баланс ПОСЛЕ отмены ордеров
             balance_info = await self.bybit.get_balance(coin)
             if not balance_info or 'available' not in balance_info:
                 return {'success': False, 'error': 'Не удалось получить баланс монеты'}
@@ -2195,7 +2222,7 @@ class DCAStrategy:
             if available_qty <= 0:
                 return {'success': False, 'error': f'Доступный баланс {coin} равен 0. Возможно, монеты заблокированы в ордерах.'}
             
-            # Целевая цена считается от средней цены входа
+            # 3. Рассчитываем целевую цену
             avg_price = stats['avg_price']
             raw_target_price = avg_price * (1 + profit_percent / 100)
             rounded_price = round_price_up(raw_target_price)
@@ -2205,7 +2232,7 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
-            # Округляем доступное количество вниз по шагу
+            # 4. Округляем доступное количество
             sell_qty = math.floor(available_qty / qty_step) * qty_step
             if sell_qty < min_qty:
                 return {'success': False, 'error': f'Доступное количество ({available_qty:.6f}) меньше минимального ({min_qty})'}
@@ -2234,24 +2261,10 @@ class DCAStrategy:
                     await update.message.reply_text(msg, parse_mode='Markdown')
                 return {'success': False, 'pending': True, 'pending_id': pending_id, 'error': 'min_amount_error', 'message': msg}
             
-            # Отменяем старые ордера на продажу (если нужно)
-            open_orders = await self.bybit.get_open_orders(symbol)
-            existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
-            if existing_sell_orders and auto_cancel_old:
-                if update and hasattr(update, 'message'):
-                    await update.message.reply_text("🔄 Обнаружены старые ордера на продажу. Отменяю их...")
-                cancelled_count, cancelled_ids = await self.bybit.cancel_all_sell_orders(symbol)
-                if cancelled_count > 0:
-                    for order_id in cancelled_ids:
-                        self.db.update_sell_order_status(order_id, 'cancelled')
-                    if update and hasattr(update, 'message'):
-                        await update.message.reply_text(f"✅ Отменено {cancelled_count} старых ордеров. Выставляю новый...")
-                else:
-                    if update and hasattr(update, 'message'):
-                        await update.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
-                    return {'success': False, 'error': 'Не удалось отменить старые ордера'}
+            # 5. Выставляем ордер
+            if update and hasattr(update, 'message'):
+                await update.message.reply_text(f"📤 Выставляю ордер на продажу {format_quantity(sell_qty, 2)} {coin} по {format_price(rounded_price, 4)} USDT...")
             
-            # Выставляем ордер
             result = await self.bybit.place_limit_sell(symbol, sell_qty, rounded_price)
             if result['success']:
                 self.db.add_sell_order(
