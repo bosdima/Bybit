@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.7 (14.04.2026)
-ИСПРАВЛЕНО: Порядок хендлеров (кнопка "Настройки" снова работает)
+Версия 3.4.8 (16.04.2026)
+ИСПРАВЛЕНО: При выставлении ордера на продажу используется доступный баланс монеты (исправление ошибки Insufficient balance)
 """
 
 import os
@@ -62,7 +62,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "3.4.7 (14.04.2026)"
+BOT_VERSION = "3.4.8 (16.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -2184,29 +2184,44 @@ class DCAStrategy:
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
                 return {'success': False, 'error': 'Нет купленных активов для продажи'}
-            target_info = self.calculate_target_info(stats, profit_percent)
-            if not target_info:
-                return {'success': False, 'error': 'Не удалось рассчитать целевую цену'}
-            raw_price = target_info['target_price']
-            rounded_price = round_price_up(raw_price)
+            
             coin = symbol.replace('USDT', '')
-            total_quantity = stats['total_quantity']
-            if total_quantity <= 0:
-                return {'success': False, 'error': f'Количество {coin} равно 0'}
+            # Получаем реальный доступный баланс с биржи
+            balance_info = await self.bybit.get_balance(coin)
+            if not balance_info or 'available' not in balance_info:
+                return {'success': False, 'error': 'Не удалось получить баланс монеты'}
+            
+            available_qty = balance_info['available']
+            if available_qty <= 0:
+                return {'success': False, 'error': f'Доступный баланс {coin} равен 0. Возможно, монеты заблокированы в ордерах.'}
+            
+            # Целевая цена считается от средней цены входа
+            avg_price = stats['avg_price']
+            raw_target_price = avg_price * (1 + profit_percent / 100)
+            rounded_price = round_price_up(raw_target_price)
+            
             instrument_info = await self.bybit.get_instrument_info(symbol)
             qty_step = instrument_info['qty_step']
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
-            rounded_quantity = math.floor(total_quantity / qty_step) * qty_step
-            if rounded_quantity <= 0:
-                rounded_quantity = min_qty
-            order_value = rounded_quantity * rounded_price
+            
+            # Округляем доступное количество вниз по шагу
+            sell_qty = math.floor(available_qty / qty_step) * qty_step
+            if sell_qty < min_qty:
+                return {'success': False, 'error': f'Доступное количество ({available_qty:.6f}) меньше минимального ({min_qty})'}
+            
+            order_value = sell_qty * rounded_price
             if order_value < min_amt:
-                pending_id = self.db.add_pending_sell_order(symbol=symbol, quantity=rounded_quantity, target_price=rounded_price, profit_percent=profit_percent)
-                required_price = min_amt / rounded_quantity
+                pending_id = self.db.add_pending_sell_order(
+                    symbol=symbol,
+                    quantity=sell_qty,
+                    target_price=rounded_price,
+                    profit_percent=profit_percent
+                )
+                required_price = min_amt / sell_qty
                 msg = (f"⏳ *ОРДЕР ОТЛОЖЕН*\n\n"
                        f"🪙 Токен: `{symbol}`\n"
-                       f"📊 Количество: `{format_quantity(rounded_quantity, 2)}` {coin}\n"
+                       f"📊 Количество: `{format_quantity(sell_qty, 2)}` {coin}\n"
                        f"💰 Целевая цена: `{format_price(rounded_price, 4)}` USDT\n"
                        f"📈 Целевая прибыль: `{profit_percent}%`\n\n"
                        f"⚠️ *Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)*\n\n"
@@ -2218,6 +2233,8 @@ class DCAStrategy:
                 if update and hasattr(update, 'message'):
                     await update.message.reply_text(msg, parse_mode='Markdown')
                 return {'success': False, 'pending': True, 'pending_id': pending_id, 'error': 'min_amount_error', 'message': msg}
+            
+            # Отменяем старые ордера на продажу (если нужно)
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
             if existing_sell_orders and auto_cancel_old:
@@ -2233,17 +2250,44 @@ class DCAStrategy:
                     if update and hasattr(update, 'message'):
                         await update.message.reply_text("⚠️ Не удалось отменить старые ордера. Попробуйте позже.")
                     return {'success': False, 'error': 'Не удалось отменить старые ордера'}
-            result = await self.bybit.place_limit_sell(symbol, rounded_quantity, rounded_price)
+            
+            # Выставляем ордер
+            result = await self.bybit.place_limit_sell(symbol, sell_qty, rounded_price)
             if result['success']:
-                self.db.add_sell_order(symbol=symbol, order_id=result['order_id'], quantity=rounded_quantity, target_price=rounded_price, profit_percent=profit_percent)
-                self.db.log_action('FULL_SELL_ORDER', symbol, f"Ордер на продажу {rounded_quantity:.2f} {coin} по {rounded_price:.4f} USDT")
-                return {'success': True, 'order_id': result['order_id'], 'quantity': rounded_quantity, 'price': rounded_price, 'raw_price': raw_price, 'profit_percent': profit_percent}
+                self.db.add_sell_order(
+                    symbol=symbol,
+                    order_id=result['order_id'],
+                    quantity=sell_qty,
+                    target_price=rounded_price,
+                    profit_percent=profit_percent
+                )
+                self.db.log_action('FULL_SELL_ORDER', symbol, f"Ордер на продажу {sell_qty:.2f} {coin} по {rounded_price:.4f} USDT")
+                
+                warning_msg = ""
+                if sell_qty < stats['total_quantity']:
+                    diff = stats['total_quantity'] - sell_qty
+                    warning_msg = f"\n⚠️ Продано только {format_quantity(sell_qty, 2)} из {format_quantity(stats['total_quantity'], 2)} {coin}. Остаток ({format_quantity(diff, 2)}) недоступен (возможно, заблокирован)."
+                
+                return {
+                    'success': True,
+                    'order_id': result['order_id'],
+                    'quantity': sell_qty,
+                    'price': rounded_price,
+                    'raw_price': raw_target_price,
+                    'profit_percent': profit_percent,
+                    'warning': warning_msg
+                }
             elif result.get('error') == 'min_amount_error':
-                pending_id = self.db.add_pending_sell_order(symbol=symbol, quantity=rounded_quantity, target_price=rounded_price, profit_percent=profit_percent)
-                required_price = min_amt / rounded_quantity
+                pending_id = self.db.add_pending_sell_order(
+                    symbol=symbol,
+                    quantity=sell_qty,
+                    target_price=rounded_price,
+                    profit_percent=profit_percent
+                )
+                required_price = min_amt / sell_qty
                 msg = (f"⏳ *ОРДЕР ОТЛОЖЕН*\n\n"
                        f"🪙 Токен: `{symbol}`\n"
-                       f"📊 Количество: `{format_quantity(rounded_quantity, 2)}` {coin}\n"
+                       f"📊 Количество: `{format_quantity(sell_qty, 2)}` {coin}\n"
                        f"💰 Целевая цена: `{format_price(rounded_price, 4)}` USDT\n"
                        f"📈 Целевая прибыль: `{profit_percent}%`\n\n"
                        f"⚠️ *Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)*\n\n"
@@ -2620,7 +2664,8 @@ class FastDCABot:
                        f"📊 Количество: `{format_quantity(result['quantity'], 2)}`\n"
                        f"💰 Цена: `{format_price(result['price'], 4)}` USDT\n"
                        f"📈 Целевая прибыль: `{result['profit_percent']}%`\n"
-                       f"🆔 ID ордера: `{result['order_id']}`\n\n"
+                       f"🆔 ID ордера: `{result['order_id']}`\n"
+                       f"{result.get('warning', '')}\n\n"
                        f"✅ Ордер успешно выставлен!")
                 await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=self.get_main_keyboard())
                 self.db.log_action('SELL_ORDER_PLACED', sell_data['symbol'], f"Ордер на продажу {result['quantity']:.2f} по {result['price']:.4f} USDT")
@@ -4260,7 +4305,6 @@ class FastDCABot:
         )
         self.application.add_handler(cancel_order_conv)
         
-        # Отдельные MessageHandler ДОЛЖНЫ БЫТЬ ПОСЛЕ ConversationHandler
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
@@ -4271,7 +4315,6 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
         
-        # Универсальный обработчик должен быть ПОСЛЕДНИМ
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
     
