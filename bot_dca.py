@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.4.8 (16.04.2026)
-ИСПРАВЛЕНО: При выставлении ордера на продажу используется доступный баланс монеты (исправление ошибки Insufficient balance)
+Версия 3.4.9 (16.04.2026)
+ИСПРАВЛЕНО: Завершение ConversationHandler после удаления покупки, кнопка "Настройки" работает
 """
 
 import os
@@ -62,7 +62,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "3.4.8 (16.04.2026)"
+BOT_VERSION = "3.4.9 (16.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -3822,9 +3822,11 @@ class FastDCABot:
             purchase_id = context.user_data.get('editing_purchase_id')
             if purchase_id and self.db.delete_purchase(purchase_id):
                 await update.message.reply_text("✅ Покупка удалена!", reply_markup=self.get_main_keyboard())
+                await self._reset_bot_state(context)
                 return ConversationHandler.END
             else:
                 await update.message.reply_text("❌ Ошибка при удалении", reply_markup=self.get_main_keyboard())
+                await self._reset_bot_state(context)
                 return ConversationHandler.END
         return EDIT_PURCHASE_SELECT
     
@@ -3845,6 +3847,8 @@ class FastDCABot:
             await self.show_purchase_after_edit(update, context, purchase_id)
         else:
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
+            await self._reset_bot_state(context)
+            return ConversationHandler.END
     
     async def back_to_main(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
