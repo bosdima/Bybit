@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.5.0 (16.04.2026)
-ИСПРАВЛЕНО: Принудительная отмена старых ордеров перед продажей, исправлен парсинг basePrecision
+Версия 3.5.1 (16.04.2026)
+ИСПРАВЛЕНО: Исправлен порядок вывода сводки проверки, убрано дублирование сообщений
 """
 
 import os
@@ -62,7 +62,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "3.5.0 (16.04.2026)"
+BOT_VERSION = "3.5.1 (16.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -1363,8 +1363,6 @@ class Database:
         except Exception as e:
             logger.error(f"Error importing database: {e}")
             return False, str(e)
-
-
 class BybitClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -1496,7 +1494,6 @@ class BybitClient:
                 lot_size_filter = info.get('lotSizeFilter', {})
                 price_filter = info.get('priceFilter', {})
                 
-                # Исправлен парсинг basePrecision
                 base_precision_str = lot_size_filter.get('basePrecision', '2')
                 try:
                     base_precision = int(float(base_precision_str))
@@ -1701,8 +1698,6 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-
-
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
@@ -2076,6 +2071,7 @@ class DCAStrategy:
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
     
     async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
+        """Возвращает словарь с результатами проверки, НЕ отправляя сообщения пользователю."""
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
             first_order_date = get_moscow_time_naive() - timedelta(days=90)
@@ -2118,28 +2114,16 @@ class DCAStrategy:
                 if not existing:
                     self.db.add_executed_order(order['order_id'], symbol, order['price'], order['quantity'], order['amount_usdt'], order['executed_at'].strftime("%Y-%m-%d %H:%M:%S"))
                 missing_orders.append(order)
-        notified_count = 0
-        for order in missing_orders:
-            if notified_count >= 10:
-                break
-            msg = (f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
-                   f"🪙 Токен: `{symbol}`\n"
-                   f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
-                   f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
-                   f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
-                   f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                   f"❗ *Добавить в статистику покупок?*")
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
-                                             InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")]])
-            try:
-                await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
-                notified_count += 1
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
-        return {'total_found': len(all_orders), 'already_added': len(already_added), 'missing': missing_orders, 'check_date': check_date, 'notified_count': notified_count}
+        
+        return {
+            'total_found': len(all_orders),
+            'already_added': len(already_added),
+            'missing': missing_orders,
+            'check_date': check_date
+        }
     
     async def force_check_completed_sells(self, symbol: str, bot, user_id: int) -> Dict:
+        """Возвращает словарь с результатами проверки продаж, НЕ отправляя сообщения пользователю."""
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
             first_order_date = get_moscow_time_naive() - timedelta(days=90)
@@ -2165,27 +2149,24 @@ class DCAStrategy:
                 profit_percent = 0
                 profit_usdt = 0
             sell_id = self.db.add_completed_sell(symbol=symbol, order_id=sell['order_id'], quantity=sell['quantity'], sell_price=sell['sell_price'], profit_percent=profit_percent, profit_usdt=profit_usdt)
-            missing_sells.append({'id': sell_id, 'order_id': sell['order_id'], 'quantity': sell['quantity'], 'sell_price': sell['sell_price'], 'amount_usdt': sell['amount_usdt'], 'executed_at': sell['executed_at'], 'profit_percent': profit_percent, 'profit_usdt': profit_usdt})
+            missing_sells.append({
+                'id': sell_id,
+                'order_id': sell['order_id'],
+                'quantity': sell['quantity'],
+                'sell_price': sell['sell_price'],
+                'amount_usdt': sell['amount_usdt'],
+                'executed_at': sell['executed_at'],
+                'profit_percent': profit_percent,
+                'profit_usdt': profit_usdt
+            })
             self.db.update_sell_order_status(sell['order_id'], 'completed')
-        for sell in missing_sells:
-            profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
-            profit_color = "+" if sell['profit_usdt'] >= 0 else ""
-            msg = (f"💰 *СДЕЛКА ПРОДАНА!*\n\n"
-                   f"🪙 Токен: `{symbol}`\n"
-                   f"📊 Количество: `{format_quantity(sell['quantity'], 2)}`\n"
-                   f"💰 Цена продажи: `{format_price(sell['sell_price'], 4)}` USDT\n"
-                   f"💵 Сумма: `{sell['amount_usdt']:.2f}` USDT\n"
-                   f"{profit_emoji} Прибыль: `{profit_color}{sell['profit_usdt']:.2f}` USDT (`{profit_color}{sell['profit_percent']:.2f}%`)\n"
-                   f"🕐 Время: `{sell['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                   f"❗ *Очистить статистику DCA по этому токену?*\n"
-                   f"После очистки начнется новый цикл накопления.")
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Да, очистить статистику", callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
-                                             InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")]])
-            try:
-                await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
-        return {'total_found': len(all_completed), 'already_processed': len(already_processed), 'missing': missing_sells, 'check_date': check_date}
+        
+        return {
+            'total_found': len(all_completed),
+            'already_processed': len(already_processed),
+            'missing': missing_sells,
+            'check_date': check_date
+        }
     
     async def place_full_sell_order(self, update, symbol: str, profit_percent: float, auto_cancel_old: bool = True) -> Dict:
         try:
@@ -2788,30 +2769,84 @@ class FastDCABot:
     async def test_tracking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return NOTIFICATION_SETTINGS_MENU
-        await update.message.reply_text("🔍 *Запускаю полную проверку отслеживания...*\n\nПроверяю ордера на покупку и продажу...", parse_mode='Markdown')
+        
+        # ОДНО сообщение о начале проверки
+        msg = await update.message.reply_text("🔍 *Запускаю полную проверку...*", parse_mode='Markdown')
+        
         self._init_bybit()
         if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_tracking_settings_keyboard())
+            await msg.edit_text("❌ Bybit API не инициализирован.")
             return NOTIFICATION_SETTINGS_MENU
+        
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         first_order_date = self.db.get_first_order_date()
         check_date_str = first_order_date.strftime('%d.%m.%Y') if first_order_date else "начала торгов"
-        await update.message.reply_text(f"🔍 *Запускаю полную проверку отслеживания...*\n\n📅 Проверка с даты первого ордера: `{check_date_str}`\n\nПроверяю ордера на покупку и продажу...", parse_mode='Markdown')
-        sell_result = await self.strategy.force_check_completed_sells(symbol, self.application.bot, self.authorized_user_id)
+        
+        # Получаем результаты (без отправки сообщений)
         buy_result = await self.strategy.force_check_executed_orders(symbol, self.application.bot, self.authorized_user_id)
-        message = f"📊 *РЕЗУЛЬТАТ ПОЛНОЙ ПРОВЕРКИ*\n\n🪙 Токен: `{symbol}`\n📅 Проверка с даты первого ордера: `{check_date_str}`\n\n━━━━━━━━━━━━━━━━━━━━━━\n🟢 *ПОКУПКИ:*\n📋 Всего найдено: `{buy_result['total_found']}`\n✅ Уже в статистике: `{buy_result['already_added']}`\n❌ Отсутствуют: `{len(buy_result['missing'])}`\n━━━━━━━━━━━━━━━━━━━━━━\n🔴 *ПРОДАЖИ:*\n📋 Всего найдено: `{sell_result['total_found']}`\n✅ Уже обработано: `{sell_result['already_processed']}`\n❌ Отсутствуют: `{len(sell_result['missing'])}`\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        sell_result = await self.strategy.force_check_completed_sells(symbol, self.application.bot, self.authorized_user_id)
+        
+        # Формируем компактную сводку
+        summary = (
+            f"📊 *РЕЗУЛЬТАТ ПРОВЕРКИ*\n"
+            f"🪙 `{symbol}` | 📅 с `{check_date_str}`\n\n"
+            f"🟢 *Покупки:* найдено `{buy_result['total_found']}`, новых `{len(buy_result['missing'])}`\n"
+            f"🔴 *Продажи:* найдено `{sell_result['total_found']}`, новых `{len(sell_result['missing'])}`"
+        )
+        
         if buy_result['missing'] or sell_result['missing']:
-            message += f"⚠️ *Найдены новые ордера!*\n"
-            if buy_result['missing']:
-                message += f"🟢 Новых покупок: {len(buy_result['missing'])}\n"
-            if sell_result['missing']:
-                message += f"🔴 Новых продаж: {len(sell_result['missing'])}\n"
-            message += f"\n✅ *Уведомления отправлены выше!*"
-            if sell_result['missing']:
-                message += f"\n\n💡 *Для продаж:* Нажмите 'Да, очистить статистику' для подтверждения"
-        else:
-            message += f"✨ *Отлично!* Все ордера синхронизированы."
-        await update.message.reply_text(message, parse_mode='Markdown', reply_markup=self.get_tracking_settings_keyboard())
+            summary += f"\n\n⚠️ *Найдены новые ордера!* Сейчас пришлю уведомления..."
+        
+        await msg.edit_text(summary, parse_mode='Markdown')
+        
+        # Теперь отправляем уведомления по каждому отсутствующему ордеру
+        notified_count = 0
+        for order in buy_result['missing']:
+            if notified_count >= 10:
+                break
+            msg_text = (f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
+                       f"🪙 Токен: `{symbol}`\n"
+                       f"💰 Цена: `{format_price(order['price'], 4)}` USDT\n"
+                       f"📊 Количество: `{format_quantity(order['quantity'], 6)}`\n"
+                       f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
+                       f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                       f"❗ *Добавить в статистику покупок?*")
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
+                InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
+            ]])
+            try:
+                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg_text, parse_mode='Markdown', reply_markup=keyboard)
+                notified_count += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
+        
+        for sell in sell_result['missing']:
+            profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
+            profit_color = "+" if sell['profit_usdt'] >= 0 else ""
+            msg_text = (f"💰 *СДЕЛКА ПРОДАНА!*\n\n"
+                       f"🪙 Токен: `{symbol}`\n"
+                       f"📊 Количество: `{format_quantity(sell['quantity'], 2)}`\n"
+                       f"💰 Цена продажи: `{format_price(sell['sell_price'], 4)}` USDT\n"
+                       f"💵 Сумма: `{sell['amount_usdt']:.2f}` USDT\n"
+                       f"{profit_emoji} Прибыль: `{profit_color}{sell['profit_usdt']:.2f}` USDT (`{profit_color}{sell['profit_percent']:.2f}%`)\n"
+                       f"🕐 Время: `{sell['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                       f"❗ *Очистить статистику DCA по этому токену?*\n"
+                       f"После очистки начнется новый цикл накопления.")
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, очистить", callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
+                InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")
+            ]])
+            try:
+                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg_text, parse_mode='Markdown', reply_markup=keyboard)
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
+        
+        if notified_count == 0 and not sell_result['missing']:
+            await self.application.bot.send_message(chat_id=self.authorized_user_id, text="✨ *Отлично!* Все ордера синхронизированы.", parse_mode='Markdown')
+        
         return NOTIFICATION_SETTINGS_MENU
     
     async def back_to_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
