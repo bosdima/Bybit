@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.5.1 (16.04.2026)
-ИСПРАВЛЕНО: Исправлен порядок вывода сводки проверки, убрано дублирование сообщений
+Версия 3.5.2 (17.04.2026)
+ИСПРАВЛЕНО: Инкрементальная проверка теперь корректно находит новые ордера
 """
 
 import os
@@ -62,7 +62,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "3.5.1 (16.04.2026)"
+BOT_VERSION = "3.5.2 (17.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -410,6 +410,9 @@ class Database:
             conn.commit()
             conn.close()
             self.update_first_order_date()
+            # Сбрасываем время последней инкрементальной проверки, чтобы новые ордера были найдены
+            self.set_last_incremental_check_time(None)
+            logger.info("Сброшено время последней инкрементальной проверки из-за новой покупки")
             return purchase_id
         except Exception as e:
             logger.error(f"Error adding purchase: {e}")
@@ -1076,8 +1079,11 @@ class Database:
                 return None
         return None
     
-    def set_last_incremental_check_time(self, check_time: datetime):
-        self.set_setting('last_order_check_time', check_time.isoformat())
+    def set_last_incremental_check_time(self, check_time: Optional[datetime]):
+        if check_time is None:
+            self.set_setting('last_order_check_time', '')
+        else:
+            self.set_setting('last_order_check_time', check_time.isoformat())
     
     def export_database(self) -> Tuple[bool, int, str]:
         try:
@@ -1363,6 +1369,8 @@ class Database:
         except Exception as e:
             logger.error(f"Error importing database: {e}")
             return False, str(e)
+
+
 class BybitClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -1698,6 +1706,8 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
@@ -1928,12 +1938,22 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Инкрементальная проверка новых ордеров с момента последней проверки."""
         last_check = self.db.get_last_incremental_check_time()
         first_order_date = self.db.get_first_order_date()
-        if first_order_date is None:
-            first_order_date = get_moscow_time_naive() - timedelta(days=30)
-        check_date = last_check if last_check and last_check > first_order_date else first_order_date
+        
+        # Если нет даты последней проверки, используем дату первого ордера или 30 дней назад
+        if last_check is None:
+            if first_order_date is None:
+                last_check = get_moscow_time_naive() - timedelta(days=30)
+            else:
+                last_check = first_order_date
+        
+        # Запрашиваем ордера, начиная с last_check (минус 1 час для надёжности)
+        check_date = last_check - timedelta(hours=1)
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
+        
+        # Сохраняем время проверки (текущее московское время)
         self.db.set_last_incremental_check_time(get_moscow_time_naive())
         
         purchases = self.db.get_purchases(symbol)
@@ -1965,10 +1985,12 @@ class DCAStrategy:
                 self.db.add_executed_order(order['order_id'], symbol, order['price'], order['quantity'], order['amount_usdt'], order['executed_at'].strftime("%Y-%m-%d %H:%M:%S"))
                 self.db.mark_order_as_added(order['order_id'])
                 continue
-            if order['executed_at'] > check_date:
+            # Проверяем, что ордер был исполнен ПОСЛЕ последней проверки
+            if order['executed_at'] > last_check:
                 self.db.add_executed_order(order['order_id'], symbol, order['price'], order['quantity'], order['amount_usdt'], order['executed_at'].strftime("%Y-%m-%d %H:%M:%S"))
                 new_orders.append(order)
         
+        # Отправляем уведомления о новых ордерах
         for order in new_orders:
             msg = (f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
                    f"🪙 Токен: `{symbol}`\n"
@@ -1977,12 +1999,15 @@ class DCAStrategy:
                    f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
                    f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
                    f"❗ *Добавить в статистику покупок?*")
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
-                                             InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")]])
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
+                InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
+            ]])
             try:
                 await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
+        
         return new_orders
     
     async def full_check_missing_orders(self, symbol: str, user_id: int, bot) -> List[Dict]:
@@ -2038,8 +2063,10 @@ class DCAStrategy:
                    f"💵 Сумма: `{order['amount_usdt']:.2f}` USDT\n"
                    f"🕐 Время: `{order['executed_at'].strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
                    f"❗ *Добавить в статистику покупок?*")
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
-                                             InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")]])
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
+                InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
+            ]])
             try:
                 await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
             except Exception as e:
@@ -2189,7 +2216,6 @@ class DCAStrategy:
                             self.db.update_sell_order_status(order_id, 'cancelled')
                         if update and hasattr(update, 'message'):
                             await update.message.reply_text(f"✅ Отменено {cancelled_count} старых ордеров.")
-                        # Ждём немного, чтобы биржа обновила баланс
                         await asyncio.sleep(2)
                     else:
                         logger.warning("Не удалось отменить старые ордера, но продолжаем...")
