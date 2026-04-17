@@ -1,9 +1,9 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 3.5.2 (17.04.2026)
-ИСПРАВЛЕНО: Инкрементальная проверка теперь корректно находит новые ордера
+Версия 3.5.3 (17.04.2026)
+ИСПРАВЛЕНО: Сброс состояния при нажатии кнопок меню, исправлено округление количества при продаже
 """
 
 import os
@@ -62,7 +62,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "3.5.2 (17.04.2026)"
+BOT_VERSION = "3.5.3 (17.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -1634,7 +1634,11 @@ class BybitClient:
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
             
-            rounded_quantity = math.floor(quantity / qty_step) * qty_step
+            # Используем Decimal для точного округления
+            qty_decimal = Decimal(str(quantity))
+            step_decimal = Decimal(str(qty_step))
+            rounded_quantity = float((qty_decimal // step_decimal) * step_decimal)
+            
             if rounded_quantity <= 0:
                 rounded_quantity = min_qty
             
@@ -1670,7 +1674,9 @@ class BybitClient:
             if not price:
                 return {'success': False, 'error': 'Не удалось получить цену'}
             quantity = amount_usdt / price
-            quantity = math.floor(quantity / qty_step) * qty_step
+            qty_decimal = Decimal(str(quantity))
+            step_decimal = Decimal(str(qty_step))
+            quantity = float((qty_decimal // step_decimal) * step_decimal)
             if quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty}'}
             response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Market", qty=str(quantity))
@@ -1697,7 +1703,9 @@ class BybitClient:
             if amount_usdt < min_amt:
                 return {'success': False, 'error': f'Минимальная сумма: {min_amt} USDT'}
             quantity = amount_usdt / price
-            quantity = math.floor(quantity / qty_step) * qty_step
+            qty_decimal = Decimal(str(quantity))
+            step_decimal = Decimal(str(qty_step))
+            quantity = float((qty_decimal // step_decimal) * step_decimal)
             if quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty}'}
             response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Limit", qty=str(quantity), price=str(price), timeInForce="GTC")
@@ -2239,8 +2247,11 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
-            # 4. Округляем доступное количество
-            sell_qty = math.floor(available_qty / qty_step) * qty_step
+            # 4. Округляем доступное количество ДО ШАГА (исправление ошибки с десятичными знаками)
+            qty_decimal = Decimal(str(available_qty))
+            step_decimal = Decimal(str(qty_step))
+            sell_qty = float((qty_decimal // step_decimal) * step_decimal)
+            
             if sell_qty < min_qty:
                 return {'success': False, 'error': f'Доступное количество ({available_qty:.6f}) меньше минимального ({min_qty})'}
             
@@ -2658,7 +2669,9 @@ class FastDCABot:
             self.import_waiting = False
             await update.message.reply_text("❌ Импорт отменен", reply_markup=self.get_main_keyboard())
         else:
-            await update.message.reply_text("Нет активного импорта", reply_markup=self.get_main_keyboard())
+            # Если импорт не активен, просто сбрасываем состояние и показываем меню
+            await self._reset_bot_state(context)
+            await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
     
     async def handle_sell_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3540,6 +3553,10 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         text = update.message.text.strip()
+        if text in MAIN_MENU_BUTTONS:
+            await self._reset_bot_state(context)
+            await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
+            return ConversationHandler.END
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
@@ -3561,6 +3578,10 @@ class FastDCABot:
             return ConversationHandler.END
         self._init_bybit()
         text = update.message.text.strip()
+        if text in MAIN_MENU_BUTTONS:
+            await self._reset_bot_state(context)
+            await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
+            return ConversationHandler.END
         if text == "❌ Отмена":
             await update.message.reply_text("❌ Отменено", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
@@ -3637,6 +3658,7 @@ class FastDCABot:
     
     async def manual_add_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
+        # Проверяем, не нажал ли пользователь кнопку меню
         if text in MAIN_MENU_BUTTONS:
             await self._reset_bot_state(context)
             await update.message.reply_text("❌ Действие отменено. Возврат в главное меню.", reply_markup=self.get_main_keyboard())
