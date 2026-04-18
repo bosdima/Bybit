@@ -2,8 +2,8 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 4.0.0 (18.04.2026)
-ИСПРАВЛЕНО: Полностью переработана логика Авто DCA — покупка по расписанию с мартингейлом от средней цены
+Версия 4.1.0 (18.04.2026)
+ДОБАВЛЕНО: Переключение между обычным и демо-режимом в настройках
 """
 
 import os
@@ -60,9 +60,10 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
-BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
+# По умолчанию обычный режим (не тестнет)
+BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.0.0 (18.04.2026)"
+BOT_VERSION = "4.1.0 (18.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -332,7 +333,8 @@ class Database:
                 ('last_sell_check_time', ''),
                 ('last_purchase_notify_date', ''),
                 ('first_order_date', ''),
-                ('next_dca_purchase_time', ''),  # Время следующей покупки по расписанию
+                ('next_dca_purchase_time', ''),
+                ('trading_mode', 'real'),  # 'real' или 'demo'
             ]
             
             for key, value in defaults:
@@ -369,6 +371,18 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error setting {key}: {e}")
+    
+    def get_trading_mode(self) -> str:
+        """Возвращает текущий режим торговли: 'real' или 'demo'."""
+        return self.get_setting('trading_mode', 'real')
+    
+    def set_trading_mode(self, mode: str):
+        """Устанавливает режим торговли: 'real' или 'demo'."""
+        self.set_setting('trading_mode', mode)
+    
+    def is_demo_mode(self) -> bool:
+        """Возвращает True, если включён демо-режим."""
+        return self.get_trading_mode() == 'demo'
     
     def get_first_order_date(self) -> Optional[datetime]:
         date_str = self.get_setting('first_order_date', '')
@@ -1385,7 +1399,7 @@ class BybitClient:
     def _init_session(self):
         try:
             self.session = HTTP(testnet=self.testnet, api_key=self.api_key, api_secret=self.api_secret, recv_window=5000)
-            logger.info("Bybit session initialized")
+            logger.info(f"Bybit session initialized (testnet={self.testnet})")
         except Exception as e:
             logger.error(f"Session init error: {e}")
     
@@ -2437,10 +2451,12 @@ class FastDCABot:
     def _init_bybit(self):
         if not self.bybit_initialized and BYBIT_API_KEY and BYBIT_API_SECRET:
             try:
-                self.bybit = BybitClient(BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET)
+                # Используем режим из базы данных
+                testnet = self.db.is_demo_mode()
+                self.bybit = BybitClient(BYBIT_API_KEY, BYBIT_API_SECRET, testnet)
                 self.strategy = DCAStrategy(self.db, self.bybit)
                 self.bybit_initialized = True
-                logger.info("Bybit client initialized")
+                logger.info(f"Bybit client initialized (demo={testnet})")
             except Exception as e:
                 logger.error(f"Bybit init error: {e}")
     
@@ -2499,13 +2515,16 @@ class FastDCABot:
         ], resize_keyboard=True)
     
     def get_settings_keyboard(self):
+        mode = self.db.get_trading_mode()
+        mode_button = "🌐 Режим: Демо" if mode == 'demo' else "🌐 Режим: Обычный"
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("💵 Сумма покупки")],
             [KeyboardButton("📊 Процент прибыли"), KeyboardButton("📉 Настройки падения")],
             [KeyboardButton("⏰ Время покупки"), KeyboardButton("🔄 Частота покупки")],
             [KeyboardButton("🪜 Настройка лестницы"), KeyboardButton("⚙️ Настройки отслеживания")],
-            [KeyboardButton("🔔 Уведомления о покупке"), KeyboardButton("📤 Экспорт базы")],
-            [KeyboardButton("📥 Импорт базы"), KeyboardButton("🔙 Назад в меню")],
+            [KeyboardButton("🔔 Уведомления о покупке"), KeyboardButton(mode_button)],
+            [KeyboardButton("📤 Экспорт базы"), KeyboardButton("📥 Импорт базы")],
+            [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2603,10 +2622,8 @@ class FastDCABot:
         schedule_hour, schedule_minute = map(int, schedule_time_str.split(':'))
         now = get_moscow_time()
         
-        # Ближайшее время сегодня
         next_time = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
         
-        # Если время уже прошло, добавляем frequency_hours пока не получим будущее время
         while next_time <= now:
             next_time += timedelta(hours=frequency_hours)
         
@@ -2617,14 +2634,39 @@ class FastDCABot:
             return
         await self._reset_bot_state(context)
         current_time = get_moscow_time()
+        mode = self.db.get_trading_mode()
+        mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
         await update.message.reply_text(
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
             f"📌 Версия: {BOT_VERSION}\n"
+            f"🌐 Режим: {mode_text}\n"
             f"🕐 Московское время: {current_time.strftime('%H:%M')}\n\n"
             f"Главное меню:",
             reply_markup=self.get_main_keyboard()
         )
+    
+    async def toggle_trading_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Переключение между обычным и демо-режимом."""
+        if not await self._check_user_fast(update):
+            return SELECTING_ACTION
+        
+        current_mode = self.db.get_trading_mode()
+        new_mode = 'demo' if current_mode == 'real' else 'real'
+        self.db.set_trading_mode(new_mode)
+        
+        # Переинициализируем клиент Bybit
+        self.bybit_initialized = False
+        self._init_bybit()
+        
+        mode_text = "Демо-режим" if new_mode == 'demo' else "Обычный режим"
+        await update.message.reply_text(
+            f"✅ Режим изменён на: *{mode_text}*\n\n"
+            f"Клиент Bybit переподключён.",
+            reply_markup=self.get_settings_keyboard(),
+            parse_mode='Markdown'
+        )
+        return SELECTING_ACTION
     
     async def purchase_notify_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3273,7 +3315,10 @@ class FastDCABot:
         first_order_date = self.db.get_first_order_date()
         current_time = get_moscow_time()
         next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
+        mode = self.db.get_trading_mode()
+        mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
         message = f"📋 *Статус бота*\n\n"
+        message += f"🌐 Режим: {mode_text}\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
         if is_active and next_purchase_str:
             try:
@@ -3355,13 +3400,16 @@ class FastDCABot:
         profit_percent = self.db.get_setting('profit_percent', '5')
         schedule_time = self.db.get_setting('schedule_time', '09:00')
         frequency_hours = self.db.get_setting('frequency_hours', '24')
+        mode = self.db.get_trading_mode()
+        mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
         await update.message.reply_text(
             f"⚙️ *Настройки*\n\n"
             f"🪙 Токен: `{symbol}`\n"
             f"💵 Сумма: `{invest_amount}` USDT\n"
             f"📈 Прибыль: `{profit_percent}%`\n"
             f"⏰ Время: `{schedule_time}`\n"
-            f"🔄 Частота: `{frequency_hours}`ч\n\n"
+            f"🔄 Частота: `{frequency_hours}`ч\n"
+            f"🌐 Режим: {mode_text}\n\n"
             f"Выберите параметр для изменения:",
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
@@ -4532,6 +4580,7 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu),
                     MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
                     MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings),
+                    MessageHandler(filters.Regex('^🌐 Режим: (Обычный|Демо)$'), self.toggle_trading_mode),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
                 ],
                 SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
@@ -4603,7 +4652,7 @@ class FastDCABot:
             return
         print(f"{Fore.GREEN}✅ Токен: {TELEGRAM_TOKEN[:10]}...{TELEGRAM_TOKEN[-5:]}")
         print(f"{Fore.WHITE}👤 Пользователь: {AUTHORIZED_USER}")
-        print(f"{Fore.WHITE}🌐 Testnet: {'Да' if BYBIT_TESTNET else 'Нет'}")
+        print(f"{Fore.WHITE}🌐 Testnet (из .env): {'Да' if BYBIT_TESTNET_DEFAULT else 'Нет'}")
         print(f"{Fore.WHITE}💾 База данных: dca_bot.db (данные сохраняются)")
         print(f"{Fore.WHITE}🕐 Московское время: {get_moscow_time().strftime('%H:%M')}")
         print(f"{Fore.CYAN}{'='*60}\n")
