@@ -2,8 +2,9 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 4.1.0 (18.04.2026)
-ДОБАВЛЕНО: Переключение между обычным и демо-режимом в настройках
+Версия 4.2.0 (19.04.2026)
+ИСПРАВЛЕНИЯ: устранено зацикливание кнопок, исправлена проверка исполненных ордеров,
+             добавлено сохранение ID пользователя, улучшена обработка ошибок
 """
 
 import os
@@ -60,10 +61,9 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
-# По умолчанию обычный режим (не тестнет)
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.1.0 (18.04.2026)"
+BOT_VERSION = "4.2.0 (19.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -307,6 +307,14 @@ class Database:
                 if 'added_to_stats' not in columns:
                     cursor.execute("ALTER TABLE executed_orders ADD COLUMN added_to_stats BOOLEAN DEFAULT 0")
             
+            # Таблица для хранения ID авторизованного пользователя
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            ''')
+            
             defaults = [
                 ('symbol', 'TONUSDT'),
                 ('invest_amount', '1.1'),
@@ -334,7 +342,7 @@ class Database:
                 ('last_purchase_notify_date', ''),
                 ('first_order_date', ''),
                 ('next_dca_purchase_time', ''),
-                ('trading_mode', 'real'),  # 'real' или 'demo'
+                ('trading_mode', 'real'),
             ]
             
             for key, value in defaults:
@@ -373,15 +381,12 @@ class Database:
             logger.error(f"Error setting {key}: {e}")
     
     def get_trading_mode(self) -> str:
-        """Возвращает текущий режим торговли: 'real' или 'demo'."""
         return self.get_setting('trading_mode', 'real')
     
     def set_trading_mode(self, mode: str):
-        """Устанавливает режим торговли: 'real' или 'demo'."""
         self.set_setting('trading_mode', mode)
     
     def is_demo_mode(self) -> bool:
-        """Возвращает True, если включён демо-режим."""
         return self.get_trading_mode() == 'demo'
     
     def get_first_order_date(self) -> Optional[datetime]:
@@ -425,8 +430,8 @@ class Database:
             conn.commit()
             conn.close()
             self.update_first_order_date()
-            self.set_last_incremental_check_time(None)
-            logger.info("Сброшено время последней инкрементальной проверки из-за новой покупки")
+            # НЕ сбрасываем last_incremental_check_time, чтобы не дублировать уведомления
+            logger.info("Покупка добавлена, last_incremental_check_time не сброшен")
             return purchase_id
         except Exception as e:
             logger.error(f"Error adding purchase: {e}")
@@ -1099,6 +1104,27 @@ class Database:
         else:
             self.set_setting('last_order_check_time', check_time.isoformat())
     
+    def get_authorized_user_id(self) -> Optional[int]:
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('SELECT value FROM bot_state WHERE key = "authorized_user_id"')
+            row = cursor.fetchone()
+            conn.close()
+            return int(row[0]) if row else None
+        except Exception:
+            return None
+    
+    def set_authorized_user_id(self, user_id: int):
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)', ('authorized_user_id', str(user_id)))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error saving authorized user id: {e}")
+    
     def export_database(self) -> Tuple[bool, int, str]:
         try:
             purchases = self.get_purchases()
@@ -1735,7 +1761,6 @@ class DCAStrategy:
         self.bybit = bybit
     
     async def execute_scheduled_purchase(self, symbol: str, profit_percent: float) -> Dict:
-        """Выполняет покупку по расписанию с учётом мартингейла от средней цены."""
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
             return {'success': False, 'error': 'Не удалось получить цену'}
@@ -1744,9 +1769,7 @@ class DCAStrategy:
         settings = self.db.get_ladder_settings(symbol)
         base_amount = settings['base_amount']
         
-        # Определяем сумму покупки
         if not stats or stats['total_quantity'] <= 0:
-            # Первая покупка - базовая сумма
             amount_usdt = base_amount
             drop_percent = 0
             step_level = 0
@@ -1754,24 +1777,20 @@ class DCAStrategy:
             avg_price = stats['avg_price']
             current_drop = calculate_current_drop(current_price, avg_price)
             if current_price < avg_price:
-                # Цена ниже средней - покупаем по мартингейлу
                 amount_usdt = get_amount_by_drop(current_drop, base_amount, settings['max_amount'], settings['max_depth'])
                 drop_percent = current_drop
                 step_level = int(current_drop)
             else:
-                # Цена выше или равна средней - покупаем базовую сумму
                 amount_usdt = base_amount
                 drop_percent = 0
                 step_level = 0
         
-        # Проверяем баланс
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
         
         if available_usdt < amount_usdt:
             return {'success': False, 'error': f'Недостаточно средств. Нужно {amount_usdt:.2f} USDT, доступно {available_usdt:.2f} USDT'}
         
-        # Выполняем рыночную покупку
         result = await self.bybit.place_market_buy(symbol, amount_usdt)
         
         if result['success']:
@@ -1789,7 +1808,6 @@ class DCAStrategy:
             self.db.set_setting('last_purchase_price', str(result['price']))
             self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
-            # Создаём ордер на продажу
             target_price_sell = result['price'] * (1 + profit_percent / 100)
             sell_result = await self.bybit.place_limit_sell(symbol, result['quantity'], target_price_sell)
             
@@ -1823,7 +1841,6 @@ class DCAStrategy:
         return result
     
     async def execute_ladder_purchase(self, symbol: str, profit_percent: float) -> Dict:
-        """Старый метод для обратной совместимости (ручная покупка по рекомендации)."""
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
             return {'success': False, 'error': 'Не удалось получить цену'}
@@ -2048,7 +2065,6 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        """Инкрементальная проверка новых ордеров с момента последней проверки."""
         last_check = self.db.get_last_incremental_check_time()
         first_order_date = self.db.get_first_order_date()
         
@@ -2058,9 +2074,11 @@ class DCAStrategy:
             else:
                 last_check = first_order_date
         
-        check_date = last_check - timedelta(hours=1)
+        # Проверяем ордера с момента последней проверки (без вычитания часа)
+        check_date = last_check
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         
+        # Обновляем время проверки ДО обработки, чтобы не дублировать
         self.db.set_last_incremental_check_time(get_moscow_time_naive())
         
         purchases = self.db.get_purchases(symbol)
@@ -2187,12 +2205,11 @@ class DCAStrategy:
         if last_full_check is None:
             need_full_check = True
         else:
-            last_check_date = last_full_check.date()
-            today = now.date()
-            if last_check_date < today:
+            # Полная проверка раз в день в 19:00
+            if now.date() > last_full_check.date():
                 if now.hour >= 19:
                     need_full_check = True
-            elif last_check_date == today and last_full_check.hour < 19 and now.hour >= 19:
+            elif now.date() == last_full_check.date() and last_full_check.hour < 19 and now.hour >= 19:
                 need_full_check = True
         
         if need_full_check:
@@ -2203,7 +2220,6 @@ class DCAStrategy:
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
     
     async def force_check_executed_orders(self, symbol: str, bot, user_id: int) -> Dict:
-        """Возвращает словарь с результатами проверки, НЕ отправляя сообщения пользователю."""
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
             first_order_date = get_moscow_time_naive() - timedelta(days=90)
@@ -2255,7 +2271,6 @@ class DCAStrategy:
         }
     
     async def force_check_completed_sells(self, symbol: str, bot, user_id: int) -> Dict:
-        """Возвращает словарь с результатами проверки продаж, НЕ отправляя сообщения пользователю."""
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
             first_order_date = get_moscow_time_naive() - timedelta(days=90)
@@ -2443,7 +2458,7 @@ class FastDCABot:
         self.application = builder.build()
         
         self.scheduler_running = False
-        self.authorized_user_id = None
+        self.authorized_user_id = self.db.get_authorized_user_id()  # восстанавливаем из БД
         self.pending_executed_order = None
         
         self.setup_handlers()
@@ -2451,7 +2466,6 @@ class FastDCABot:
     def _init_bybit(self):
         if not self.bybit_initialized and BYBIT_API_KEY and BYBIT_API_SECRET:
             try:
-                # Используем режим из базы данных
                 testnet = self.db.is_demo_mode()
                 self.bybit = BybitClient(BYBIT_API_KEY, BYBIT_API_SECRET, testnet)
                 self.strategy = DCAStrategy(self.db, self.bybit)
@@ -2582,6 +2596,7 @@ class FastDCABot:
         if self.authorized_user_id is None:
             if username == AUTHORIZED_USER:
                 self.authorized_user_id = user.id
+                self.db.set_authorized_user_id(user.id)  # сохраняем в БД
                 return True
         elif user.id == self.authorized_user_id:
             return True
@@ -2615,7 +2630,6 @@ class FastDCABot:
         return ConversationHandler.END
     
     def _calculate_next_purchase_time(self) -> datetime:
-        """Вычисляет время следующей покупки по расписанию."""
         schedule_time_str = self.db.get_setting('schedule_time', '09:00')
         frequency_hours = int(self.db.get_setting('frequency_hours', '24'))
         
@@ -2647,7 +2661,6 @@ class FastDCABot:
         )
     
     async def toggle_trading_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Переключение между обычным и демо-режимом."""
         if not await self._check_user_fast(update):
             return SELECTING_ACTION
         
@@ -2655,7 +2668,6 @@ class FastDCABot:
         new_mode = 'demo' if current_mode == 'real' else 'real'
         self.db.set_trading_mode(new_mode)
         
-        # Переинициализируем клиент Bybit
         self.bybit_initialized = False
         self._init_bybit()
         
@@ -3370,7 +3382,6 @@ class FastDCABot:
             self.db.set_setting('initial_reference_price', str(current_price))
             self.db.set_dca_start(symbol, current_price)
             
-            # Вычисляем время следующей покупки
             next_time = self._calculate_next_purchase_time()
             self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
             
@@ -3499,7 +3510,6 @@ class FastDCABot:
         try:
             datetime.strptime(time_str, "%H:%M")
             self.db.set_setting('schedule_time', time_str)
-            # Обновляем время следующей покупки, если DCA активен
             if self.db.get_setting('dca_active', 'false') == 'true':
                 next_time = self._calculate_next_purchase_time()
                 self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
@@ -3523,7 +3533,6 @@ class FastDCABot:
             if hours < 1 or hours > 720:
                 raise ValueError
             self.db.set_setting('frequency_hours', str(hours))
-            # Обновляем время следующей покупки, если DCA активен
             if self.db.get_setting('dca_active', 'false') == 'true':
                 next_time = self._calculate_next_purchase_time()
                 self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
@@ -3748,7 +3757,6 @@ class FastDCABot:
         try:
             amount = float(text.replace(',', '.'))
             
-            # Проверяем минимальную сумму
             self._init_bybit()
             if self.bybit_initialized:
                 instrument_info = await self.bybit.get_instrument_info(self.db.get_setting('symbol', 'TONUSDT'))
@@ -4132,11 +4140,10 @@ class FastDCABot:
         await update.message.reply_text("Используйте кнопки меню", reply_markup=self.get_main_keyboard())
     
     async def dca_scheduler_loop(self):
-        """Цикл автоматического DCA — проверяет расписание каждую минуту."""
         logger.info("DCA scheduler loop started (schedule-based)")
         while self.scheduler_running:
             try:
-                await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+                await asyncio.sleep(30)
                 
                 if self.db.get_setting('dca_active', 'false') != 'true':
                     continue
@@ -4150,7 +4157,6 @@ class FastDCABot:
                 next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
                 
                 if not next_purchase_str:
-                    # Если время не задано, вычисляем
                     next_time = self._calculate_next_purchase_time()
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     continue
@@ -4162,7 +4168,6 @@ class FastDCABot:
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     continue
                 
-                # Если наступило время покупки (с погрешностью 30 секунд)
                 if now >= next_time:
                     symbol = self.db.get_setting('symbol', 'TONUSDT')
                     profit_percent = float(self.db.get_setting('profit_percent', '5'))
@@ -4172,7 +4177,6 @@ class FastDCABot:
                     result = await self.strategy.execute_scheduled_purchase(symbol, profit_percent)
                     
                     if result['success']:
-                        # Уведомляем пользователя
                         if self.authorized_user_id:
                             msg = (f"🪜 *АВТО DCA — ПОКУПКА ПО РАСПИСАНИЮ*\n\n"
                                    f"🪙 Токен: `{symbol}`\n"
@@ -4199,11 +4203,9 @@ class FastDCABot:
                             except:
                                 pass
                     
-                    # Вычисляем следующее время покупки
                     frequency_hours = int(self.db.get_setting('frequency_hours', '24'))
                     next_time = next_time + timedelta(hours=frequency_hours)
                     
-                    # Убеждаемся, что следующее время в будущем
                     while next_time <= now:
                         next_time += timedelta(hours=frequency_hours)
                     
@@ -4216,6 +4218,7 @@ class FastDCABot:
                 break
             except Exception as e:
                 logger.error(f"DCA scheduler error: {e}")
+                await asyncio.sleep(60)
     
     async def sell_checker_loop(self):
         logger.info("Sell checker loop started")
@@ -4240,6 +4243,7 @@ class FastDCABot:
                 break
             except Exception as e:
                 logger.error(f"Sell checker error: {e}")
+                await asyncio.sleep(60)
             await asyncio.sleep(3600)
     
     async def pending_sell_checker_loop(self):
@@ -4262,6 +4266,7 @@ class FastDCABot:
                 break
             except Exception as e:
                 logger.error(f"Pending sell checker error: {e}")
+                await asyncio.sleep(60)
             await asyncio.sleep(1800)
     
     async def order_checker_loop(self):
@@ -4286,16 +4291,16 @@ class FastDCABot:
                     else:
                         logger.debug(f"No new orders found ({result['type']})")
                 else:
-                    logger.warning("No authorized user ID set, cannot send notifications")
+                    logger.warning("No authorized user ID set, cannot send order notifications")
             except asyncio.CancelledError:
                 logger.info("Order checker loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Order checker error: {e}")
+                await asyncio.sleep(60)
             await asyncio.sleep(interval_minutes * 60)
     
     async def purchase_notify_loop(self):
-        """Цикл ежедневных уведомлений о покупке (использует московское время)"""
         logger.info("Purchase notify loop started (Moscow timezone)")
         await asyncio.sleep(10)
         while self.scheduler_running:
@@ -4364,6 +4369,7 @@ class FastDCABot:
                 break
             except Exception as e:
                 logger.error(f"Purchase notify loop error: {e}")
+                await asyncio.sleep(60)
             
             await asyncio.sleep(60)
     
