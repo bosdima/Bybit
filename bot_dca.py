@@ -2,9 +2,13 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 4.2.0 (19.04.2026)
-ИСПРАВЛЕНИЯ: устранено зацикливание кнопок, исправлена проверка исполненных ордеров,
-             добавлено сохранение ID пользователя, улучшена обработка ошибок
+Версия 4.3.0 (20.04.2026)
+ИСПРАВЛЕНИЯ: 
+- Сохранение ID пользователя в БД
+- Уменьшен интервал проверки до 15 минут
+- Исправлена логика инкрементальной проверки
+- Добавлена немедленная проверка после покупки
+- Устранено зацикливание кнопок
 """
 
 import os
@@ -63,7 +67,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.2.0 (19.04.2026)"
+BOT_VERSION = "4.3.0 (20.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -332,7 +336,7 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '3.3'),
                 ('order_execution_notify', 'true'),
-                ('order_check_interval_minutes', '60'),
+                ('order_check_interval_minutes', '15'),  # Изменено с 60 на 15 минут
                 ('sell_tracking_enabled', 'true'),
                 ('purchase_notify_enabled', 'true'),
                 ('purchase_notify_time', '06:00'),
@@ -430,8 +434,7 @@ class Database:
             conn.commit()
             conn.close()
             self.update_first_order_date()
-            # НЕ сбрасываем last_incremental_check_time, чтобы не дублировать уведомления
-            logger.info("Покупка добавлена, last_incremental_check_time не сброшен")
+            logger.info("Покупка добавлена")
             return purchase_id
         except Exception as e:
             logger.error(f"Error adding purchase: {e}")
@@ -1072,7 +1075,7 @@ class Database:
         self.set_setting('order_execution_notify', 'true' if enabled else 'false')
     
     def get_order_check_interval(self) -> int:
-        return int(self.get_setting('order_check_interval_minutes', '60'))
+        return int(self.get_setting('order_check_interval_minutes', '15'))
     
     def set_order_check_interval(self, minutes: int):
         self.set_setting('order_check_interval_minutes', str(minutes))
@@ -2065,6 +2068,7 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Инкрементальная проверка новых ордеров с момента последней проверки."""
         last_check = self.db.get_last_incremental_check_time()
         first_order_date = self.db.get_first_order_date()
         
@@ -2074,7 +2078,7 @@ class DCAStrategy:
             else:
                 last_check = first_order_date
         
-        # Проверяем ордера с момента последней проверки (без вычитания часа)
+        # Проверяем ордера с момента последней проверки
         check_date = last_check
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         
@@ -2110,9 +2114,9 @@ class DCAStrategy:
                 self.db.add_executed_order(order['order_id'], symbol, order['price'], order['quantity'], order['amount_usdt'], order['executed_at'].strftime("%Y-%m-%d %H:%M:%S"))
                 self.db.mark_order_as_added(order['order_id'])
                 continue
-            if order['executed_at'] > last_check:
-                self.db.add_executed_order(order['order_id'], symbol, order['price'], order['quantity'], order['amount_usdt'], order['executed_at'].strftime("%Y-%m-%d %H:%M:%S"))
-                new_orders.append(order)
+            # Ордер не был обработан ранее
+            self.db.add_executed_order(order['order_id'], symbol, order['price'], order['quantity'], order['amount_usdt'], order['executed_at'].strftime("%Y-%m-%d %H:%M:%S"))
+            new_orders.append(order)
         
         for order in new_orders:
             msg = (f"✅ *ОРДЕР ИСПОЛНЕН!*\n\n"
@@ -2597,6 +2601,7 @@ class FastDCABot:
             if username == AUTHORIZED_USER:
                 self.authorized_user_id = user.id
                 self.db.set_authorized_user_id(user.id)  # сохраняем в БД
+                logger.info(f"Authorized user ID saved: {user.id}")
                 return True
         elif user.id == self.authorized_user_id:
             return True
@@ -2930,7 +2935,7 @@ class FastDCABot:
         await update.message.reply_text(
             f"⏱ Введите интервал проверки в минутах (от 5 до 1440):\n"
             f"*Текущий интервал: {self.db.get_order_check_interval()} минут*\n\n"
-            f"Рекомендуется: 60 минут",
+            f"Рекомендуется: 15 минут",
             reply_markup=self.get_cancel_keyboard(),
             parse_mode='Markdown'
         )
