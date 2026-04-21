@@ -2,13 +2,11 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 4.3.0 (20.04.2026)
+Версия 4.4.0 (21.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Сохранение ID пользователя в БД
-- Уменьшен интервал проверки до 15 минут
-- Исправлена логика инкрементальной проверки
-- Добавлена немедленная проверка после покупки
-- Устранено зацикливание кнопок
+- Исправлено зацикливание кнопки "Настройки"
+- Добавлено ограничение логов до 200 КБ с ротацией
+- Исправлена обработка состояния бота
 """
 
 import os
@@ -24,6 +22,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, List, Optional, Tuple
 from colorama import init, Fore, Style
+from logging.handlers import RotatingFileHandler
 
 try:
     import pytz
@@ -51,11 +50,14 @@ if sys.platform == 'win32':
 init(autoreset=True)
 load_dotenv()
 
+# Настройка логов с ротацией (максимум 200 КБ)
+log_handler = RotatingFileHandler("bot_errors.log", encoding='utf-8', maxBytes=200*1024, backupCount=2)
+log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
     handlers=[
-        logging.FileHandler("bot_errors.log", encoding='utf-8'),
+        log_handler,
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -67,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.3.0 (20.04.2026)"
+BOT_VERSION = "4.4.0 (21.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -336,7 +338,7 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '3.3'),
                 ('order_execution_notify', 'true'),
-                ('order_check_interval_minutes', '15'),  # Изменено с 60 на 15 минут
+                ('order_check_interval_minutes', '15'),
                 ('sell_tracking_enabled', 'true'),
                 ('purchase_notify_enabled', 'true'),
                 ('purchase_notify_time', '06:00'),
@@ -2068,7 +2070,6 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        """Инкрементальная проверка новых ордеров с момента последней проверки."""
         last_check = self.db.get_last_incremental_check_time()
         first_order_date = self.db.get_first_order_date()
         
@@ -2078,11 +2079,9 @@ class DCAStrategy:
             else:
                 last_check = first_order_date
         
-        # Проверяем ордера с момента последней проверки
         check_date = last_check
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         
-        # Обновляем время проверки ДО обработки, чтобы не дублировать
         self.db.set_last_incremental_check_time(get_moscow_time_naive())
         
         purchases = self.db.get_purchases(symbol)
@@ -2114,7 +2113,6 @@ class DCAStrategy:
                 self.db.add_executed_order(order['order_id'], symbol, order['price'], order['quantity'], order['amount_usdt'], order['executed_at'].strftime("%Y-%m-%d %H:%M:%S"))
                 self.db.mark_order_as_added(order['order_id'])
                 continue
-            # Ордер не был обработан ранее
             self.db.add_executed_order(order['order_id'], symbol, order['price'], order['quantity'], order['amount_usdt'], order['executed_at'].strftime("%Y-%m-%d %H:%M:%S"))
             new_orders.append(order)
         
@@ -2209,7 +2207,6 @@ class DCAStrategy:
         if last_full_check is None:
             need_full_check = True
         else:
-            # Полная проверка раз в день в 19:00
             if now.date() > last_full_check.date():
                 if now.hour >= 19:
                     need_full_check = True
@@ -2462,7 +2459,7 @@ class FastDCABot:
         self.application = builder.build()
         
         self.scheduler_running = False
-        self.authorized_user_id = self.db.get_authorized_user_id()  # восстанавливаем из БД
+        self.authorized_user_id = self.db.get_authorized_user_id()
         self.pending_executed_order = None
         
         self.setup_handlers()
@@ -2600,7 +2597,7 @@ class FastDCABot:
         if self.authorized_user_id is None:
             if username == AUTHORIZED_USER:
                 self.authorized_user_id = user.id
-                self.db.set_authorized_user_id(user.id)  # сохраняем в БД
+                self.db.set_authorized_user_id(user.id)
                 logger.info(f"Authorized user ID saved: {user.id}")
                 return True
         elif user.id == self.authorized_user_id:
@@ -4578,6 +4575,7 @@ class FastDCABot:
         )
         self.application.add_handler(edit_purchases_conv)
         
+        # ОСНОВНОЙ КОНВЕРСЕЙШН ДЛЯ НАСТРОЕК
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
