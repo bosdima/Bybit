@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Непрерывный расчёт коэффициента на каждый процент падения
-Версия 4.6.0 (21.04.2026)
+Версия 4.7.0 (21.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлено зацикливание кнопки "Настройки"
-- Удалён дублирующий обработчик, перехватывающий сообщения
-- Оптимизирована обработка состояний
+- Исправлена автоматическая проверка ордеров после изменения интервала
+- Добавлен принудительный сброс времени проверки при изменении настроек
+- Улучшена логика инкрементальной проверки
 """
 
 import os
@@ -69,7 +68,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.6.0 (21.04.2026)"
+BOT_VERSION = "4.7.0 (21.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -2075,6 +2074,7 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Инкрементальная проверка новых ордеров с момента последней проверки."""
         last_check = self.db.get_last_incremental_check_time()
         first_order_date = self.db.get_first_order_date()
         
@@ -2953,7 +2953,9 @@ class FastDCABot:
             if minutes < 5 or minutes > 1440:
                 raise ValueError
             self.db.set_order_check_interval(minutes)
-            await update.message.reply_text(f"✅ Интервал проверки изменен на {minutes} минут", reply_markup=self.get_tracking_settings_keyboard())
+            # Сбрасываем время последней проверки, чтобы применить новый интервал
+            self.db.reset_incremental_check_time()
+            await update.message.reply_text(f"✅ Интервал проверки изменен на {minutes} минут\n🔄 Время последней проверки сброшено для применения нового интервала.", reply_markup=self.get_tracking_settings_keyboard())
             return NOTIFICATION_SETTINGS_MENU
         except ValueError:
             await update.message.reply_text("❌ Некорректное значение. Введите число от 5 до 1440.", reply_markup=self.get_cancel_keyboard())
@@ -4644,7 +4646,7 @@ class FastDCABot:
         )
         self.application.add_handler(cancel_order_conv)
         
-        # Обработчики для кнопок главного меню (НЕ перехватывают настройки)
+        # Обработчики для кнопок главного меню
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
@@ -4655,10 +4657,6 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
         
-        # УДАЛЁН обработчик для ⚙️ Настройки, который перехватывал сообщения!
-        # Теперь кнопка "⚙️ Настройки" обрабатывается только в main_conv
-        
-        # Обработчик для неизвестных сообщений (только если ничего не подошло)
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
     
