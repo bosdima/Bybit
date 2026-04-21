@@ -2,11 +2,11 @@
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 Непрерывный расчёт коэффициента на каждый процент падения
-Версия 4.5.0 (21.04.2026)
+Версия 4.6.0 (21.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлена проблема с повторным поиском неотмеченных ордеров
-- Добавлен сброс времени проверки после добавления/пропуска ордера
-- Улучшена логика инкрементальной проверки
+- Исправлено зацикливание кнопки "Настройки"
+- Удалён дублирующий обработчик, перехватывающий сообщения
+- Оптимизирована обработка состояний
 """
 
 import os
@@ -69,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.5.0 (21.04.2026)"
+BOT_VERSION = "4.6.0 (21.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -2075,22 +2075,18 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        """Инкрементальная проверка новых ордеров с момента последней проверки."""
         last_check = self.db.get_last_incremental_check_time()
         first_order_date = self.db.get_first_order_date()
         
         if last_check is None:
-            # Если время сброшено, ищем все ордера с момента первого
             if first_order_date is None:
                 last_check = get_moscow_time_naive() - timedelta(days=90)
             else:
                 last_check = first_order_date - timedelta(days=1)
         
-        # Проверяем ордера с момента последней проверки
         check_date = last_check
         all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
         
-        # Обновляем время проверки
         self.db.set_last_incremental_check_time(get_moscow_time_naive())
         
         purchases = self.db.get_purchases(symbol)
@@ -4509,7 +4505,6 @@ class FastDCABot:
         purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=order_dict['amount_usdt'], price=price, quantity=order_dict['quantity'], multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=purchase_date)
         if purchase_id:
             self.db.mark_order_as_added(order_id)
-            # Сбрасываем время последней проверки, чтобы при следующей проверке найти другие необработанные ордера
             self.db.reset_incremental_check_time()
             msg = f"✅ *Покупка добавлена в статистику!*\n\n🪙 Токен: `{symbol}`\n💰 Цена: `{format_price(price, 4)}` USDT\n📊 Количество: `{format_quantity(order_dict['quantity'], 2)}`\n💵 Сумма: `{order_dict['amount_usdt']:.2f}` USDT\n📅 Дата: `{purchase_date}`\n"
             if drop_percent > 0:
@@ -4550,7 +4545,6 @@ class FastDCABot:
     
     async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         self.db.mark_order_as_skipped(order_id)
-        # Сбрасываем время последней проверки, чтобы при следующей проверке найти другие необработанные ордера
         self.db.reset_incremental_check_time()
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
     
@@ -4650,6 +4644,7 @@ class FastDCABot:
         )
         self.application.add_handler(cancel_order_conv)
         
+        # Обработчики для кнопок главного меню (НЕ перехватывают настройки)
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
@@ -4660,6 +4655,10 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
         
+        # УДАЛЁН обработчик для ⚙️ Настройки, который перехватывал сообщения!
+        # Теперь кнопка "⚙️ Настройки" обрабатывается только в main_conv
+        
+        # Обработчик для неизвестных сообщений (только если ничего не подошло)
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
     
