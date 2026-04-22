@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 4.7.2 (22.04.2026)
+Версия 4.8.0 (22.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлена синтаксическая ошибка в set_drop_done
-- Исправлена ошибка DCA scheduler с переменной symbol
-- Исправлена ошибка NOT NULL constraint для ladder_settings.step_percent
-- Исправлена работа кнопки "Настройки"
+- Полная реорганизация меню настроек
+- Добавлено подменю "Настройки Авто DCA"
+- Переименована кнопка лестницы
+- Исправлено зацикливание кнопок
+- Улучшена обработка состояний ConversationHandler
 - Исправлены уведомления о покупках
 """
 
@@ -70,7 +71,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.7.2 (22.04.2026)"
+BOT_VERSION = "4.8.0 (22.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -117,7 +118,8 @@ def get_moscow_time_naive() -> datetime:
     WAITING_SELL_CONFIRMATION,
     WAITING_CLEAR_STATS_CONFIRMATION,
     WAITING_PURCHASE_NOTIFY_TIME,
-) = range(34)
+    AUTO_DCA_SETTINGS,
+) = range(35)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
@@ -1121,7 +1123,6 @@ class Database:
             self.set_setting('last_order_check_time', check_time.isoformat())
     
     def reset_incremental_check_time(self):
-        """Сбрасывает время последней инкрементальной проверки, чтобы при следующей проверке найти все необработанные ордера."""
         self.set_last_incremental_check_time(None)
         logger.info("Last incremental check time reset for full rescan")
     
@@ -1702,8 +1703,7 @@ class BybitClient:
             rounded_quantity = float((qty_decimal // step_decimal) * step_decimal)
             
             if rounded_quantity <= 0:
-                rounded_quantity = min_qty
-            
+                rounded_quantity = min_qty            
             if rounded_quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'}
             
@@ -2088,7 +2088,6 @@ class DCAStrategy:
         }
     
     async def check_new_orders_incremental(self, symbol: str, user_id: int, bot) -> List[Dict]:
-        """Инкрементальная проверка новых ордеров с момента последней проверки."""
         last_check = self.db.get_last_incremental_check_time()
         first_order_date = self.db.get_first_order_date()
         
@@ -2539,6 +2538,18 @@ class FastDCABot:
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
+    def get_auto_dca_keyboard(self):
+        schedule_time = self.db.get_setting('schedule_time', '09:00')
+        frequency_hours = self.db.get_setting('frequency_hours', '24')
+        invest_amount = self.db.get_setting('invest_amount', '1.1')
+        keyboard = [
+            [KeyboardButton(f"💵 Сумма покупки ({invest_amount} USDT)")],
+            [KeyboardButton(f"⏰ Время покупки ({schedule_time})")],
+            [KeyboardButton(f"🔄 Частота покупки ({frequency_hours} ч)")],
+            [KeyboardButton("🔙 Назад в настройки")],
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
     def get_cancel_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     
@@ -2552,13 +2563,11 @@ class FastDCABot:
         mode = self.db.get_trading_mode()
         mode_button = "🌐 Режим: Демо" if mode == 'demo' else "🌐 Режим: Обычный"
         keyboard = [
-            [KeyboardButton("🪙 Выбор токена"), KeyboardButton("💵 Сумма покупки")],
-            [KeyboardButton("📊 Процент прибыли"), KeyboardButton("📉 Настройки падения")],
-            [KeyboardButton("⏰ Время покупки"), KeyboardButton("🔄 Частота покупки")],
-            [KeyboardButton("🪜 Настройка лестницы"), KeyboardButton("⚙️ Настройки отслеживания")],
-            [KeyboardButton("🔔 Уведомления о покупке"), KeyboardButton(mode_button)],
-            [KeyboardButton("📤 Экспорт базы"), KeyboardButton("📥 Импорт базы")],
-            [KeyboardButton("🔙 Назад в меню")],
+            [KeyboardButton("🪙 Выбор токена"), KeyboardButton("🚀 Настройки Авто DCA")],
+            [KeyboardButton("📊 Процент прибыли"), KeyboardButton("🪜 Лестница Мартингейла")],
+            [KeyboardButton("⚙️ Настройки отслеживания"), KeyboardButton("🔔 Уведомления о покупке")],
+            [KeyboardButton(mode_button), KeyboardButton("📤 Экспорт базы")],
+            [KeyboardButton("📥 Импорт базы"), KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2566,7 +2575,7 @@ class FastDCABot:
         keyboard = [
             [KeyboardButton("📉 Глубина просадки (%)"), KeyboardButton("💵 Базовая сумма")],
             [KeyboardButton("📋 Текущие настройки"), KeyboardButton("🔄 Сбросить лестницу")],
-            [KeyboardButton("🔙 Назад в меню")],
+            [KeyboardButton("🔙 Назад в настройки")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2753,6 +2762,96 @@ class FastDCABot:
         await update.message.reply_text("⚙️ *Настройки*", reply_markup=self.get_settings_keyboard(), parse_mode='Markdown')
         return ConversationHandler.END
     
+    async def auto_dca_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_user_fast(update):
+            return ConversationHandler.END
+        await self._reset_bot_state(context)
+        schedule_time = self.db.get_setting('schedule_time', '09:00')
+        frequency_hours = self.db.get_setting('frequency_hours', '24')
+        invest_amount = self.db.get_setting('invest_amount', '1.1')
+        await update.message.reply_text(
+            f"🚀 *Настройки Авто DCA*\n\n"
+            f"Здесь вы можете настроить параметры автоматической стратегии.\n\n"
+            f"💵 Сумма покупки: `{invest_amount}` USDT\n"
+            f"⏰ Время покупки: `{schedule_time}` (МСК)\n"
+            f"🔄 Частота покупки: `{frequency_hours}` часов\n\n"
+            f"Выберите параметр для изменения:",
+            reply_markup=self.get_auto_dca_keyboard(),
+            parse_mode='Markdown'
+        )
+        return AUTO_DCA_SETTINGS
+    
+    async def set_amount_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"💵 Введите сумму (текущая: {self.db.get_setting('invest_amount', '1.1')}):\n*Это базовая сумма для лестницы*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        return SET_AMOUNT
+    
+    async def set_amount_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        try:
+            amount = float(text)
+            if amount < 1:
+                raise ValueError
+            self.db.set_setting('invest_amount', str(amount))
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            ladder = self.db.get_ladder_settings(symbol)
+            ladder['base_amount'] = amount
+            ladder['max_amount'] = amount * 3
+            self.db.save_ladder_settings(ladder)
+            await update.message.reply_text(f"✅ Сумма изменена на {amount} USDT\n🪜 Базовая сумма лестницы обновлена", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        except ValueError:
+            await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_cancel_keyboard())
+            return SET_AMOUNT
+    
+    async def set_time_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '09:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
+        return SET_SCHEDULE_TIME
+    
+    async def set_time_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        time_str = update.message.text.strip()
+        if time_str in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        try:
+            datetime.strptime(time_str, "%H:%M")
+            self.db.set_setting('schedule_time', time_str)
+            if self.db.get_setting('dca_active', 'false') == 'true':
+                next_time = self._calculate_next_purchase_time()
+                self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
+                logger.info(f"Updated next purchase time to {next_time.isoformat()}")
+            await update.message.reply_text(f"✅ Время изменено на {time_str}", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        except ValueError:
+            await update.message.reply_text("❌ Некорректный формат. Используйте ЧЧ:ММ", reply_markup=self.get_cancel_keyboard())
+            return SET_SCHEDULE_TIME
+    
+    async def set_frequency_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"🔄 Введите частоту в часах (текущая: {self.db.get_setting('frequency_hours', '24')}):", reply_markup=self.get_cancel_keyboard())
+        return SET_FREQUENCY_HOURS
+    
+    async def set_frequency_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        try:
+            hours = int(text)
+            if hours < 1 or hours > 720:
+                raise ValueError
+            self.db.set_setting('frequency_hours', str(hours))
+            if self.db.get_setting('dca_active', 'false') == 'true':
+                next_time = self._calculate_next_purchase_time()
+                self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
+                logger.info(f"Updated next purchase time to {next_time.isoformat()}")
+            await update.message.reply_text(f"✅ Частота изменена на {hours} часов", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        except ValueError:
+            await update.message.reply_text("❌ Введите число от 1 до 720", reply_markup=self.get_cancel_keyboard())
+            return SET_FREQUENCY_HOURS
+    
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -2859,6 +2958,7 @@ class FastDCABot:
                 await update.message.reply_text(f"❌ *Ошибка при создании ордера на продажу*\n\n{result['error']}", parse_mode='Markdown', reply_markup=self.get_main_keyboard())
             context.user_data.pop('pending_sell_data', None)
             await self._reset_bot_state(context)
+    
     async def toggle_order_execution(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -3354,7 +3454,7 @@ class FastDCABot:
             message += f"📅 Первый ордер: `{first_order_date.strftime('%d.%m.%Y %H:%M')}`\n"
         if last_full_check:
             message += f"📅 Последняя полная проверка: `{last_full_check.strftime('%d.%m.%Y %H:%M')}`\n"
-        message += f"\n🪜 *Лестница:*\n"
+        message += f"\n🪜 *Лестница Мартингейла:*\n"
         message += f"Глубина просадки: `{ladder_settings['max_depth']}%`\n"
         message += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
         message += f"Макс. сумма: `{ladder_settings['max_amount']}` USDT\n"
@@ -3411,48 +3511,18 @@ class FastDCABot:
             return ConversationHandler.END
         await self._reset_bot_state(context)
         symbol = self.db.get_setting('symbol', 'TONUSDT')
-        invest_amount = self.db.get_setting('invest_amount', '1.1')
         profit_percent = self.db.get_setting('profit_percent', '5')
-        schedule_time = self.db.get_setting('schedule_time', '09:00')
-        frequency_hours = self.db.get_setting('frequency_hours', '24')
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
         await update.message.reply_text(
             f"⚙️ *Настройки*\n\n"
             f"🪙 Токен: `{symbol}`\n"
-            f"💵 Сумма: `{invest_amount}` USDT\n"
-            f"📈 Прибыль: `{profit_percent}%`\n"
-            f"⏰ Время: `{schedule_time}`\n"
-            f"🔄 Частота: `{frequency_hours}`ч\n"
+            f"📈 Цель: `{profit_percent}%`\n"
             f"🌐 Режим: {mode_text}\n\n"
-            f"Выберите параметр для изменения:",
+            f"Выберите раздел для настройки:",
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
         )
-        return SELECTING_ACTION
-    
-    async def set_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"💵 Введите сумму (текущая: {self.db.get_setting('invest_amount', '1.1')}):\n*Это базовая сумма для лестницы*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
-        return SET_AMOUNT
-    
-    async def set_amount_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            amount = float(text)
-            if amount < 1:
-                raise ValueError
-            self.db.set_setting('invest_amount', str(amount))
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
-            ladder = self.db.get_ladder_settings(symbol)
-            ladder['base_amount'] = amount
-            ladder['max_amount'] = amount * 3
-            self.db.save_ladder_settings(ladder)
-            await update.message.reply_text(f"✅ Сумма изменена на {amount} USDT\n🪜 Базовая сумма лестницы обновлена", reply_markup=self.get_settings_keyboard())
-        except ValueError:
-            await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_settings_keyboard())
         return SELECTING_ACTION
     
     async def set_profit_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3472,78 +3542,6 @@ class FastDCABot:
             await update.message.reply_text(f"✅ Процент изменен на {percent}%", reply_markup=self.get_settings_keyboard())
         except ValueError:
             await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def set_drop_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"📉 Введите макс. падение % и множитель (текущие: {self.db.get_setting('max_drop_percent', '80')}% x{self.db.get_setting('max_multiplier', '3')}):\nНапример: 80 3", reply_markup=self.get_cancel_keyboard())
-        return SET_MAX_DROP
-    
-    async def set_drop_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            parts = text.split()
-            if len(parts) != 2:
-                raise ValueError
-            max_drop = float(parts[0])
-            max_mult = float(parts[1])
-            if max_drop < 30 or max_drop > 95 or max_mult < 1.5 or max_mult > 10:
-                raise ValueError
-            self.db.set_setting('max_drop_percent', str(max_drop))
-            self.db.set_setting('max_multiplier', str(max_mult))
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
-            ladder = self.db.get_ladder_settings(symbol)
-            ladder['max_depth'] = max_drop
-            self.db.save_ladder_settings(ladder)
-            await update.message.reply_text(f"✅ Настройки обновлены: {max_drop}% x{max_mult}\n🪜 Глубина просадки лестницы обновлена", reply_markup=self.get_settings_keyboard())
-        except Exception:
-            await update.message.reply_text("❌ Ошибка формата. Используйте: 80 3", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def set_time_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '09:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
-        return SET_SCHEDULE_TIME
-    
-    async def set_time_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        time_str = update.message.text.strip()
-        if time_str in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            datetime.strptime(time_str, "%H:%M")
-            self.db.set_setting('schedule_time', time_str)
-            if self.db.get_setting('dca_active', 'false') == 'true':
-                next_time = self._calculate_next_purchase_time()
-                self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
-                logger.info(f"Updated next purchase time to {next_time.isoformat()}")
-            await update.message.reply_text(f"✅ Время изменено на {time_str}", reply_markup=self.get_settings_keyboard())
-        except ValueError:
-            await update.message.reply_text("❌ Некорректный формат. Используйте ЧЧ:ММ", reply_markup=self.get_settings_keyboard())
-        return SELECTING_ACTION
-    
-    async def set_frequency_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"🔄 Введите частоту в часах (текущая: {self.db.get_setting('frequency_hours', '24')}):", reply_markup=self.get_cancel_keyboard())
-        return SET_FREQUENCY_HOURS
-    
-    async def set_frequency_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
-            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
-            return SELECTING_ACTION
-        try:
-            hours = int(text)
-            if hours < 1 or hours > 720:
-                raise ValueError
-            self.db.set_setting('frequency_hours', str(hours))
-            if self.db.get_setting('dca_active', 'false') == 'true':
-                next_time = self._calculate_next_purchase_time()
-                self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
-                logger.info(f"Updated next purchase time to {next_time.isoformat()}")
-            await update.message.reply_text(f"✅ Частота изменена на {hours} часов", reply_markup=self.get_settings_keyboard())
-        except ValueError:
-            await update.message.reply_text("❌ Введите число от 1 до 720", reply_markup=self.get_settings_keyboard())
         return SELECTING_ACTION
     
     async def set_symbol_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3592,12 +3590,13 @@ class FastDCABot:
             return ConversationHandler.END
         await self._reset_bot_state(context)
         await update.message.reply_text(
-            "🪜 *Настройка лестницы (Мартингейл)*\n\n"
+            "🪜 *Лестница Мартингейла*\n\n"
             "Стратегия: при каждом падении цены на 1% от средней цены\n"
             "происходит докупка с линейным ростом суммы (от базовой до максимальной).\n\n"
             "Параметры:\n"
             "• Глубина просадки: максимальный процент падения\n"
-            "• Рост суммы: от базовой до максимальной",
+            "• Рост суммы: от базовой до максимальной\n"
+            "• Базовая сумма: сумма первого ордера",
             reply_markup=self.get_ladder_settings_keyboard(),
             parse_mode='Markdown'
         )
@@ -3610,7 +3609,7 @@ class FastDCABot:
         ladder = self.db.get_ladder_settings(symbol)
         current_price = await self.bybit.get_symbol_price(symbol) if self.bybit_initialized else None
         summary = self.db.get_ladder_summary(symbol, current_price)
-        text = f"🪜 *ТЕКУЩИЕ НАСТРОЙКИ ЛЕСТНИЦЫ*\n\n"
+        text = f"🪜 *ТЕКУЩИЕ НАСТРОЙКИ ЛЕСТНИЦЫ МАРТИНГЕЙЛА*\n\n"
         text += f"🪙 Токен: `{symbol}`\n"
         if summary['avg_price'] > 0:
             text += f"💰 Средняя цена: `{format_price(summary['avg_price'], 4)}` USDT\n"
@@ -3624,7 +3623,7 @@ class FastDCABot:
         for step in summary['steps'][:15]:
             status_emoji = "✅" if step['status'] == 'completed' else "⏳"
             target_price_str = format_price(step['price'], 4) if step['price'] > 0 else "—"
-            text += f"{status_emoji} {step['drop_percent']}%: {step['amount']:.2f} USDT (коэф. {step['ratio']:.4f}) → {target_price_str}\n"
+            text += f"{status_emoji} {step['drop_percent']}%: {step['amount']:.2f} USDT → {target_price_str}\n"
         if len(summary['steps']) > 15:
             text += f"_...и еще {len(summary['steps']) - 15} уровней_"
         await update.message.reply_text(text, parse_mode='Markdown', reply_markup=self.get_ladder_settings_keyboard())
@@ -4144,6 +4143,8 @@ class FastDCABot:
         text = update.message.text
         if text == "⚙️ Настройки":
             await self.settings_menu(update, context)
+        elif text == "🚀 Настройки Авто DCA":
+            await self.auto_dca_settings_menu(update, context)
         elif text in ["🏠 Главное меню", "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку"]:
             await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
         else:
@@ -4592,33 +4593,47 @@ class FastDCABot:
             states={
                 SELECTING_ACTION: [
                     MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start),
-                    MessageHandler(filters.Regex('^(💵 Сумма покупки)$'), self.set_amount_start),
+                    MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu),
                     MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start),
-                    MessageHandler(filters.Regex('^(📉 Настройки падения)$'), self.set_drop_start),
-                    MessageHandler(filters.Regex('^(⏰ Время покупки)$'), self.set_time_start),
-                    MessageHandler(filters.Regex('^(🔄 Частота покупки)$'), self.set_frequency_start),
-                    MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu),
+                    MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu),
                     MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
                     MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings),
                     MessageHandler(filters.Regex('^🌐 Режим: (Обычный|Демо)$'), self.toggle_trading_mode),
+                    MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export),
+                    MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
                 ],
                 SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
                 SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)],
-                SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done)],
                 SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)],
-                SET_MAX_DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_drop_done)],
-                SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done)],
-                SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done)],
             },
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="main_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
         self.application.add_handler(main_conv)
         
+        # Конверсейшн для настроек Авто DCA
+        auto_dca_conv = ConversationHandler(
+            entry_points=[MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu)],
+            states={
+                AUTO_DCA_SETTINGS: [
+                    MessageHandler(filters.Regex(r'^💵 Сумма покупки \(\d+\.?\d* USDT\)$'), self.set_amount_start_auto),
+                    MessageHandler(filters.Regex(r'^⏰ Время покупки \(\d{2}:\d{2}\)$'), self.set_time_start_auto),
+                    MessageHandler(filters.Regex(r'^🔄 Частота покупки \(\d+ ч\)$'), self.set_frequency_start_auto),
+                    MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
+                ],
+                SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done_auto)],
+                SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done_auto)],
+                SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done_auto)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+            name="auto_dca_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+        )
+        self.application.add_handler(auto_dca_conv)
+        
         ladder_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu)],
-            states={LADDER_MENU: [MessageHandler(filters.Regex('^(📉 Глубина просадки \(%\))$'), self.set_ladder_max_depth_start), MessageHandler(filters.Regex('^(💵 Базовая сумма)$'), self.set_ladder_base_amount_start), MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_ladder_settings), MessageHandler(filters.Regex('^(🔄 Сбросить лестницу)$'), self.reset_ladder), MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main)], SET_LADDER_DEPTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_max_depth_save)], SET_LADDER_BASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save)]},
+            entry_points=[MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu)],
+            states={LADDER_MENU: [MessageHandler(filters.Regex('^(📉 Глубина просадки \(%\))$'), self.set_ladder_max_depth_start), MessageHandler(filters.Regex('^(💵 Базовая сумма)$'), self.set_ladder_base_amount_start), MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_ladder_settings), MessageHandler(filters.Regex('^(🔄 Сбросить лестницу)$'), self.reset_ladder), MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)], SET_LADDER_DEPTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_max_depth_save)], SET_LADDER_BASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save)]},
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="ladder_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
