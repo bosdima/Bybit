@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 4.7.1 (22.04.2026)
+Версия 4.7.2 (22.04.2026)
 ИСПРАВЛЕНИЯ: 
+- Исправлена синтаксическая ошибка в set_drop_done
 - Исправлена ошибка DCA scheduler с переменной symbol
 - Исправлена ошибка NOT NULL constraint для ladder_settings.step_percent
-- Улучшена обработка ConversationHandler для предотвращения зацикливания кнопок
-- Исправлены уведомления о покупках (добавлена проверка дня)
+- Исправлена работа кнопки "Настройки"
+- Исправлены уведомления о покупках
 """
 
 import os
@@ -69,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.7.1 (22.04.2026)"
+BOT_VERSION = "4.7.2 (22.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -2626,8 +2627,6 @@ class FastDCABot:
     async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         self.import_waiting = False
-        # Не сбрасываем ConversationHandler глобально, чтобы избежать проблем
-        # Просто очищаем user_data
     
     async def _end_conversation_gracefully(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
@@ -2860,7 +2859,6 @@ class FastDCABot:
                 await update.message.reply_text(f"❌ *Ошибка при создании ордера на продажу*\n\n{result['error']}", parse_mode='Markdown', reply_markup=self.get_main_keyboard())
             context.user_data.pop('pending_sell_data', None)
             await self._reset_bot_state(context)
-    
     async def toggle_order_execution(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -2951,7 +2949,6 @@ class FastDCABot:
             if minutes < 5 or minutes > 1440:
                 raise ValueError
             self.db.set_order_check_interval(minutes)
-            # Сбрасываем время последней проверки, чтобы применить новый интервал
             self.db.reset_incremental_check_time()
             await update.message.reply_text(f"✅ Интервал проверки изменен на {minutes} минут\n🔄 Время последней проверки сброшено для применения нового интервала.", reply_markup=self.get_tracking_settings_keyboard())
             return NOTIFICATION_SETTINGS_MENU
@@ -4144,7 +4141,13 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return
         await self._reset_bot_state(context)
-        await update.message.reply_text("Используйте кнопки меню", reply_markup=self.get_main_keyboard())
+        text = update.message.text
+        if text == "⚙️ Настройки":
+            await self.settings_menu(update, context)
+        elif text in ["🏠 Главное меню", "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку"]:
+            await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
+        else:
+            await update.message.reply_text("Используйте кнопки меню", reply_markup=self.get_main_keyboard())
     
     async def dca_scheduler_loop(self):
         logger.info("DCA scheduler loop started (schedule-based)")
@@ -4176,7 +4179,7 @@ class FastDCABot:
                     continue
                 
                 if now >= next_time:
-                    symbol = self.db.get_setting('symbol', 'TONUSDT')  # <-- ИСПРАВЛЕНО: symbol объявлен здесь
+                    symbol = self.db.get_setting('symbol', 'TONUSDT')
                     profit_percent = float(self.db.get_setting('profit_percent', '5'))
                     
                     logger.info(f"Scheduled purchase triggered at {now.isoformat()}")
@@ -4219,8 +4222,6 @@ class FastDCABot:
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     logger.info(f"Next purchase scheduled at {next_time.isoformat()}")
                 
-                # Исправлено: symbol объявлен внутри цикла, но используется снаружи
-                # Получаем symbol заново для проверки ордеров
                 current_symbol = self.db.get_setting('symbol', 'TONUSDT')
                 await self.strategy.check_and_update_sell_orders(current_symbol)
                 
@@ -4332,7 +4333,6 @@ class FastDCABot:
                 should_notify = False
                 notify_hour, notify_minute = map(int, notify_time_str.split(':'))
                 
-                # Проверяем, что сейчас время уведомления (в пределах 5 минут после)
                 if now.hour == notify_hour and now.minute >= notify_minute and now.minute < notify_minute + 5:
                     if last_notify_date != current_date_str:
                         should_notify = True
@@ -4658,6 +4658,7 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking))
         self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
+        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu))
         
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
