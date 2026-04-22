@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 4.8.0 (22.04.2026)
+Версия 4.8.1 (22.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Полная реорганизация меню настроек
-- Добавлено подменю "Настройки Авто DCA"
-- Переименована кнопка лестницы
-- Исправлено зацикливание кнопок
-- Улучшена обработка состояний ConversationHandler
-- Исправлены уведомления о покупках
+- Исправлено зацикливание уведомлений об ордерах
+- Исправлена обработка callback-запросов
+- Улучшена проверка дубликатов ордеров
+- Исправлена работа кнопки "Настройки"
 """
 
 import os
@@ -71,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.8.0 (22.04.2026)"
+BOT_VERSION = "4.8.1 (22.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -1703,7 +1701,8 @@ class BybitClient:
             rounded_quantity = float((qty_decimal // step_decimal) * step_decimal)
             
             if rounded_quantity <= 0:
-                rounded_quantity = min_qty            
+                rounded_quantity = min_qty
+            
             if rounded_quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'}
             
@@ -3405,7 +3404,7 @@ class FastDCABot:
                     text += f"Нужен рост: `{increase_needed:+.2f}%` от текущей цены"
             ladder_settings = self.db.get_ladder_settings(symbol)
             if ladder_settings:
-                text += f"\n\n🪜 *ЛЕСТНИЦА*\n"
+                text += f"\n\n🪜 *ЛЕСТНИЦА МАРТИНГЕЙЛА*\n"
                 text += f"Глубина просадки: `{ladder_settings['max_depth']}%`\n"
                 text += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
                 text += f"Максимальная сумма: `{ladder_settings['max_amount']}` USDT"
@@ -3454,7 +3453,7 @@ class FastDCABot:
             message += f"📅 Первый ордер: `{first_order_date.strftime('%d.%m.%Y %H:%M')}`\n"
         if last_full_check:
             message += f"📅 Последняя полная проверка: `{last_full_check.strftime('%d.%m.%Y %H:%M')}`\n"
-        message += f"\n🪜 *Лестница Мартингейла:*\n"
+        message += f"\n🪜 *ЛЕСТНИЦА МАРТИНГЕЙЛА:*\n"
         message += f"Глубина просадки: `{ladder_settings['max_depth']}%`\n"
         message += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
         message += f"Макс. сумма: `{ladder_settings['max_amount']}` USDT\n"
@@ -3590,7 +3589,7 @@ class FastDCABot:
             return ConversationHandler.END
         await self._reset_bot_state(context)
         await update.message.reply_text(
-            "🪜 *Лестница Мартингейла*\n\n"
+            "🪜 *ЛЕСТНИЦА МАРТИНГЕЙЛА*\n\n"
             "Стратегия: при каждом падении цены на 1% от средней цены\n"
             "происходит докупка с линейным ростом суммы (от базовой до максимальной).\n\n"
             "Параметры:\n"
@@ -4444,7 +4443,7 @@ class FastDCABot:
     async def skip_clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str, sell_id: int):
         query = update.callback_query
         self.db.mark_completed_sell_notified(sell_id)
-        await query.edit_message_text(f"⏭ Очистка статистики для {symbol} отложена.\n\n📊 Статистика DCA сохранена.\n💡 Вы можете очистить её позже вручную через раздел '✏️ Редактировать покупки' или '🪜 Настройка лестницы' → 'Сбросить лестницу'.", parse_mode='Markdown')
+        await query.edit_message_text(f"⏭ Очистка статистики для {symbol} отложена.\n\n📊 Статистика DCA сохранена.\n💡 Вы можете очистить её позже вручную через раздел '✏️ Редактировать покупки' или '🪜 Лестница Мартингейла' → 'Сбросить лестницу'.", parse_mode='Markdown')
     
     async def confirm_clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
         query = update.callback_query
