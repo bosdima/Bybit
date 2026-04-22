@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 4.7.0 (21.04.2026)
+Версия 4.7.1 (22.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлена автоматическая проверка ордеров после изменения интервала
-- Добавлен принудительный сброс времени проверки при изменении настроек
-- Улучшена логика инкрементальной проверки
+- Исправлена ошибка DCA scheduler с переменной symbol
+- Исправлена ошибка NOT NULL constraint для ladder_settings.step_percent
+- Улучшена обработка ConversationHandler для предотвращения зацикливания кнопок
+- Исправлены уведомления о покупках (добавлена проверка дня)
 """
 
 import os
@@ -68,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.7.0 (21.04.2026)"
+BOT_VERSION = "4.7.1 (22.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -279,9 +280,16 @@ class Database:
                     max_depth REAL NOT NULL,
                     base_amount REAL NOT NULL,
                     max_amount REAL NOT NULL,
+                    step_percent REAL DEFAULT 1.0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Проверяем и добавляем недостающие колонки в ladder_settings
+            cursor.execute("PRAGMA table_info(ladder_settings)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'step_percent' not in columns:
+                cursor.execute("ALTER TABLE ladder_settings ADD COLUMN step_percent REAL DEFAULT 1.0")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='executed_orders'")
             table_exists = cursor.fetchone()
@@ -810,6 +818,7 @@ class Database:
                     'max_depth': float(self.get_setting('ladder_max_depth', '80')),
                     'base_amount': float(self.get_setting('ladder_base_amount', '1.1')),
                     'max_amount': float(self.get_setting('ladder_max_amount', '3.3')),
+                    'step_percent': 1.0,
                 }
         except Exception as e:
             logger.error(f"Error getting ladder settings: {e}")
@@ -818,6 +827,7 @@ class Database:
                 'max_depth': 80,
                 'base_amount': 1.1,
                 'max_amount': 3.3,
+                'step_percent': 1.0,
             }
     
     def save_ladder_settings(self, settings: Dict):
@@ -827,13 +837,14 @@ class Database:
             cursor.execute('DELETE FROM ladder_settings WHERE symbol = ?', (settings['symbol'],))
             cursor.execute('''
                 INSERT INTO ladder_settings 
-                (symbol, max_depth, base_amount, max_amount)
-                VALUES (?, ?, ?, ?)
+                (symbol, max_depth, base_amount, max_amount, step_percent)
+                VALUES (?, ?, ?, ?, ?)
             ''', (
                 settings['symbol'],
                 settings['max_depth'],
                 settings['base_amount'],
                 settings['max_amount'],
+                settings.get('step_percent', 1.0),
             ))
             conn.commit()
             conn.close()
@@ -1174,7 +1185,8 @@ class Database:
                     'max_depth': row[2],
                     'base_amount': row[3],
                     'max_amount': row[4],
-                    'created_at': row[5]
+                    'step_percent': row[5] if len(row) > 5 else 1.0,
+                    'created_at': row[6] if len(row) > 6 else None
                 })
             
             cursor.execute('SELECT * FROM executed_orders')
@@ -1373,14 +1385,15 @@ class Database:
                 try:
                     cursor.execute('''
                         INSERT OR REPLACE INTO ladder_settings 
-                        (id, symbol, max_depth, base_amount, max_amount, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        (id, symbol, max_depth, base_amount, max_amount, step_percent, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         ladder.get('id'),
                         ladder.get('symbol', 'TONUSDT'),
                         ladder.get('max_depth', 80),
                         ladder.get('base_amount', 1.1),
                         ladder.get('max_amount', 3.3),
+                        ladder.get('step_percent', 1.0),
                         ladder.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S"))
                     ))
                 except Exception as e:
@@ -2613,23 +2626,8 @@ class FastDCABot:
     async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         self.import_waiting = False
-        for conv_name in ['manual_add_conversation', 'manual_buy_conversation', 'main_conversation', 
-                         'ladder_conversation', 'edit_purchases_conversation', 'tracking_conversation',
-                         'cancel_order_conversation', 'purchase_notify_conversation']:
-            try:
-                conv_handler = getattr(self.application, conv_name, None)
-                if conv_handler and hasattr(conv_handler, '_conversations'):
-                    for chat_id in list(conv_handler._conversations.keys()):
-                        conv_handler._conversations.pop(chat_id, None)
-            except Exception as e:
-                logger.debug(f"Error resetting conversation {conv_name}: {e}")
-        try:
-            current_conv = self.application.conversation_handler
-            if current_conv and hasattr(current_conv, '_conversations'):
-                for chat_id in list(current_conv._conversations.keys()):
-                    current_conv._conversations.pop(chat_id, None)
-        except Exception as e:
-            logger.debug(f"Error resetting conversation: {e}")
+        # Не сбрасываем ConversationHandler глобально, чтобы избежать проблем
+        # Просто очищаем user_data
     
     async def _end_conversation_gracefully(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
@@ -3491,8 +3489,7 @@ class FastDCABot:
         try:
             parts = text.split()
             if len(parts) != 2:
-                raise ValueError
-            max_drop = float(parts[0])
+                raise ValueError            max_drop = float(parts[0])
             max_mult = float(parts[1])
             if max_drop < 30 or max_drop > 95 or max_mult < 1.5 or max_mult > 10:
                 raise ValueError
@@ -4178,7 +4175,7 @@ class FastDCABot:
                     continue
                 
                 if now >= next_time:
-                    symbol = self.db.get_setting('symbol', 'TONUSDT')
+                    symbol = self.db.get_setting('symbol', 'TONUSDT')  # <-- ИСПРАВЛЕНО: symbol объявлен здесь
                     profit_percent = float(self.db.get_setting('profit_percent', '5'))
                     
                     logger.info(f"Scheduled purchase triggered at {now.isoformat()}")
@@ -4221,7 +4218,10 @@ class FastDCABot:
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     logger.info(f"Next purchase scheduled at {next_time.isoformat()}")
                 
-                await self.strategy.check_and_update_sell_orders(symbol)
+                # Исправлено: symbol объявлен внутри цикла, но используется снаружи
+                # Получаем symbol заново для проверки ордеров
+                current_symbol = self.db.get_setting('symbol', 'TONUSDT')
+                await self.strategy.check_and_update_sell_orders(current_symbol)
                 
             except asyncio.CancelledError:
                 break
@@ -4331,6 +4331,7 @@ class FastDCABot:
                 should_notify = False
                 notify_hour, notify_minute = map(int, notify_time_str.split(':'))
                 
+                # Проверяем, что сейчас время уведомления (в пределах 5 минут после)
                 if now.hour == notify_hour and now.minute >= notify_minute and now.minute < notify_minute + 5:
                     if last_notify_date != current_date_str:
                         should_notify = True
