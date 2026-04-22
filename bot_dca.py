@@ -3489,7 +3489,8 @@ class FastDCABot:
         try:
             parts = text.split()
             if len(parts) != 2:
-                raise ValueError            max_drop = float(parts[0])
+                raise ValueError
+            max_drop = float(parts[0])
             max_mult = float(parts[1])
             if max_drop < 30 or max_drop > 95 or max_mult < 1.5 or max_mult > 10:
                 raise ValueError
