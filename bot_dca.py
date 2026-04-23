@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 4.9.2 (23.04.2026)
+Версия 5.0.0 (23.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлен расчет количества для market ордеров (теперь сумма >= min_amt)
-- Исправлен ручной ввод (минимальная сумма 5 USDT)
-- Исправлены уведомления (единая минимальная сумма)
-- Улучшена обработка ошибок минимальной суммы
+- Разделены настройки для Авто DCA и ручного ввода
+- Добавлена отдельная кнопка "💵 Сумма для ручного ордера"
+- Авто DCA использует invest_amount (мин. 5 USDT, проверка биржи)
+- Ручной ввод использует manual_amount (может быть 1.1 USDT, без проверки биржи)
+- Исправлен расчет количества для market ордеров
+- Уведомления используют правильную сумму
 """
 
 import os
@@ -69,9 +71,9 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.9.2 (23.04.2026)"
+BOT_VERSION = "5.0.0 (23.04.2026)"
 CONVERSATION_TIMEOUT = 180
-MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма ордера для всех токенов (проверяется по бирже)
+MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
@@ -118,7 +120,8 @@ def get_moscow_time_naive() -> datetime:
     WAITING_CLEAR_STATS_CONFIRMATION,
     WAITING_PURCHASE_NOTIFY_TIME,
     AUTO_DCA_SETTINGS,
-) = range(35)
+    SET_MANUAL_AMOUNT,
+) = range(36)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
@@ -333,6 +336,7 @@ class Database:
             defaults = [
                 ('symbol', 'TONUSDT'),
                 ('invest_amount', '5.0'),
+                ('manual_amount', '1.1'),
                 ('profit_percent', '5'),
                 ('max_drop_percent', '80'),
                 ('max_multiplier', '3'),
@@ -779,6 +783,12 @@ class Database:
     
     def set_last_purchase_notify_date(self, date_str: str):
         self.set_setting('last_purchase_notify_date', date_str)
+    
+    def get_manual_amount(self) -> float:
+        return float(self.get_setting('manual_amount', '1.1'))
+    
+    def set_manual_amount(self, amount: float):
+        self.set_setting('manual_amount', str(amount))
     
     def log_action(self, action: str, symbol: str = None, details: str = None):
         try:
@@ -1744,36 +1754,34 @@ class BybitClient:
                 amount_usdt = min_amt
                 logger.warning(f"Сумма увеличена до минимальной {min_amt} USDT")
             
-            # Рассчитываем количество
+            # Рассчитываем количество и округляем ВВЕРХ
             raw_quantity = amount_usdt / price
-            
-            # Округляем количество ВВЕРХ согласно qty_step, чтобы сумма была >= amount_usdt
             qty_decimal = Decimal(str(raw_quantity))
             step_decimal = Decimal(str(qty_step))
+            # Округление вверх
             quantity = float((qty_decimal + step_decimal - Decimal('0.000001')) // step_decimal * step_decimal)
             
             if quantity < min_qty:
                 quantity = min_qty
             
-            # Проверяем итоговую сумму (должна быть не меньше min_amt)
+            # Проверяем итоговую сумму
             order_value = quantity * price
             if order_value < min_amt:
-                # Увеличиваем количество, пока не достигнем min_amt
                 needed_quantity = min_amt / price
                 qty_decimal = Decimal(str(needed_quantity))
-                quantity = float((qty_decimal // step_decimal) * step_decimal)
+                quantity = float((qty_decimal + step_decimal - Decimal('0.000001')) // step_decimal * step_decimal)
                 if quantity < min_qty:
                     quantity = min_qty
+                order_value = quantity * price
                 
-                # Циклически увеличиваем на шаг, пока сумма не станет >= min_amt
                 max_iterations = 20
                 for _ in range(max_iterations):
-                    order_value = quantity * price
                     if order_value >= min_amt:
                         break
                     quantity += qty_step
+                    order_value = quantity * price
                 
-                logger.info(f"Количество скорректировано до {quantity} (сумма {order_value:.2f} USDT) для соблюдения min_amt={min_amt}")
+                logger.info(f"Количество скорректировано до {quantity} (сумма {order_value:.2f} USDT)")
             
             response = self.session.place_order(
                 category="spot", 
@@ -1805,7 +1813,7 @@ class BybitClient:
             logger.error(f"Market buy error: {e}")
             return {'success': False, 'error': str(e)}
     
-    async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float) -> Dict:
+    async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float, is_auto: bool = True) -> Dict:
         try:
             if not self.session:
                 self._init_session()
@@ -1814,8 +1822,9 @@ class BybitClient:
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
             
-            if amount_usdt < min_amt:
-                return {'success': False, 'error': f'Минимальная сумма: {min_amt} USDT'}
+            # Для авто DCA проверяем минимальную сумму, для ручного - нет
+            if is_auto and amount_usdt < min_amt:
+                return {'success': False, 'error': f'Минимальная сумма для авто DCA: {min_amt} USDT'}
             
             quantity = amount_usdt / price
             qty_decimal = Decimal(str(quantity))
@@ -1825,9 +1834,8 @@ class BybitClient:
             if quantity < min_qty:
                 quantity = min_qty
             
-            # Проверяем итоговую сумму
             order_value = quantity * price
-            if order_value < min_amt:
+            if is_auto and order_value < min_amt:
                 needed_quantity = min_amt / price
                 qty_decimal = Decimal(str(needed_quantity))
                 quantity = float((qty_decimal // step_decimal) * step_decimal)
@@ -1844,8 +1852,6 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-
-
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
@@ -2551,6 +2557,8 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error placing full sell order: {e}")
             return {'success': False, 'error': str(e)}
+
+
 class FastDCABot:
     def __init__(self):
         self.db = Database()
@@ -2631,7 +2639,7 @@ class FastDCABot:
         frequency_hours = self.db.get_setting('frequency_hours', '24')
         invest_amount = self.db.get_setting('invest_amount', '5.0')
         keyboard = [
-            [KeyboardButton(f"💵 Сумма покупки ({invest_amount} USDT)")],
+            [KeyboardButton(f"💵 Сумма покупки авто ({invest_amount} USDT)")],
             [KeyboardButton(f"⏰ Время покупки ({schedule_time})")],
             [KeyboardButton(f"🔄 Частота покупки ({frequency_hours} ч)")],
             [KeyboardButton("🔙 Назад в настройки")],
@@ -2650,12 +2658,14 @@ class FastDCABot:
     def get_settings_keyboard(self):
         mode = self.db.get_trading_mode()
         mode_button = "🌐 Режим: Демо" if mode == 'demo' else "🌐 Режим: Обычный"
+        manual_amount = self.db.get_manual_amount()
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("🚀 Настройки Авто DCA")],
             [KeyboardButton("📊 Процент прибыли"), KeyboardButton("🪜 Лестница Мартингейла")],
-            [KeyboardButton("⚙️ Настройки отслеживания"), KeyboardButton("🔔 Уведомления о покупке")],
-            [KeyboardButton(mode_button), KeyboardButton("📤 Экспорт базы")],
-            [KeyboardButton("📥 Импорт базы"), KeyboardButton("🔙 Назад в меню")],
+            [KeyboardButton("💵 Сумма для ручного ордера"), KeyboardButton("⚙️ Настройки отслеживания")],
+            [KeyboardButton("🔔 Уведомления о покупке"), KeyboardButton(mode_button)],
+            [KeyboardButton("📤 Экспорт базы"), KeyboardButton("📥 Импорт базы")],
+            [KeyboardButton("🔙 Назад в меню")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -2860,7 +2870,7 @@ class FastDCABot:
         await update.message.reply_text(
             f"🚀 *Настройки Авто DCA*\n\n"
             f"Здесь вы можете настроить параметры автоматической стратегии.\n\n"
-            f"💵 Сумма покупки: `{invest_amount}` USDT\n"
+            f"💵 Сумма покупки авто: `{invest_amount}` USDT (мин. 5 USDT)\n"
             f"⏰ Время покупки: `{schedule_time}` (МСК)\n"
             f"🔄 Частота покупки: `{frequency_hours}` часов\n\n"
             f"Выберите параметр для изменения:",
@@ -2870,7 +2880,7 @@ class FastDCABot:
         return AUTO_DCA_SETTINGS
     
     async def set_amount_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"💵 Введите сумму (текущая: {self.db.get_setting('invest_amount', '5.0')}):\n*Минимальная сумма зависит от токена (обычно 5-10 USDT)*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text(f"💵 Введите сумму для Авто DCA (текущая: {self.db.get_setting('invest_amount', '5.0')}):\n*Минимальная сумма: 5 USDT*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_AMOUNT
     
     async def set_amount_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2888,7 +2898,7 @@ class FastDCABot:
             ladder['base_amount'] = amount
             ladder['max_amount'] = amount * 3
             self.db.save_ladder_settings(ladder)
-            await update.message.reply_text(f"✅ Сумма изменена на {amount} USDT\n🪜 Базовая сумма лестницы обновлена", reply_markup=self.get_auto_dca_keyboard())
+            await update.message.reply_text(f"✅ Сумма для Авто DCA изменена на {amount} USDT\n🪜 Базовая сумма лестницы обновлена", reply_markup=self.get_auto_dca_keyboard())
             return AUTO_DCA_SETTINGS
         except ValueError as e:
             await update.message.reply_text(f"❌ {str(e)}", reply_markup=self.get_cancel_keyboard())
@@ -2939,6 +2949,37 @@ class FastDCABot:
         except ValueError:
             await update.message.reply_text("❌ Введите число от 1 до 720", reply_markup=self.get_cancel_keyboard())
             return SET_FREQUENCY_HOURS
+    
+    async def set_manual_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        current_amount = self.db.get_manual_amount()
+        await update.message.reply_text(
+            f"💵 *Настройка суммы для ручного ордера*\n\n"
+            f"Эта сумма используется при:\n"
+            f"• Ручной лимитной покупке\n"
+            f"• Добавлении покупки вручную\n"
+            f"• Ежедневных уведомлениях\n\n"
+            f"Текущая сумма: `{current_amount}` USDT\n"
+            f"Введите новую сумму (минимум: 1.1 USDT):",
+            reply_markup=self.get_cancel_keyboard(),
+            parse_mode='Markdown'
+        )
+        return SET_MANUAL_AMOUNT
+    
+    async def set_manual_amount_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        try:
+            amount = float(text)
+            if amount < 1.1:
+                raise ValueError("Минимальная сумма 1.1 USDT")
+            self.db.set_manual_amount(amount)
+            await update.message.reply_text(f"✅ Сумма для ручного ордера изменена на {amount} USDT", reply_markup=self.get_settings_keyboard())
+            return SELECTING_ACTION
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {str(e)}", reply_markup=self.get_cancel_keyboard())
+            return SET_MANUAL_AMOUNT
     
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3457,6 +3498,7 @@ class FastDCABot:
             stats = self.db.get_dca_stats(symbol)
             current_price = await self.bybit.get_symbol_price(symbol)
             profit_percent = float(self.db.get_setting('profit_percent', '5'))
+            manual_amount = self.db.get_manual_amount()
             if not stats:
                 await update.message.reply_text("📈 *Статистика DCA*\n\nПокупок пока нет.", parse_mode='Markdown')
                 return
@@ -3496,7 +3538,8 @@ class FastDCABot:
                 text += f"\n\n🪜 *ЛЕСТНИЦА МАРТИНГЕЙЛА*\n"
                 text += f"Глубина просадки: `{ladder_settings['max_depth']}%`\n"
                 text += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
-                text += f"Максимальная сумма: `{ladder_settings['max_amount']}` USDT"
+                text += f"Максимальная сумма: `{ladder_settings['max_amount']}` USDT\n\n"
+            text += f"💡 *Для ручного ордера:* рекомендуемая сумма `{manual_amount:.2f}` USDT"
             await update.message.reply_text(text, parse_mode='Markdown')
         except Exception as e:
             logger.error(f"Error in show_dca_stats_detailed: {e}")
@@ -3509,6 +3552,7 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         invest_amount = float(self.db.get_setting('invest_amount', '5.0'))
+        manual_amount = self.db.get_manual_amount()
         ladder_settings = self.db.get_ladder_settings(symbol)
         order_execution = self.db.get_order_execution_notify()
         sell_tracking = self.db.get_sell_tracking_enabled()
@@ -3531,7 +3575,8 @@ class FastDCABot:
             except:
                 pass
         message += f"🪙 Токен: `{symbol}`\n"
-        message += f"💵 Сумма покупки: `{invest_amount}` USDT\n"
+        message += f"💵 Сумма для Авто DCA: `{invest_amount}` USDT\n"
+        message += f"💵 Сумма для ручного ордера: `{manual_amount}` USDT\n"
         message += f"📈 Цель: `{self.db.get_setting('profit_percent', '5')}%`\n"
         message += f"📋 Отслеживание ордеров: {'✅ Вкл' if order_execution else '⏹ Выкл'}\n"
         message += f"💰 Отслеживание продаж: {'✅ Вкл' if sell_tracking else '⏹ Выкл'}\n"
@@ -3576,7 +3621,7 @@ class FastDCABot:
             min_amt = instrument_info['min_amt']
             invest_amount = float(self.db.get_setting('invest_amount', '5.0'))
             if invest_amount < min_amt:
-                await update.message.reply_text(f"❌ Сумма покупки ({invest_amount} USDT) меньше минимальной на бирже ({min_amt} USDT).\nУвеличьте сумму в настройках.")
+                await update.message.reply_text(f"❌ Сумма покупки ({invest_amount} USDT) меньше минимальной на бирже ({min_amt} USDT).\nУвеличьте сумму в настройках Авто DCA.")
                 return
             
             self.db.set_setting('dca_active', 'true')
@@ -3611,10 +3656,12 @@ class FastDCABot:
         profit_percent = self.db.get_setting('profit_percent', '5')
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
+        manual_amount = self.db.get_manual_amount()
         await update.message.reply_text(
             f"⚙️ *Настройки*\n\n"
             f"🪙 Токен: `{symbol}`\n"
             f"📈 Цель: `{profit_percent}%`\n"
+            f"💵 Сумма для ручного ордера: `{manual_amount}` USDT\n"
             f"🌐 Режим: {mode_text}\n\n"
             f"Выберите раздел для настройки:",
             reply_markup=self.get_settings_keyboard(),
@@ -3687,7 +3734,7 @@ class FastDCABot:
         await update.message.reply_text(
             f"✅ Символ изменен на {symbol}\n"
             f"💰 Текущая цена: {format_price(price, 4)} USDT\n"
-            f"⚠️ Минимальная сумма покупки: {min_amt} USDT",
+            f"⚠️ Минимальная сумма для Авто DCA: {min_amt} USDT",
             reply_markup=self.get_settings_keyboard()
         )
         return SELECTING_ACTION
@@ -3703,7 +3750,7 @@ class FastDCABot:
             "Параметры:\n"
             "• Глубина просадки: максимальный процент падения\n"
             "• Рост суммы: от базовой до максимальной\n"
-            "• Базовая сумма: сумма первого ордера (синхронизирована с настройками Авто DCA)",
+            "• Базовая сумма: сумма первого ордера (синхронизирована с Авто DCA)",
             reply_markup=self.get_ladder_settings_keyboard(),
             parse_mode='Markdown'
         )
@@ -3809,6 +3856,7 @@ class FastDCABot:
             await update.message.reply_text("❌ Не удалось получить цену", reply_markup=self.get_main_keyboard())
             return ConversationHandler.END
         recommendation = await self.strategy.get_recommended_purchase(symbol)
+        manual_amount = self.db.get_manual_amount()
         context.user_data['manual_buy_current_price'] = current_price
         context.user_data['manual_buy_symbol'] = symbol
         context.user_data['manual_buy_recommendation'] = recommendation
@@ -3817,13 +3865,14 @@ class FastDCABot:
             msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Сейчас хороший момент!\n"
             if recommendation.get('current_drop', 0) > 0:
                 msg += f"📉 Падение от средней цены: `{recommendation['current_drop']:.1f}%`\n"
-            msg += f"📊 Сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+            msg += f"📊 Рекомендуемая сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
         elif recommendation['success']:
             msg += f"⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения\n"
             if recommendation.get('current_drop', 0) > 0:
                 msg += f"📉 Текущее падение: `{recommendation['current_drop']:.1f}%`\n"
             msg += f"📉 Следующее падение: `{recommendation.get('next_drop', 0):.1f}%`\n"
             msg += f"💰 Следующая цена: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n\n"
+        msg += f"💵 *Сумма для ручного ордера*: `{manual_amount:.2f}` USDT\n"
         msg += f"Введите цену лимитного ордера (или нажмите Отмена):"
         await update.message.reply_text(msg, reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
         return MANUAL_BUY_PRICE
@@ -3844,9 +3893,8 @@ class FastDCABot:
             if price <= 0:
                 raise ValueError
             context.user_data['manual_buy_price'] = price
-            recommendation = context.user_data.get('manual_buy_recommendation', {})
-            suggested_amount = recommendation.get('amount_usdt', 5.0) if recommendation.get('should_buy') else 5.0
-            await update.message.reply_text(f"💰 Введите сумму покупки в USDT\n*Рекомендуемая сумма:* {suggested_amount:.2f} USDT\nМинимум: 5 USDT:", reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
+            manual_amount = self.db.get_manual_amount()
+            await update.message.reply_text(f"💰 Введите сумму покупки в USDT\n*Рекомендуемая сумма:* {manual_amount:.2f} USDT\nМинимум: 1.1 USDT:", reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
             return MANUAL_BUY_AMOUNT
         except ValueError:
             await update.message.reply_text("❌ Некорректная цена. Введите число больше 0.", reply_markup=self.get_manual_buy_keyboard())
@@ -3867,24 +3915,17 @@ class FastDCABot:
         try:
             amount = float(text.replace(',', '.'))
             
-            self._init_bybit()
-            if self.bybit_initialized:
-                instrument_info = await self.bybit.get_instrument_info(self.db.get_setting('symbol', 'TONUSDT'))
-                min_amt = instrument_info['min_amt']
-                if amount < min_amt:
-                    await update.message.reply_text(f"❌ Минимальная сумма покупки: {min_amt} USDT", reply_markup=self.get_manual_buy_keyboard())
-                    return MANUAL_BUY_AMOUNT
-            
-            if amount < 5:
-                raise ValueError("Минимальная сумма 5 USDT")
+            if amount < 1.1:
+                raise ValueError("Минимальная сумма 1.1 USDT")
             price = context.user_data.get('manual_buy_price')
             symbol = context.user_data.get('manual_buy_symbol', 'TONUSDT')
             recommendation = context.user_data.get('manual_buy_recommendation', {})
             if not price:
                 await update.message.reply_text("❌ Ошибка", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
-            await update.message.reply_text("⏳ Создаю ордер...")
-            result = await self.bybit.place_limit_buy(symbol, price, amount)
+            await update.message.reply_text("⏳ Создаю лимитный ордер...")
+            # Для ручного ввода is_auto=False - не проверяем минимальную сумму биржи
+            result = await self.bybit.place_limit_buy(symbol, price, amount, is_auto=False)
             if result['success']:
                 profit_percent = float(self.db.get_setting('profit_percent', '5'))
                 target_price = price * (1 + profit_percent / 100)
@@ -3925,6 +3966,7 @@ class FastDCABot:
         stats = self.db.get_dca_stats(symbol)
         ladder_settings = self.db.get_ladder_settings(symbol)
         recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol)
+        manual_amount = self.db.get_manual_amount()
         msg = f"➕ *Добавление покупки вручную*\n\n"
         msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
         if stats and stats['avg_price'] > 0:
@@ -3934,12 +3976,12 @@ class FastDCABot:
         if recommendation['success']:
             if recommendation['is_first']:
                 msg += f"🟢 *ПЕРВАЯ ПОКУПКА*\n"
-                msg += f"💰 Рекомендуемая сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+                msg += f"💰 Рекомендуемая сумма: `{manual_amount:.2f}` USDT\n\n"
             else:
                 msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
                 msg += f"📉 Уровень падения составляет: `{recommendation['drop_percent']:.1f}%`\n"
                 msg += f"📊 Коэффициент: `{recommendation['ratio']:.4f}`\n"
-                msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+                msg += f"💰 Рекомендуемая сумма покупки: `{manual_amount:.2f}` USDT\n\n"
         msg += f"Введите цену покупки (USDT):"
         await update.message.reply_text(msg, reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return MANUAL_ADD_PRICE
@@ -3963,15 +4005,14 @@ class FastDCABot:
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             stats = self.db.get_dca_stats(symbol)
             ladder_settings = self.db.get_ladder_settings(symbol)
+            manual_amount = self.db.get_manual_amount()
             if stats and stats['avg_price'] > 0:
                 drop_percent = calculate_current_drop(price, stats['avg_price'])
-                recommendation = self.db.get_recommendation_for_current_drop(price, symbol)
-                suggested_amount = recommendation.get('amount_usdt', 5.0) if recommendation['success'] else 5.0
                 await update.message.reply_text(
                     f"✅ Цена {format_price(price, 4)} USDT\n"
                     f"📉 Падение от средней цены ({format_price(stats['avg_price'], 4)}): `{drop_percent:.1f}%`\n\n"
                     f"💰 Введите количество монет (в {symbol.replace('USDT', '')}):\n"
-                    f"*Рекомендуемая сумма:* {suggested_amount:.2f} USDT\n"
+                    f"*Рекомендуемая сумма:* {manual_amount:.2f} USDT\n"
                     f"*Минимальное количество:* 0.000001",
                     reply_markup=self.get_cancel_keyboard(),
                     parse_mode='Markdown'
@@ -3980,7 +4021,7 @@ class FastDCABot:
                 await update.message.reply_text(
                     f"✅ Цена {format_price(price, 4)} USDT\n\n"
                     f"💰 Введите количество монет (в {symbol.replace('USDT', '')}):\n"
-                    f"*Рекомендуемая сумма:* {ladder_settings['base_amount']:.2f} USDT\n"
+                    f"*Рекомендуемая сумма:* {manual_amount:.2f} USDT\n"
                     f"*Минимальное количество:* 0.000001",
                     reply_markup=self.get_cancel_keyboard(),
                     parse_mode='Markdown'
@@ -4009,8 +4050,7 @@ class FastDCABot:
             if not price:
                 await self._reset_bot_state(context)
                 await update.message.reply_text("❌ Ошибка: цена не найдена. Попробуйте заново.", reply_markup=self.get_main_keyboard())
-                return ConversationHandler.END
-            symbol = self.db.get_setting('symbol', 'TONUSDT')
+                return ConversationHandler.END            symbol = self.db.get_setting('symbol', 'TONUSDT')
             amount_usdt = price * quantity
             stats = self.db.get_dca_stats(symbol)
             drop_percent = 0
@@ -4252,6 +4292,8 @@ class FastDCABot:
             await self.settings_menu(update, context)
         elif text == "🚀 Настройки Авто DCA":
             await self.auto_dca_settings_menu(update, context)
+        elif text == "💵 Сумма для ручного ордера":
+            await self.set_manual_amount_start(update, context)
         elif text in ["🏠 Главное меню", "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку"]:
             await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
         else:
@@ -4451,6 +4493,7 @@ class FastDCABot:
                     if current_price:
                         stats = self.db.get_dca_stats(symbol)
                         settings = self.db.get_ladder_settings(symbol)
+                        manual_amount = self.db.get_manual_amount()
                         
                         msg = f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ О ПОКУПКЕ*\n\n"
                         msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n"
@@ -4463,18 +4506,20 @@ class FastDCABot:
                             
                             recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol)
                             if recommendation['success']:
-                                msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
+                                msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ (для ручного ордера):*\n"
                                 msg += f"📉 Уровень падения составляет: `{recommendation['drop_percent']:.1f}%`\n"
                                 msg += f"📊 Коэффициент: `{recommendation['ratio']:.4f}`\n"
-                                msg += f"💰 Рекомендуемая сумма покупки: `{recommendation['amount_usdt']:.2f}` USDT"
+                                msg += f"💰 Рекомендуемая сумма: `{manual_amount:.2f}` USDT\n"
+                                msg += f"📈 Рекомендуемая цена: `{format_price(current_price, 4)}` USDT"
                             else:
                                 msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Покупка не требуется\n"
                         else:
                             msg += f"📊 *Статистика DCA отсутствует*\n\n"
-                            msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
+                            msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ (для ручного ордера):*\n"
                             msg += f"📉 Уровень падения составляет: `0.0%`\n"
                             msg += f"📊 Коэффициент: `0.0000`\n"
-                            msg += f"💰 Рекомендуемая сумма покупки: `{settings['base_amount']:.2f}` USDT"
+                            msg += f"💰 Рекомендуемая сумма: `{manual_amount:.2f}` USDT\n"
+                            msg += f"📈 Рекомендуемая цена: `{format_price(current_price, 4)}` USDT"
                         
                         try:
                             await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
@@ -4703,6 +4748,7 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu),
                     MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start),
                     MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu),
+                    MessageHandler(filters.Regex('^(💵 Сумма для ручного ордера)$'), self.set_manual_amount_start),
                     MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
                     MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings),
                     MessageHandler(filters.Regex('^🌐 Режим: (Обычный|Демо)$'), self.toggle_trading_mode),
@@ -4713,6 +4759,7 @@ class FastDCABot:
                 SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
                 SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)],
                 SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)],
+                SET_MANUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_manual_amount_done)],
             },
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="main_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
@@ -4724,7 +4771,7 @@ class FastDCABot:
             entry_points=[MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu)],
             states={
                 AUTO_DCA_SETTINGS: [
-                    MessageHandler(filters.Regex(r'^💵 Сумма покупки \(\d+\.?\d* USDT\)$'), self.set_amount_start_auto),
+                    MessageHandler(filters.Regex(r'^💵 Сумма покупки авто \(\d+\.?\d* USDT\)$'), self.set_amount_start_auto),
                     MessageHandler(filters.Regex(r'^⏰ Время покупки \(\d{2}:\d{2}\)$'), self.set_time_start_auto),
                     MessageHandler(filters.Regex(r'^🔄 Частота покупки \(\d+ ч\)$'), self.set_frequency_start_auto),
                     MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
