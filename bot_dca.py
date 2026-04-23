@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.0.0 (23.04.2026)
+Версия 5.0.1 (23.04.2026)
 ИСПРАВЛЕНИЯ: 
+- Исправлена синтаксическая ошибка (перенос строки)
 - Разделены настройки для Авто DCA и ручного ввода
 - Добавлена отдельная кнопка "💵 Сумма для ручного ордера"
 - Авто DCA использует invest_amount (мин. 5 USDT, проверка биржи)
@@ -71,7 +72,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.0.0 (23.04.2026)"
+BOT_VERSION = "5.0.1 (23.04.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
@@ -1852,6 +1853,8 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
@@ -2557,8 +2560,6 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error placing full sell order: {e}")
             return {'success': False, 'error': str(e)}
-
-
 class FastDCABot:
     def __init__(self):
         self.db = Database()
@@ -4050,7 +4051,8 @@ class FastDCABot:
             if not price:
                 await self._reset_bot_state(context)
                 await update.message.reply_text("❌ Ошибка: цена не найдена. Попробуйте заново.", reply_markup=self.get_main_keyboard())
-                return ConversationHandler.END            symbol = self.db.get_setting('symbol', 'TONUSDT')
+                return ConversationHandler.END
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             amount_usdt = price * quantity
             stats = self.db.get_dca_stats(symbol)
             drop_percent = 0
