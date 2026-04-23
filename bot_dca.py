@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 4.9.0 (23.04.2026)
+Версия 4.9.1 (23.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлена ошибка минимальной суммы (теперь проверяется min_amt биржи)
-- Объединены настройки суммы (invest_amount и ladder_base_amount теперь синхронизированы)
-- Исправлено зацикливание кнопок
-- Добавлена проверка минимальной суммы перед покупкой
-- Улучшена обработка ConversationHandler
+- Исправлена ошибка минимальной суммы (Order value exceeded lower limit)
+- Автоматическое увеличение суммы до минимальной на бирже
+- Улучшен расчет количества для market ордеров
 """
 
 import os
@@ -70,7 +68,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.9.0 (23.04.2026)"
+BOT_VERSION = "4.9.1 (23.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -1732,23 +1730,50 @@ class BybitClient:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
+            tick_size = instrument_info['tick_size']
             
-            if amount_usdt < min_amt:
-                return {'success': False, 'error': f'Минимальная сумма: {min_amt} USDT'}
-            
+            # Получаем текущую цену
             price = await self.get_symbol_price(symbol)
             if not price:
                 return {'success': False, 'error': 'Не удалось получить цену'}
             
-            quantity = amount_usdt / price
-            qty_decimal = Decimal(str(quantity))
+            # Рассчитываем количество
+            raw_quantity = amount_usdt / price
+            
+            # Округляем количество согласно qty_step
+            qty_decimal = Decimal(str(raw_quantity))
             step_decimal = Decimal(str(qty_step))
             quantity = float((qty_decimal // step_decimal) * step_decimal)
             
             if quantity < min_qty:
-                return {'success': False, 'error': f'Минимальное количество: {min_qty}'}
+                quantity = min_qty
             
-            response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Market", qty=str(quantity))
+            # Проверяем, что сумма ордера не меньше минимальной
+            order_value = quantity * price
+            if order_value < min_amt:
+                # Увеличиваем количество, чтобы достичь минимальной суммы
+                needed_quantity = min_amt / price
+                qty_decimal = Decimal(str(needed_quantity))
+                step_decimal = Decimal(str(qty_step))
+                quantity = float((qty_decimal // step_decimal) * step_decimal)
+                if quantity < min_qty:
+                    quantity = min_qty
+                order_value = quantity * price
+                
+                # Если всё ещё меньше - увеличиваем ещё на один шаг
+                while order_value < min_amt and quantity < 10000:
+                    quantity += qty_step
+                    order_value = quantity * price
+                
+                logger.info(f"Сумма {amount_usdt} USDT увеличена до {order_value:.2f} USDT для соблюдения min_amt={min_amt}")
+            
+            response = self.session.place_order(
+                category="spot", 
+                symbol=symbol, 
+                side="Buy", 
+                orderType="Market", 
+                qty=str(quantity)
+            )
             if response['retCode'] == 0:
                 order_id = response['result']['orderId']
                 await asyncio.sleep(1)
@@ -1756,7 +1781,15 @@ class BybitClient:
                 avg_price = price
                 if order_details['retCode'] == 0 and order_details['result']['list']:
                     avg_price = float(order_details['result']['list'][0].get('avgPrice', price))
-                return {'success': True, 'order_id': order_id, 'quantity': float(quantity), 'price': avg_price, 'total_usdt': amount_usdt}
+                return {
+                    'success': True, 
+                    'order_id': order_id, 
+                    'quantity': float(quantity), 
+                    'price': avg_price, 
+                    'total_usdt': quantity * avg_price
+                }
+            if response['retCode'] == 170140:
+                return {'success': False, 'error': f'Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)'}
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
             logger.error(f"Market buy error: {e}")
@@ -1804,6 +1837,11 @@ class DCAStrategy:
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         
+        # Убеждаемся, что сумма не меньше минимальной
+        if base_amount < min_amt:
+            base_amount = min_amt
+            logger.warning(f"Базовая сумма увеличена с {settings['base_amount']} до {min_amt} USDT (мин. сумма на бирже)")
+        
         if not stats or stats['total_quantity'] <= 0:
             amount_usdt = base_amount
             drop_percent = 0
@@ -1823,7 +1861,7 @@ class DCAStrategy:
         # Корректируем сумму, если она меньше минимальной
         if amount_usdt < min_amt:
             amount_usdt = min_amt
-            logger.warning(f"Сумма покупки увеличена с {base_amount} до {min_amt} USDT (минимальная на бирже)")
+            logger.warning(f"Сумма покупки увеличена с {amount_usdt:.2f} до {min_amt} USDT (минимальная на бирже)")
         
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
