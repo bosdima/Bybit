@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 4.8.1 (22.04.2026)
+Версия 4.9.0 (23.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлено зацикливание уведомлений об ордерах
-- Исправлена обработка callback-запросов
-- Улучшена проверка дубликатов ордеров
-- Исправлена работа кнопки "Настройки"
+- Исправлена ошибка минимальной суммы (теперь проверяется min_amt биржи)
+- Объединены настройки суммы (invest_amount и ladder_base_amount теперь синхронизированы)
+- Исправлено зацикливание кнопок
+- Добавлена проверка минимальной суммы перед покупкой
+- Улучшена обработка ConversationHandler
 """
 
 import os
@@ -69,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "4.8.1 (22.04.2026)"
+BOT_VERSION = "4.9.0 (23.04.2026)"
 CONVERSATION_TIMEOUT = 180
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -331,7 +332,7 @@ class Database:
             
             defaults = [
                 ('symbol', 'TONUSDT'),
-                ('invest_amount', '1.1'),
+                ('invest_amount', '5.0'),
                 ('profit_percent', '5'),
                 ('max_drop_percent', '80'),
                 ('max_multiplier', '3'),
@@ -342,9 +343,9 @@ class Database:
                 ('last_purchase_price', '0'),
                 ('initial_reference_price', '0'),
                 ('last_purchase_time', '0'),
-                ('ladder_base_amount', '1.1'),
+                ('ladder_base_amount', '5.0'),
                 ('ladder_max_depth', '80'),
-                ('ladder_max_amount', '3.3'),
+                ('ladder_max_amount', '15.0'),
                 ('order_execution_notify', 'true'),
                 ('order_check_interval_minutes', '15'),
                 ('sell_tracking_enabled', 'true'),
@@ -817,8 +818,8 @@ class Database:
                 return {
                     'symbol': symbol,
                     'max_depth': float(self.get_setting('ladder_max_depth', '80')),
-                    'base_amount': float(self.get_setting('ladder_base_amount', '1.1')),
-                    'max_amount': float(self.get_setting('ladder_max_amount', '3.3')),
+                    'base_amount': float(self.get_setting('invest_amount', '5.0')),
+                    'max_amount': float(self.get_setting('invest_amount', '5.0')) * 3,
                     'step_percent': 1.0,
                 }
         except Exception as e:
@@ -826,8 +827,8 @@ class Database:
             return {
                 'symbol': symbol,
                 'max_depth': 80,
-                'base_amount': 1.1,
-                'max_amount': 3.3,
+                'base_amount': 5.0,
+                'max_amount': 15.0,
                 'step_percent': 1.0,
             }
     
@@ -853,6 +854,8 @@ class Database:
             self.set_setting('ladder_max_depth', str(settings['max_depth']))
             self.set_setting('ladder_base_amount', str(settings['base_amount']))
             self.set_setting('ladder_max_amount', str(settings['max_amount']))
+            # Синхронизируем invest_amount с base_amount
+            self.set_setting('invest_amount', str(settings['base_amount']))
         except Exception as e:
             logger.error(f"Error saving ladder settings: {e}")
     
@@ -1572,15 +1575,15 @@ class BybitClient:
                 
                 return {
                     'min_qty': float(lot_size_filter.get('minOrderQty', 0.01)),
-                    'min_amt': float(lot_size_filter.get('minOrderAmt', 10)),
+                    'min_amt': float(lot_size_filter.get('minOrderAmt', 5)),
                     'qty_step': float(lot_size_filter.get('qtyStep', 0.01)),
                     'tick_size': float(price_filter.get('tickSize', 0.0001)),
                     'base_precision': base_precision,
                 }
-            return {'min_qty': 0.01, 'min_amt': 10, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+            return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
         except Exception as e:
             logger.error(f"Error getting instrument info: {e}")
-            return {'min_qty': 0.01, 'min_amt': 10, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+            return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
@@ -1729,17 +1732,22 @@ class BybitClient:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
+            
             if amount_usdt < min_amt:
                 return {'success': False, 'error': f'Минимальная сумма: {min_amt} USDT'}
+            
             price = await self.get_symbol_price(symbol)
             if not price:
                 return {'success': False, 'error': 'Не удалось получить цену'}
+            
             quantity = amount_usdt / price
             qty_decimal = Decimal(str(quantity))
             step_decimal = Decimal(str(qty_step))
             quantity = float((qty_decimal // step_decimal) * step_decimal)
+            
             if quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty}'}
+            
             response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Market", qty=str(quantity))
             if response['retCode'] == 0:
                 order_id = response['result']['orderId']
@@ -1751,6 +1759,7 @@ class BybitClient:
                 return {'success': True, 'order_id': order_id, 'quantity': float(quantity), 'price': avg_price, 'total_usdt': amount_usdt}
             return {'success': False, 'error': response['retMsg']}
         except Exception as e:
+            logger.error(f"Market buy error: {e}")
             return {'success': False, 'error': str(e)}
     
     async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float) -> Dict:
@@ -1791,6 +1800,10 @@ class DCAStrategy:
         settings = self.db.get_ladder_settings(symbol)
         base_amount = settings['base_amount']
         
+        # Проверяем минимальную сумму для покупки
+        instrument_info = await self.bybit.get_instrument_info(symbol)
+        min_amt = instrument_info['min_amt']
+        
         if not stats or stats['total_quantity'] <= 0:
             amount_usdt = base_amount
             drop_percent = 0
@@ -1806,6 +1819,11 @@ class DCAStrategy:
                 amount_usdt = base_amount
                 drop_percent = 0
                 step_level = 0
+        
+        # Корректируем сумму, если она меньше минимальной
+        if amount_usdt < min_amt:
+            amount_usdt = min_amt
+            logger.warning(f"Сумма покупки увеличена с {base_amount} до {min_amt} USDT (минимальная на бирже)")
         
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
@@ -1859,6 +1877,8 @@ class DCAStrategy:
             result['drop_percent'] = drop_percent
             
             self.db.log_action('SCHEDULED_PURCHASE', symbol, f"Сумма: {result['total_usdt']:.2f} USDT, падение: {drop_percent:.1f}%")
+        else:
+            logger.error(f"Scheduled purchase failed: {result.get('error')}")
         
         return result
     
@@ -1874,6 +1894,12 @@ class DCAStrategy:
         amount_usdt = ladder_info['amount_usdt']
         drop_percent = ladder_info.get('drop_percent', 0)
         step_level = ladder_info['step_level']
+        
+        # Проверяем минимальную сумму
+        instrument_info = await self.bybit.get_instrument_info(symbol)
+        min_amt = instrument_info['min_amt']
+        if amount_usdt < min_amt:
+            amount_usdt = min_amt
         
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
@@ -2540,7 +2566,7 @@ class FastDCABot:
     def get_auto_dca_keyboard(self):
         schedule_time = self.db.get_setting('schedule_time', '09:00')
         frequency_hours = self.db.get_setting('frequency_hours', '24')
-        invest_amount = self.db.get_setting('invest_amount', '1.1')
+        invest_amount = self.db.get_setting('invest_amount', '5.0')
         keyboard = [
             [KeyboardButton(f"💵 Сумма покупки ({invest_amount} USDT)")],
             [KeyboardButton(f"⏰ Время покупки ({schedule_time})")],
@@ -2767,7 +2793,7 @@ class FastDCABot:
         await self._reset_bot_state(context)
         schedule_time = self.db.get_setting('schedule_time', '09:00')
         frequency_hours = self.db.get_setting('frequency_hours', '24')
-        invest_amount = self.db.get_setting('invest_amount', '1.1')
+        invest_amount = self.db.get_setting('invest_amount', '5.0')
         await update.message.reply_text(
             f"🚀 *Настройки Авто DCA*\n\n"
             f"Здесь вы можете настроить параметры автоматической стратегии.\n\n"
@@ -2781,7 +2807,7 @@ class FastDCABot:
         return AUTO_DCA_SETTINGS
     
     async def set_amount_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"💵 Введите сумму (текущая: {self.db.get_setting('invest_amount', '1.1')}):\n*Это базовая сумма для лестницы*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text(f"💵 Введите сумму (текущая: {self.db.get_setting('invest_amount', '5.0')}):\n*Минимальная сумма зависит от токена (обычно 5-10 USDT)*", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_AMOUNT
     
     async def set_amount_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2791,8 +2817,8 @@ class FastDCABot:
             return AUTO_DCA_SETTINGS
         try:
             amount = float(text)
-            if amount < 1:
-                raise ValueError
+            if amount < 5:
+                raise ValueError("Минимальная сумма 5 USDT")
             self.db.set_setting('invest_amount', str(amount))
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             ladder = self.db.get_ladder_settings(symbol)
@@ -2801,8 +2827,8 @@ class FastDCABot:
             self.db.save_ladder_settings(ladder)
             await update.message.reply_text(f"✅ Сумма изменена на {amount} USDT\n🪜 Базовая сумма лестницы обновлена", reply_markup=self.get_auto_dca_keyboard())
             return AUTO_DCA_SETTINGS
-        except ValueError:
-            await update.message.reply_text("❌ Некорректное значение", reply_markup=self.get_cancel_keyboard())
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {str(e)}", reply_markup=self.get_cancel_keyboard())
             return SET_AMOUNT
     
     async def set_time_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3419,7 +3445,7 @@ class FastDCABot:
         await self._reset_bot_state(context)
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
-        invest_amount = float(self.db.get_setting('invest_amount', '1.1'))
+        invest_amount = float(self.db.get_setting('invest_amount', '5.0'))
         ladder_settings = self.db.get_ladder_settings(symbol)
         order_execution = self.db.get_order_execution_notify()
         sell_tracking = self.db.get_sell_tracking_enabled()
@@ -3481,6 +3507,15 @@ class FastDCABot:
             if not current_price:
                 await update.message.reply_text("❌ Не удалось получить цену")
                 return
+            
+            # Проверяем минимальную сумму
+            instrument_info = await self.bybit.get_instrument_info(symbol)
+            min_amt = instrument_info['min_amt']
+            invest_amount = float(self.db.get_setting('invest_amount', '5.0'))
+            if invest_amount < min_amt:
+                await update.message.reply_text(f"❌ Сумма покупки ({invest_amount} USDT) меньше минимальной на бирже ({min_amt} USDT).\nУвеличьте сумму в настройках.")
+                return
+            
             self.db.set_setting('dca_active', 'true')
             self.db.set_setting('initial_reference_price', str(current_price))
             self.db.set_dca_start(symbol, current_price)
@@ -3488,7 +3523,6 @@ class FastDCABot:
             next_time = self._calculate_next_purchase_time()
             self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
             
-            invest_amount = float(self.db.get_setting('invest_amount', '1.1'))
             ladder_settings = self.db.get_ladder_settings(symbol)
             schedule_time = self.db.get_setting('schedule_time', '09:00')
             frequency_hours = self.db.get_setting('frequency_hours', '24')
@@ -3500,7 +3534,8 @@ class FastDCABot:
                 f"💵 Базовая сумма: {invest_amount} USDT\n"
                 f"📉 Макс. просадка: {ladder_settings['max_depth']}%\n"
                 f"⏰ Расписание: {schedule_time} (МСК), каждые {frequency_hours} ч.\n"
-                f"⏰ Следующая покупка: {next_time.strftime('%d.%m.%Y %H:%M')} (МСК)",
+                f"⏰ Следующая покупка: {next_time.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
+                f"⚠️ *Важно:* Минимальная сумма покупки на Bybit для {symbol} составляет {min_amt} USDT",
                 reply_markup=self.get_main_keyboard()
             )
             logger.info(f"DCA activated. Next purchase at {next_time.isoformat()}")
@@ -3579,9 +3614,19 @@ class FastDCABot:
         if not price:
             await update.message.reply_text(f"❌ Символ {symbol} не найден.", reply_markup=self.get_symbol_selection_keyboard())
             return SELECTING_SYMBOL
+        
+        # Проверяем минимальную сумму для нового токена
+        instrument_info = await self.bybit.get_instrument_info(symbol)
+        min_amt = instrument_info['min_amt']
+        
         self.db.set_setting('symbol', symbol)
         self.db.set_setting('initial_reference_price', str(price))
-        await update.message.reply_text(f"✅ Символ изменен на {symbol}\n💰 Текущая цена: {format_price(price, 4)} USDT", reply_markup=self.get_settings_keyboard())
+        await update.message.reply_text(
+            f"✅ Символ изменен на {symbol}\n"
+            f"💰 Текущая цена: {format_price(price, 4)} USDT\n"
+            f"⚠️ Минимальная сумма покупки: {min_amt} USDT",
+            reply_markup=self.get_settings_keyboard()
+        )
         return SELECTING_ACTION
     
     async def ladder_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3595,7 +3640,7 @@ class FastDCABot:
             "Параметры:\n"
             "• Глубина просадки: максимальный процент падения\n"
             "• Рост суммы: от базовой до максимальной\n"
-            "• Базовая сумма: сумма первого ордера",
+            "• Базовая сумма: сумма первого ордера (синхронизирована с настройками Авто DCA)",
             reply_markup=self.get_ladder_settings_keyboard(),
             parse_mode='Markdown'
         )
@@ -3656,7 +3701,7 @@ class FastDCABot:
     async def set_ladder_base_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text("💵 Введите базовую сумму (мин 1 USDT):\n*Сумма первого ордера*\n\nПример: 1.1", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("💵 Введите базовую сумму (мин 5 USDT):\n*Сумма первого ордера*\n\nПример: 5", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_BASE_AMOUNT
     
     async def set_ladder_base_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3666,17 +3711,17 @@ class FastDCABot:
             return LADDER_MENU
         try:
             base_amount = float(text.replace(',', '.'))
-            if base_amount < 1:
-                raise ValueError
+            if base_amount < 5:
+                raise ValueError("Минимальная сумма 5 USDT")
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             ladder = self.db.get_ladder_settings(symbol)
             ladder['base_amount'] = base_amount
             ladder['max_amount'] = base_amount * 3
             self.db.save_ladder_settings(ladder)
-            await update.message.reply_text(f"✅ Базовая сумма: {base_amount} USDT\n💰 Максимальная сумма: {base_amount * 3} USDT", reply_markup=self.get_ladder_settings_keyboard())
+            await update.message.reply_text(f"✅ Базовая сумма: {base_amount} USDT\n💰 Максимальная сумма: {base_amount * 3} USDT\n🔄 Сумма в настройках Авто DCA также обновлена.", reply_markup=self.get_ladder_settings_keyboard())
             return LADDER_MENU
         except ValueError:
-            await update.message.reply_text("❌ Некорректная сумма (мин 1).", reply_markup=self.get_cancel_keyboard())
+            await update.message.reply_text("❌ Некорректная сумма (мин 5).", reply_markup=self.get_cancel_keyboard())
             return SET_LADDER_BASE_AMOUNT
     
     async def reset_ladder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3737,8 +3782,8 @@ class FastDCABot:
                 raise ValueError
             context.user_data['manual_buy_price'] = price
             recommendation = context.user_data.get('manual_buy_recommendation', {})
-            suggested_amount = recommendation.get('amount_usdt', 1.1) if recommendation.get('should_buy') else 1.1
-            await update.message.reply_text(f"💰 Введите сумму покупки в USDT\n*Рекомендуемая сумма:* {suggested_amount:.2f} USDT\nМинимум: 1.1 USDT:", reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
+            suggested_amount = recommendation.get('amount_usdt', 5.0) if recommendation.get('should_buy') else 5.0
+            await update.message.reply_text(f"💰 Введите сумму покупки в USDT\n*Рекомендуемая сумма:* {suggested_amount:.2f} USDT\nМинимум: 5 USDT:", reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
             return MANUAL_BUY_AMOUNT
         except ValueError:
             await update.message.reply_text("❌ Некорректная цена. Введите число больше 0.", reply_markup=self.get_manual_buy_keyboard())
@@ -3767,8 +3812,8 @@ class FastDCABot:
                     await update.message.reply_text(f"❌ Минимальная сумма покупки: {min_amt} USDT", reply_markup=self.get_manual_buy_keyboard())
                     return MANUAL_BUY_AMOUNT
             
-            if amount < 1.1:
-                raise ValueError("Минимальная сумма 1.1 USDT")
+            if amount < 5:
+                raise ValueError("Минимальная сумма 5 USDT")
             price = context.user_data.get('manual_buy_price')
             symbol = context.user_data.get('manual_buy_symbol', 'TONUSDT')
             recommendation = context.user_data.get('manual_buy_recommendation', {})
@@ -3858,7 +3903,7 @@ class FastDCABot:
             if stats and stats['avg_price'] > 0:
                 drop_percent = calculate_current_drop(price, stats['avg_price'])
                 recommendation = self.db.get_recommendation_for_current_drop(price, symbol)
-                suggested_amount = recommendation.get('amount_usdt', 1.1) if recommendation['success'] else 1.1
+                suggested_amount = recommendation.get('amount_usdt', 5.0) if recommendation['success'] else 5.0
                 await update.message.reply_text(
                     f"✅ Цена {format_price(price, 4)} USDT\n"
                     f"📉 Падение от средней цены ({format_price(stats['avg_price'], 4)}): `{drop_percent:.1f}%`\n\n"
