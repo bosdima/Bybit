@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.0.1 (23.04.2026)
+Версия 5.2.0 (24.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлена синтаксическая ошибка (перенос строки)
-- Разделены настройки для Авто DCA и ручного ввода
-- Добавлена отдельная кнопка "💵 Сумма для ручного ордера"
-- Авто DCA использует invest_amount (мин. 5 USDT, проверка биржи)
-- Ручной ввод использует manual_amount (может быть 1.1 USDT, без проверки биржи)
-- Исправлен расчет количества для market ордеров
-- Уведомления используют правильную сумму
+- Исправлен расчет суммы для ручной покупки (теперь учитывает коэффициент Мартингейла)
+- Убрано дублирование строки с падением цены
+- Исправлено зацикливание кнопок в редактировании покупок
+- В ручном режиме используется своя базовая сумма (manual_amount)
 """
 
 import os
@@ -72,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.0.1 (23.04.2026)"
+BOT_VERSION = "5.2.0 (24.04.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
@@ -162,7 +159,14 @@ def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) ->
     return level, ratio
 
 def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
-    if drop_percent <= 0: return base_amount
+    """
+    Расчет суммы покупки на основе процента падения (Мартингейл лесенкой)
+    При падении 0% -> base_amount
+    При падении max_depth% -> max_amount
+    Линейная интерполяция между ними
+    """
+    if drop_percent <= 0:
+        return base_amount
     effective_drop = min(drop_percent, max_depth)
     fraction = effective_drop / max_depth
     amount = base_amount + (max_amount - base_amount) * fraction
@@ -927,29 +931,46 @@ class Database:
             'reason': f'Ждем падения до {next_drop:.1f}% ({format_price(next_price)}) от средней цены {format_price(avg_price)}'
         }
     
-    def get_recommendation_for_current_drop(self, current_price: float, symbol: str = None) -> Dict:
+    def get_recommendation_for_current_drop(self, current_price: float, symbol: str = None, for_manual: bool = False) -> Dict:
+        """
+        for_manual = True -> используется manual_amount как базовая сумма для ручного режима
+        for_manual = False -> используются настройки лестницы (для авто DCA)
+        """
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
         
         stats = self.get_dca_stats(symbol)
-        settings = self.get_ladder_settings(symbol)
+        
+        if for_manual:
+            # Для ручного режима используем отдельные настройки
+            base_amount = self.get_manual_amount()
+            max_amount = base_amount * 3  # максимальная сумма для ручного режима = базовая * 3
+            max_depth = float(self.get_setting('ladder_max_depth', '80'))
+        else:
+            settings = self.get_ladder_settings(symbol)
+            base_amount = settings['base_amount']
+            max_amount = settings['max_amount']
+            max_depth = settings['max_depth']
         
         if not stats or stats['total_quantity'] <= 0:
             return {
                 'success': True,
                 'drop_percent': 0,
                 'ratio': 0,
-                'amount_usdt': settings['base_amount'],
+                'amount_usdt': base_amount,
                 'level': 0,
                 'avg_price': 0,
-                'is_first': True
+                'is_first': True,
+                'base_amount': base_amount,
+                'max_amount': max_amount,
+                'max_depth': max_depth
             }
         
         avg_price = stats['avg_price']
         drop_percent = calculate_current_drop(current_price, avg_price)
         
-        amount = get_amount_by_drop(drop_percent, settings['base_amount'], settings['max_amount'], settings['max_depth'])
-        level, ratio = get_ladder_levels(drop_percent, settings['max_depth'])
+        amount = get_amount_by_drop(drop_percent, base_amount, max_amount, max_depth)
+        level, ratio = get_ladder_levels(drop_percent, max_depth)
         
         return {
             'success': True,
@@ -959,7 +980,10 @@ class Database:
             'level': level,
             'avg_price': avg_price,
             'current_drop': drop_percent,
-            'is_first': False
+            'is_first': False,
+            'base_amount': base_amount,
+            'max_amount': max_amount,
+            'max_depth': max_depth
         }
     
     def get_ladder_summary(self, symbol: str = None, current_price: float = None) -> Dict:
@@ -1873,11 +1897,7 @@ class DCAStrategy:
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         
-        # Убеждаемся, что сумма не меньше минимальной
-        if base_amount < min_amt:
-            base_amount = min_amt
-            logger.warning(f"Базовая сумма увеличена с {settings['base_amount']} до {min_amt} USDT (мин. сумма на бирже)")
-        
+        # Рассчитываем сумму с учетом коэффициента Мартингейла
         if not stats or stats['total_quantity'] <= 0:
             amount_usdt = base_amount
             drop_percent = 0
@@ -1889,6 +1909,7 @@ class DCAStrategy:
                 amount_usdt = get_amount_by_drop(current_drop, base_amount, settings['max_amount'], settings['max_depth'])
                 drop_percent = current_drop
                 step_level = int(current_drop)
+                logger.info(f"Расчет суммы для Авто DCA: падение={current_drop:.1f}%, сумма={amount_usdt:.2f} USDT")
             else:
                 amount_usdt = base_amount
                 drop_percent = 0
@@ -3862,18 +3883,20 @@ class FastDCABot:
         context.user_data['manual_buy_symbol'] = symbol
         context.user_data['manual_buy_recommendation'] = recommendation
         msg = f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
-        if recommendation['success'] and recommendation['should_buy']:
-            msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Сейчас хороший момент!\n"
-            if recommendation.get('current_drop', 0) > 0:
-                msg += f"📉 Падение от средней цены: `{recommendation['current_drop']:.1f}%`\n"
-            msg += f"📊 Рекомендуемая сумма: `{recommendation['amount_usdt']:.2f}` USDT\n\n"
-        elif recommendation['success']:
-            msg += f"⏳ *РЕКОМЕНДАЦИЯ:* Ждем снижения\n"
-            if recommendation.get('current_drop', 0) > 0:
-                msg += f"📉 Текущее падение: `{recommendation['current_drop']:.1f}%`\n"
-            msg += f"📉 Следующее падение: `{recommendation.get('next_drop', 0):.1f}%`\n"
-            msg += f"💰 Следующая цена: `{format_price(recommendation['next_buy_price'], 4)}` USDT\n\n"
-        msg += f"💵 *Сумма для ручного ордера*: `{manual_amount:.2f}` USDT\n"
+        
+        # Показываем рекомендованную сумму с учетом коэффициента Мартингейла для ручного режима
+        rec_manual = self.db.get_recommendation_for_current_drop(current_price, symbol, for_manual=True)
+        if rec_manual['success']:
+            if rec_manual['is_first']:
+                msg += f"🟢 *ПЕРВАЯ ПОКУПКА*\n"
+                msg += f"💰 Рекомендуемая сумма (с учетом коэффициента): `{rec_manual['amount_usdt']:.2f}` USDT\n\n"
+            else:
+                msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
+                msg += f"📉 Уровень падения составляет: `{rec_manual['drop_percent']:.1f}%`\n"
+                msg += f"📊 Коэффициент: `{rec_manual['ratio']:.4f}`\n"
+                msg += f"💰 Рекомендуемая сумма (с учетом коэффициента): `{rec_manual['amount_usdt']:.2f}` USDT\n\n"
+        
+        msg += f"💵 *Сумма для ручного ордера в настройках*: `{manual_amount:.2f}` USDT\n"
         msg += f"Введите цену лимитного ордера (или нажмите Отмена):"
         await update.message.reply_text(msg, reply_markup=self.get_manual_buy_keyboard(), parse_mode='Markdown')
         return MANUAL_BUY_PRICE
@@ -3965,8 +3988,10 @@ class FastDCABot:
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         current_price = await self.bybit.get_symbol_price(symbol)
         stats = self.db.get_dca_stats(symbol)
-        ladder_settings = self.db.get_ladder_settings(symbol)
-        recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol)
+        
+        # Используем for_manual=True для ручного режима
+        recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol, for_manual=True)
+        
         manual_amount = self.db.get_manual_amount()
         msg = f"➕ *Добавление покупки вручную*\n\n"
         msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
@@ -3977,12 +4002,13 @@ class FastDCABot:
         if recommendation['success']:
             if recommendation['is_first']:
                 msg += f"🟢 *ПЕРВАЯ ПОКУПКА*\n"
-                msg += f"💰 Рекомендуемая сумма: `{manual_amount:.2f}` USDT\n\n"
+                msg += f"💰 Рекомендуемая сумма (с учетом коэффициента): `{recommendation['amount_usdt']:.2f}` USDT\n\n"
             else:
                 msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ ПО ПРИНЦИПУ МАРТИНГЕЙЛА:*\n"
                 msg += f"📉 Уровень падения составляет: `{recommendation['drop_percent']:.1f}%`\n"
                 msg += f"📊 Коэффициент: `{recommendation['ratio']:.4f}`\n"
-                msg += f"💰 Рекомендуемая сумма покупки: `{manual_amount:.2f}` USDT\n\n"
+                msg += f"💰 Рекомендуемая сумма покупки (с учетом коэффициента): `{recommendation['amount_usdt']:.2f}` USDT\n\n"
+        msg += f"💡 *Сумма для ручного ордера в настройках*: `{manual_amount:.2f}` USDT\n"
         msg += f"Введите цену покупки (USDT):"
         await update.message.reply_text(msg, reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return MANUAL_ADD_PRICE
@@ -4005,15 +4031,17 @@ class FastDCABot:
             context.user_data['manual_price'] = price
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             stats = self.db.get_dca_stats(symbol)
-            ladder_settings = self.db.get_ladder_settings(symbol)
-            manual_amount = self.db.get_manual_amount()
+            
+            # Рекомендация для указанной цены (ручной режим)
+            recommendation = self.db.get_recommendation_for_current_drop(price, symbol, for_manual=True)
+            
             if stats and stats['avg_price'] > 0:
                 drop_percent = calculate_current_drop(price, stats['avg_price'])
                 await update.message.reply_text(
                     f"✅ Цена {format_price(price, 4)} USDT\n"
                     f"📉 Падение от средней цены ({format_price(stats['avg_price'], 4)}): `{drop_percent:.1f}%`\n\n"
                     f"💰 Введите количество монет (в {symbol.replace('USDT', '')}):\n"
-                    f"*Рекомендуемая сумма:* {manual_amount:.2f} USDT\n"
+                    f"*Рекомендуемая сумма (с учетом коэффициента):* {recommendation['amount_usdt']:.2f} USDT\n"
                     f"*Минимальное количество:* 0.000001",
                     reply_markup=self.get_cancel_keyboard(),
                     parse_mode='Markdown'
@@ -4022,7 +4050,7 @@ class FastDCABot:
                 await update.message.reply_text(
                     f"✅ Цена {format_price(price, 4)} USDT\n\n"
                     f"💰 Введите количество монет (в {symbol.replace('USDT', '')}):\n"
-                    f"*Рекомендуемая сумма:* {manual_amount:.2f} USDT\n"
+                    f"*Рекомендуемая сумма (с учетом коэффициента):* {recommendation['amount_usdt']:.2f} USDT\n"
                     f"*Минимальное количество:* 0.000001",
                     reply_markup=self.get_cancel_keyboard(),
                     parse_mode='Markdown'
@@ -4092,6 +4120,9 @@ class FastDCABot:
             await self.back_to_main(update, context)
             return ConversationHandler.END
         if text in ["💰 Изменить цену", "📊 Изменить количество", "📅 Изменить дату", "❌ Удалить покупку", "🔙 Назад к списку"]:
+            # Возвращаемся к списку покупок, если нажата кнопка "Назад к списку"
+            if text == "🔙 Назад к списку":
+                return await self.edit_purchases_list(update, context)
             return EDIT_PURCHASE_SELECT
         try:
             import re
@@ -4346,7 +4377,7 @@ class FastDCABot:
                                    f"💵 Цена: `{format_price(result['price'], 4)}` USDT\n"
                                    f"📊 Количество: `{format_quantity(result['quantity'], 2)}`\n")
                             if result.get('drop_percent', 0) > 0:
-                                msg += f"📉 Падение от средней: `{result['drop_percent']:.1f}%`\n"
+                                msg += f"📉 Падение от средней: `{result['drop_percent']:.1f}%` (сумма увеличена по лестнице)\n"
                             if result.get('sell_warning'):
                                 msg += f"\n⚠️ {result['sell_warning']}"
                             try:
@@ -4494,8 +4525,10 @@ class FastDCABot:
                     current_price = await self.bybit.get_symbol_price(symbol)
                     if current_price:
                         stats = self.db.get_dca_stats(symbol)
-                        settings = self.db.get_ladder_settings(symbol)
                         manual_amount = self.db.get_manual_amount()
+                        
+                        # Используем for_manual=True для ручного режима
+                        recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol, for_manual=True)
                         
                         msg = f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ О ПОКУПКЕ*\n\n"
                         msg += f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n"
@@ -4506,13 +4539,12 @@ class FastDCABot:
                             msg += f"📉 Средняя цена: `{format_price(stats['avg_price'], 4)}` USDT\n"
                             msg += f"📉 Падение от средней цены: `{current_drop:.1f}%`\n\n"
                             
-                            recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol)
                             if recommendation['success']:
                                 msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ (для ручного ордера):*\n"
                                 msg += f"📉 Уровень падения составляет: `{recommendation['drop_percent']:.1f}%`\n"
                                 msg += f"📊 Коэффициент: `{recommendation['ratio']:.4f}`\n"
-                                msg += f"💰 Рекомендуемая сумма: `{manual_amount:.2f}` USDT\n"
-                                msg += f"📈 Рекомендуемая цена: `{format_price(current_price, 4)}` USDT"
+                                msg += f"💰 Рекомендуемая сумма (с учетом коэффициента): `{recommendation['amount_usdt']:.2f}` USDT\n"
+                                msg += f"📈 Рекомендуемая цена: `{format_price(current_price, 4)}` USDT\n\n"
                             else:
                                 msg += f"🟢 *РЕКОМЕНДАЦИЯ:* Покупка не требуется\n"
                         else:
@@ -4520,8 +4552,10 @@ class FastDCABot:
                             msg += f"🟢 *РЕКОМЕНДАЦИЯ ПО ПОКУПКЕ (для ручного ордера):*\n"
                             msg += f"📉 Уровень падения составляет: `0.0%`\n"
                             msg += f"📊 Коэффициент: `0.0000`\n"
-                            msg += f"💰 Рекомендуемая сумма: `{manual_amount:.2f}` USDT\n"
-                            msg += f"📈 Рекомендуемая цена: `{format_price(current_price, 4)}` USDT"
+                            msg += f"💰 Рекомендуемая сумма (с учетом коэффициента): `{recommendation['amount_usdt']:.2f}` USDT\n"
+                            msg += f"📈 Рекомендуемая цена: `{format_price(current_price, 4)}` USDT\n"
+                        
+                        msg += f"💡 *Сумма для ручного ордера в настройках*: `{manual_amount:.2f}` USDT"
                         
                         try:
                             await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
