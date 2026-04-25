@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.2.0 (24.04.2026)
+Версия 5.2.1 (25.04.2026)
 ИСПРАВЛЕНИЯ: 
-- Исправлен расчет суммы для ручной покупки (теперь учитывает коэффициент Мартингейла)
+- Исправлена ошибка market buy (код 170140) через использование quoteOrderQty
+- Улучшена коррекция суммы для авто DCA с учётом min_amt биржи
+- Предотвращено возможное зацикливание в редактировании покупок
 - Убрано дублирование строки с падением цены
-- Исправлено зацикливание кнопок в редактировании покупок
 - В ручном режиме используется своя базовая сумма (manual_amount)
+- Добавлены дополнительные проверки и логирование
 """
 
 import os
@@ -69,7 +71,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.2.0 (24.04.2026)"
+BOT_VERSION = "5.2.1 (25.04.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
@@ -1760,82 +1762,98 @@ class BybitClient:
             return {'success': False, 'error': str(e)}
     
     async def place_market_buy(self, symbol: str, amount_usdt: float) -> Dict:
+        """
+        Размещение рыночного ордера на покупку с использованием quoteOrderQty.
+        Это гарантирует, что сумма ордера будет точно соответствовать amount_usdt,
+        и устраняет ошибки из-за неправильного округления количества.
+        """
         try:
             if not self.session:
                 self._init_session()
-            instrument_info = await self.get_instrument_info(symbol)
-            min_qty = instrument_info['min_qty']
-            min_amt = instrument_info['min_amt']
-            qty_step = instrument_info['qty_step']
-            tick_size = instrument_info['tick_size']
             
-            # Получаем текущую цену
-            price = await self.get_symbol_price(symbol)
-            if not price:
-                return {'success': False, 'error': 'Не удалось получить цену'}
+            # Получаем инструментальную информацию для проверки ограничений
+            instrument_info = await self.get_instrument_info(symbol)
+            min_amt = instrument_info['min_amt']
             
             # Убеждаемся, что сумма не меньше минимальной
             if amount_usdt < min_amt:
                 amount_usdt = min_amt
-                logger.warning(f"Сумма увеличена до минимальной {min_amt} USDT")
+                logger.warning(f"Сумма покупки увеличена до минимальной {min_amt} USDT")
             
-            # Рассчитываем количество и округляем ВВЕРХ
-            raw_quantity = amount_usdt / price
-            qty_decimal = Decimal(str(raw_quantity))
-            step_decimal = Decimal(str(qty_step))
-            # Округление вверх
-            quantity = float((qty_decimal + step_decimal - Decimal('0.000001')) // step_decimal * step_decimal)
+            # Округляем сумму до 2 знаков (обычно достаточно, но для некоторых пар может быть больше)
+            quote_order_qty = round(amount_usdt, 2)
             
-            if quantity < min_qty:
-                quantity = min_qty
+            # Дополнительная проверка: если сумма всё ещё меньше минимальной, устанавливаем её в min_amt
+            if quote_order_qty < min_amt:
+                quote_order_qty = min_amt
             
-            # Проверяем итоговую сумму
-            order_value = quantity * price
-            if order_value < min_amt:
-                needed_quantity = min_amt / price
-                qty_decimal = Decimal(str(needed_quantity))
-                quantity = float((qty_decimal + step_decimal - Decimal('0.000001')) // step_decimal * step_decimal)
-                if quantity < min_qty:
-                    quantity = min_qty
-                order_value = quantity * price
-                
-                max_iterations = 20
-                for _ in range(max_iterations):
-                    if order_value >= min_amt:
-                        break
-                    quantity += qty_step
-                    order_value = quantity * price
-                
-                logger.info(f"Количество скорректировано до {quantity} (сумма {order_value:.2f} USDT)")
+            logger.info(f"Market buy: symbol={symbol}, quoteOrderQty={quote_order_qty} USDT")
             
+            # Отправляем ордер с quoteOrderQty (сумма в USDT)
             response = self.session.place_order(
-                category="spot", 
-                symbol=symbol, 
-                side="Buy", 
-                orderType="Market", 
-                qty=str(quantity)
+                category="spot",
+                symbol=symbol,
+                side="Buy",
+                orderType="Market",
+                qty=None,                     # Не используем qty
+                quoteOrderQty=str(quote_order_qty),  # Используем сумму в USDT
+                timeInForce="GTC"
             )
+            
             if response['retCode'] == 0:
                 order_id = response['result']['orderId']
+                # Ждём 1 секунду и получаем детали исполнения
                 await asyncio.sleep(1)
                 order_details = self.session.get_order_history(category="spot", orderId=order_id)
-                avg_price = price
+                avg_price = None
+                executed_qty = None
+                executed_value = None
+                
                 if order_details['retCode'] == 0 and order_details['result']['list']:
-                    avg_price = float(order_details['result']['list'][0].get('avgPrice', price))
-                return {
-                    'success': True, 
-                    'order_id': order_id, 
-                    'quantity': float(quantity), 
-                    'price': avg_price, 
-                    'total_usdt': quantity * avg_price
+                    ord_info = order_details['result']['list'][0]
+                    avg_price = float(ord_info.get('avgPrice', 0))
+                    executed_qty = float(ord_info.get('cumExecQty', 0))
+                    executed_value = float(ord_info.get('cumExecValue', 0))
+                
+                # Если не удалось получить avgPrice, используем текущую цену как fallback
+                if not avg_price or avg_price == 0:
+                    price = await self.get_symbol_price(symbol)
+                    avg_price = price if price else 0
+                
+                if not executed_qty or executed_qty == 0:
+                    # Рассчитываем количество из суммы и цены
+                    if avg_price > 0:
+                        executed_qty = quote_order_qty / avg_price
+                    else:
+                        executed_qty = quote_order_qty / (await self.get_symbol_price(symbol) or 1)
+                
+                if not executed_value or executed_value == 0:
+                    executed_value = executed_qty * avg_price
+                
+                # Округляем количество в соответствии с шагом
+                qty_step = instrument_info['qty_step']
+                qty_decimal = Decimal(str(executed_qty))
+                step_decimal = Decimal(str(qty_step))
+                rounded_qty = float((qty_decimal // step_decimal) * step_decimal)
+                if rounded_qty <= 0:
+                    rounded_qty = instrument_info['min_qty']
+                
+                result = {
+                    'success': True,
+                    'order_id': order_id,
+                    'quantity': rounded_qty,
+                    'price': avg_price,
+                    'total_usdt': executed_value
                 }
-            if response['retCode'] == 170140:
-                error_msg = f'Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)'
-                logger.error(error_msg)
+                logger.info(f"Market buy executed: {result}")
+                return result
+            else:
+                error_msg = response.get('retMsg', 'Unknown error')
+                logger.error(f"Market buy error: {error_msg} (Code: {response.get('retCode')})")
                 return {'success': False, 'error': error_msg}
-            return {'success': False, 'error': response['retMsg']}
+        
         except Exception as e:
-            logger.error(f"Market buy error: {e}")
+            logger.error(f"Market buy exception: {e}")
             return {'success': False, 'error': str(e)}
     
     async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float, is_auto: bool = True) -> Dict:
@@ -1847,7 +1865,6 @@ class BybitClient:
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
             
-            # Для авто DCA проверяем минимальную сумму, для ручного - нет
             if is_auto and amount_usdt < min_amt:
                 return {'success': False, 'error': f'Минимальная сумма для авто DCA: {min_amt} USDT'}
             
@@ -2581,6 +2598,8 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error placing full sell order: {e}")
             return {'success': False, 'error': str(e)}
+
+
 class FastDCABot:
     def __init__(self):
         self.db = Database()
@@ -4122,6 +4141,8 @@ class FastDCABot:
         if text in ["💰 Изменить цену", "📊 Изменить количество", "📅 Изменить дату", "❌ Удалить покупку", "🔙 Назад к списку"]:
             # Возвращаемся к списку покупок, если нажата кнопка "Назад к списку"
             if text == "🔙 Назад к списку":
+                # Очищаем ID редактируемой покупки, чтобы избежать конфликта состояний
+                context.user_data.pop('editing_purchase_id', None)
                 return await self.edit_purchases_list(update, context)
             return EDIT_PURCHASE_SELECT
         try:
@@ -4278,6 +4299,8 @@ class FastDCABot:
             purchase_id = context.user_data.get('editing_purchase_id')
             if purchase_id and self.db.delete_purchase(purchase_id):
                 await update.message.reply_text("✅ Покупка удалена!", reply_markup=self.get_main_keyboard())
+                # Очищаем ID покупки, чтобы избежать конфликтов при последующих операциях
+                context.user_data.pop('editing_purchase_id', None)
                 await self._reset_bot_state(context)
                 return ConversationHandler.END
             else:
