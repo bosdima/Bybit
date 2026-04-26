@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.2.2 (25.04.2026)
-ИСПРАВЛЕНИЯ: 
-- Исправлена ошибка 170130 при market buy (удалён параметр qty, оставлен только quoteOrderQty)
-- Добавлена альтернативная попытка через qty при ошибке 170130
-- Улучшена обработка ошибок и логирование
-- Предотвращено зацикливание кнопок в редактировании покупок
-- Корректный сброс состояний после редактирования
+Версия 5.2.3 (26.04.2026)
+ИСПРАВЛЕНИЯ:
+- Удалён неработающий параметр quoteOrderQty, всегда используется qty
+- Исправлена ошибка минимальной суммы ордера (170140)
+- Улучшена корректировка суммы/количества для маркет-ордеров
+- Добавлено корректное завершение фоновых задач при остановке бота
+- Динамическое обновление интервалов проверки в циклах
 """
 
 import os
@@ -70,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.2.2 (25.04.2026)"
+BOT_VERSION = "5.2.3 (26.04.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
@@ -160,12 +160,6 @@ def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) ->
     return level, ratio
 
 def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
-    """
-    Расчет суммы покупки на основе процента падения (Мартингейл лесенкой)
-    При падении 0% -> base_amount
-    При падении max_depth% -> max_amount
-    Линейная интерполяция между ними
-    """
     if drop_percent <= 0:
         return base_amount
     effective_drop = min(drop_percent, max_depth)
@@ -296,7 +290,6 @@ class Database:
                 )
             ''')
             
-            # Проверяем и добавляем недостающие колонки в ladder_settings
             cursor.execute("PRAGMA table_info(ladder_settings)")
             columns = [col[1] for col in cursor.fetchall()]
             if 'step_percent' not in columns:
@@ -331,7 +324,6 @@ class Database:
                 if 'added_to_stats' not in columns:
                     cursor.execute("ALTER TABLE executed_orders ADD COLUMN added_to_stats BOOLEAN DEFAULT 0")
             
-            # Таблица для хранения ID авторизованного пользователя
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
@@ -870,7 +862,6 @@ class Database:
             self.set_setting('ladder_max_depth', str(settings['max_depth']))
             self.set_setting('ladder_base_amount', str(settings['base_amount']))
             self.set_setting('ladder_max_amount', str(settings['max_amount']))
-            # Синхронизируем invest_amount с base_amount
             self.set_setting('invest_amount', str(settings['base_amount']))
         except Exception as e:
             logger.error(f"Error saving ladder settings: {e}")
@@ -933,19 +924,14 @@ class Database:
         }
     
     def get_recommendation_for_current_drop(self, current_price: float, symbol: str = None, for_manual: bool = False) -> Dict:
-        """
-        for_manual = True -> используется manual_amount как базовая сумма для ручного режима
-        for_manual = False -> используются настройки лестницы (для авто DCA)
-        """
         if symbol is None:
             symbol = self.get_setting('symbol', 'TONUSDT')
         
         stats = self.get_dca_stats(symbol)
         
         if for_manual:
-            # Для ручного режима используем отдельные настройки
             base_amount = self.get_manual_amount()
-            max_amount = base_amount * 3  # максимальная сумма для ручного режима = базовая * 3
+            max_amount = base_amount * 3
             max_depth = float(self.get_setting('ladder_max_depth', '80'))
         else:
             settings = self.get_ladder_settings(symbol)
@@ -1762,8 +1748,8 @@ class BybitClient:
     
     async def place_market_buy(self, symbol: str, amount_usdt: float) -> Dict:
         """
-        Размещение рыночного ордера на покупку с использованием quoteOrderQty.
-        Если ошибка 170130, пробуем запасной вариант через qty.
+        Размещение рыночного ордера на покупку с использованием qty.
+        Автоматически корректирует количество для соблюдения минимальной стоимости.
         """
         try:
             if not self.session:
@@ -1771,73 +1757,77 @@ class BybitClient:
             
             instrument_info = await self.get_instrument_info(symbol)
             min_amt = instrument_info['min_amt']
+            min_qty = instrument_info['min_qty']
+            qty_step = instrument_info['qty_step']
             
-            # Корректируем сумму, если она меньше минимальной
+            # 1. Гарантируем минимальную сумму
             if amount_usdt < min_amt:
                 amount_usdt = min_amt
                 logger.warning(f"Сумма покупки увеличена до минимальной {min_amt} USDT")
             
-            # Округляем сумму до 2 знаков (USDT)
-            quote_order_qty = round(amount_usdt, 2)
-            if quote_order_qty < min_amt:
-                quote_order_qty = min_amt
+            # 2. Получаем актуальную цену
+            price = await self.get_symbol_price(symbol)
+            if not price:
+                return {'success': False, 'error': 'Не удалось получить текущую цену'}
             
-            logger.info(f"Market buy: symbol={symbol}, quoteOrderQty={quote_order_qty} USDT")
+            # 3. Рассчитываем ожидаемое количество
+            raw_qty = amount_usdt / price
+            qty_decimal = Decimal(str(raw_qty))
+            step_decimal = Decimal(str(qty_step))
+            quantity = float((qty_decimal // step_decimal) * step_decimal)
+            if quantity < min_qty:
+                quantity = min_qty
             
-            # Пытаемся отправить ордер только с quoteOrderQty (без qty)
-            try:
-                response = self.session.place_order(
-                    category="spot",
-                    symbol=symbol,
-                    side="Buy",
-                    orderType="Market",
-                    quoteOrderQty=str(quote_order_qty),
-                    timeInForce="GTC"
-                )
-            except Exception as e:
-                logger.error(f"Market buy exception (quoteOrderQty): {e}")
-                # Если ошибка связана с параметром, пробуем через qty
-                if "170130" in str(e) or "parameter" in str(e).lower():
-                    logger.info("Trying fallback: use qty instead of quoteOrderQty")
-                    return await self._place_market_buy_fallback(symbol, amount_usdt, instrument_info)
-                raise
+            # 4. Пересчитываем стоимость и корректируем до min_amt
+            order_value = quantity * price
+            if order_value < min_amt:
+                # Увеличиваем quantity пошагово до достижения min_amt
+                needed_qty = min_amt / price
+                qty_decimal = Decimal(str(needed_qty))
+                quantity = float((qty_decimal // step_decimal) * step_decimal)
+                if quantity < min_qty:
+                    quantity = min_qty
+                # Цикл для гарантии
+                max_iter = 10
+                for _ in range(max_iter):
+                    if quantity * price >= min_amt:
+                        break
+                    quantity += qty_step
+                order_value = quantity * price
+                logger.info(f"Скорректировано количество для соблюдения минимальной суммы: {quantity} {symbol.replace('USDT','')} (~{order_value:.2f} USDT)")
+            
+            # 5. Отправляем ордер с qty
+            logger.info(f"Market buy: symbol={symbol}, qty={quantity} (~{order_value:.2f} USDT)")
+            response = self.session.place_order(
+                category="spot",
+                symbol=symbol,
+                side="Buy",
+                orderType="Market",
+                qty=str(quantity),
+                timeInForce="GTC"
+            )
             
             if response['retCode'] == 0:
                 order_id = response['result']['orderId']
                 # Ждём 1 секунду и получаем детали исполнения
                 await asyncio.sleep(1)
                 order_details = self.session.get_order_history(category="spot", orderId=order_id)
-                avg_price = None
-                executed_qty = None
-                executed_value = None
+                avg_price = price
+                executed_qty = quantity
+                executed_value = quantity * price
                 
                 if order_details['retCode'] == 0 and order_details['result']['list']:
                     ord_info = order_details['result']['list'][0]
-                    avg_price = float(ord_info.get('avgPrice', 0))
-                    executed_qty = float(ord_info.get('cumExecQty', 0))
-                    executed_value = float(ord_info.get('cumExecValue', 0))
-                
-                # Fallback если не получили данные
-                if not avg_price or avg_price == 0:
-                    price = await self.get_symbol_price(symbol)
-                    avg_price = price if price else 0
-                
-                if not executed_qty or executed_qty == 0:
-                    if avg_price > 0:
-                        executed_qty = quote_order_qty / avg_price
-                    else:
-                        executed_qty = quote_order_qty / (await self.get_symbol_price(symbol) or 1)
-                
-                if not executed_value or executed_value == 0:
-                    executed_value = executed_qty * avg_price
+                    avg_price = float(ord_info.get('avgPrice', price))
+                    executed_qty = float(ord_info.get('cumExecQty', quantity))
+                    executed_value = float(ord_info.get('cumExecValue', executed_qty * avg_price))
                 
                 # Округляем количество в соответствии с шагом
-                qty_step = instrument_info['qty_step']
                 qty_decimal = Decimal(str(executed_qty))
                 step_decimal = Decimal(str(qty_step))
                 rounded_qty = float((qty_decimal // step_decimal) * step_decimal)
                 if rounded_qty <= 0:
-                    rounded_qty = instrument_info['min_qty']
+                    rounded_qty = min_qty
                 
                 result = {
                     'success': True,
@@ -1848,10 +1838,6 @@ class BybitClient:
                 }
                 logger.info(f"Market buy executed: {result}")
                 return result
-            elif response['retCode'] == 170130:
-                # Ошибка параметра — пробуем запасной вариант
-                logger.warning("quoteOrderQty not accepted, falling back to qty method")
-                return await self._place_market_buy_fallback(symbol, amount_usdt, instrument_info)
             else:
                 error_msg = response.get('retMsg', 'Unknown error')
                 logger.error(f"Market buy error: {error_msg} (Code: {response.get('retCode')})")
@@ -1859,71 +1845,6 @@ class BybitClient:
         
         except Exception as e:
             logger.error(f"Market buy exception: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    async def _place_market_buy_fallback(self, symbol: str, amount_usdt: float, instrument_info: Dict) -> Dict:
-        """Запасной метод: расчёт qty через цену"""
-        try:
-            price = await self.get_symbol_price(symbol)
-            if not price:
-                return {'success': False, 'error': 'Не удалось получить цену'}
-            
-            min_qty = instrument_info['min_qty']
-            min_amt = instrument_info['min_amt']
-            qty_step = instrument_info['qty_step']
-            
-            # Рассчитываем количество
-            raw_quantity = amount_usdt / price
-            qty_decimal = Decimal(str(raw_quantity))
-            step_decimal = Decimal(str(qty_step))
-            quantity = float((qty_decimal // step_decimal) * step_decimal)
-            
-            if quantity < min_qty:
-                quantity = min_qty
-            
-            order_value = quantity * price
-            if order_value < min_amt:
-                needed_quantity = min_amt / price
-                qty_decimal = Decimal(str(needed_quantity))
-                quantity = float((qty_decimal // step_decimal) * step_decimal)
-                if quantity < min_qty:
-                    quantity = min_qty
-                order_value = quantity * price
-                
-                # Корректировка до минимальной суммы
-                max_iter = 20
-                for _ in range(max_iter):
-                    if order_value >= min_amt:
-                        break
-                    quantity += qty_step
-                    order_value = quantity * price
-            
-            response = self.session.place_order(
-                category="spot",
-                symbol=symbol,
-                side="Buy",
-                orderType="Market",
-                qty=str(quantity),
-                timeInForce="GTC"
-            )
-            if response['retCode'] == 0:
-                order_id = response['result']['orderId']
-                await asyncio.sleep(1)
-                order_details = self.session.get_order_history(category="spot", orderId=order_id)
-                avg_price = price
-                if order_details['retCode'] == 0 and order_details['result']['list']:
-                    avg_price = float(order_details['result']['list'][0].get('avgPrice', price))
-                return {
-                    'success': True,
-                    'order_id': order_id,
-                    'quantity': quantity,
-                    'price': avg_price,
-                    'total_usdt': quantity * avg_price
-                }
-            else:
-                return {'success': False, 'error': response.get('retMsg', 'Unknown error')}
-        except Exception as e:
-            logger.error(f"Fallback market buy error: {e}")
             return {'success': False, 'error': str(e)}
     
     async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float, is_auto: bool = True) -> Dict:
@@ -2677,13 +2598,14 @@ class FastDCABot:
         self.strategy = None
         self.bybit_initialized = False
         self.import_waiting = False
+        self.scheduler_running = False
+        self.background_tasks = []  # для корректного завершения
         
         request_kwargs = {'connect_timeout': 60.0, 'read_timeout': 60.0, 'write_timeout': 60.0, 'pool_timeout': 60.0}
         request = HTTPXRequest(**request_kwargs)
         builder = Application.builder().token(TELEGRAM_TOKEN).request(request)
         self.application = builder.build()
         
-        self.scheduler_running = False
         self.authorized_user_id = self.db.get_authorized_user_id()
         self.pending_executed_order = None
         
@@ -4525,13 +4447,13 @@ class FastDCABot:
                     completed_sells = await self.strategy.check_completed_sells(symbol, self.authorized_user_id, self.application.bot)
                     if completed_sells:
                         logger.info(f"Found {len(completed_sells)} completed sell orders")
+                await asyncio.sleep(3600)  # Проверка раз в час
             except asyncio.CancelledError:
                 logger.info("Sell checker loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Sell checker error: {e}")
                 await asyncio.sleep(60)
-            await asyncio.sleep(3600)
     
     async def pending_sell_checker_loop(self):
         logger.info("Pending sell checker loop started")
@@ -4548,19 +4470,20 @@ class FastDCABot:
                     executed = await self.strategy.check_pending_sell_orders(symbol, self.authorized_user_id, self.application.bot)
                     if executed:
                         logger.info(f"Executed {len(executed)} pending sell orders")
+                await asyncio.sleep(1800)  # 30 минут
             except asyncio.CancelledError:
                 logger.info("Pending sell checker loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Pending sell checker error: {e}")
                 await asyncio.sleep(60)
-            await asyncio.sleep(1800)
     
     async def order_checker_loop(self):
         logger.info("Order checker loop started")
         await asyncio.sleep(30)
         while self.scheduler_running:
             try:
+                # Динамически получаем интервал на каждой итерации
                 interval_minutes = self.db.get_order_check_interval()
                 if not self.db.get_order_execution_notify():
                     await asyncio.sleep(interval_minutes * 60)
@@ -4579,13 +4502,13 @@ class FastDCABot:
                         logger.debug(f"No new orders found ({result['type']})")
                 else:
                     logger.warning("No authorized user ID set, cannot send order notifications")
+                await asyncio.sleep(interval_minutes * 60)
             except asyncio.CancelledError:
                 logger.info("Order checker loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Order checker error: {e}")
                 await asyncio.sleep(60)
-            await asyncio.sleep(interval_minutes * 60)
     
     async def purchase_notify_loop(self):
         logger.info("Purchase notify loop started (Moscow timezone)")
@@ -4668,12 +4591,25 @@ class FastDCABot:
     
     async def post_init(self, application):
         self.scheduler_running = True
-        asyncio.create_task(self.dca_scheduler_loop())
-        asyncio.create_task(self.order_checker_loop())
-        asyncio.create_task(self.sell_checker_loop())
-        asyncio.create_task(self.pending_sell_checker_loop())
-        asyncio.create_task(self.purchase_notify_loop())
+        # Запускаем фоновые задачи и сохраняем их
+        task1 = asyncio.create_task(self.dca_scheduler_loop())
+        task2 = asyncio.create_task(self.order_checker_loop())
+        task3 = asyncio.create_task(self.sell_checker_loop())
+        task4 = asyncio.create_task(self.pending_sell_checker_loop())
+        task5 = asyncio.create_task(self.purchase_notify_loop())
+        self.background_tasks = [task1, task2, task3, task4, task5]
         logger.info("Bot initialized, scheduler loops started")
+    
+    async def shutdown(self, application):
+        logger.info("Shutting down bot...")
+        self.scheduler_running = False
+        # Отменяем все фоновые задачи
+        for task in self.background_tasks:
+            if not task.done():
+                task.cancel()
+        # Ждём их завершения (небольшая задержка)
+        await asyncio.sleep(2)
+        logger.info("Bot shutdown complete")
     
     async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -4977,6 +4913,7 @@ class FastDCABot:
         print(f"{Fore.WHITE}🕐 Московское время: {get_moscow_time().strftime('%H:%M')}")
         print(f"{Fore.CYAN}{'='*60}\n")
         self.application.post_init = self.post_init
+        self.application.shutdown = self.shutdown  # корректное завершение
         try:
             self.application.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0, timeout=60)
         except Exception as e:
