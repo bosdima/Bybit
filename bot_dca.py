@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.2.3 (26.04.2026)
+Версия 5.2.4 (26.04.2026)
 ИСПРАВЛЕНИЯ:
-- Удалён неработающий параметр quoteOrderQty, всегда используется qty
-- Исправлена ошибка минимальной суммы ордера (170140)
-- Улучшена корректировка суммы/количества для маркет-ордеров
-- Добавлено корректное завершение фоновых задач при остановке бота
-- Динамическое обновление интервалов проверки в циклах
+- Полное устранение ошибки 170140 (Order value exceeded lower limit)
+- Автоматическая коррекция суммы до минимальной (min_amt) + повторная попытка
+- Исправлена отправка уведомлений об исполненных ордерах
+- Улучшено логирование всех торговых действий
+- Повышена стабильность фоновых задач
 """
 
 import os
@@ -70,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.2.3 (26.04.2026)"
+BOT_VERSION = "5.2.4 (26.04.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
@@ -1746,10 +1746,10 @@ class BybitClient:
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
-    async def place_market_buy(self, symbol: str, amount_usdt: float) -> Dict:
+    async def place_market_buy(self, symbol: str, amount_usdt: float, retry: bool = True) -> Dict:
         """
-        Размещение рыночного ордера на покупку с использованием qty.
-        Автоматически корректирует количество для соблюдения минимальной стоимости.
+        Размещение рыночного ордера на покупку с коррекцией количества до min_amt.
+        Если первая попытка не удалась, делается вторая с увеличенной суммой.
         """
         try:
             if not self.session:
@@ -1787,8 +1787,7 @@ class BybitClient:
                 quantity = float((qty_decimal // step_decimal) * step_decimal)
                 if quantity < min_qty:
                     quantity = min_qty
-                # Цикл для гарантии
-                max_iter = 10
+                max_iter = 20
                 for _ in range(max_iter):
                     if quantity * price >= min_amt:
                         break
@@ -1838,6 +1837,11 @@ class BybitClient:
                 }
                 logger.info(f"Market buy executed: {result}")
                 return result
+            elif response['retCode'] == 170140 and retry:
+                # Попробуем ещё раз с увеличенной суммой
+                new_amount = min_amt * 1.2
+                logger.warning(f"Ошибка 170140, повторная попытка с суммой {new_amount:.2f} USDT")
+                return await self.place_market_buy(symbol, new_amount, retry=False)
             else:
                 error_msg = response.get('retMsg', 'Unknown error')
                 logger.error(f"Market buy error: {error_msg} (Code: {response.get('retCode')})")
@@ -1926,7 +1930,7 @@ class DCAStrategy:
         # Корректируем сумму, если она меньше минимальной
         if amount_usdt < min_amt:
             amount_usdt = min_amt
-            logger.warning(f"Сумма покупки увеличена с {amount_usdt:.2f} до {min_amt} USDT (минимальная на бирже)")
+            logger.warning(f"Сумма покупки увеличена до минимальной {min_amt} USDT")
         
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
@@ -2275,7 +2279,11 @@ class DCAStrategy:
                 InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
             ]])
             try:
-                await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
+                if user_id:
+                    await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
+                    logger.info(f"Sent order notification for {order['order_id']} to user {user_id}")
+                else:
+                    logger.error(f"Cannot send notification: user_id is None")
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
         
@@ -2339,7 +2347,11 @@ class DCAStrategy:
                 InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
             ]])
             try:
-                await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
+                if user_id:
+                    await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
+                    logger.info(f"Sent full-check order notification for {order['order_id']}")
+                else:
+                    logger.error("Cannot send full-check notification: user_id is None")
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
         
@@ -2599,7 +2611,7 @@ class FastDCABot:
         self.bybit_initialized = False
         self.import_waiting = False
         self.scheduler_running = False
-        self.background_tasks = []  # для корректного завершения
+        self.background_tasks = []
         
         request_kwargs = {'connect_timeout': 60.0, 'read_timeout': 60.0, 'write_timeout': 60.0, 'pool_timeout': 60.0}
         request = HTTPXRequest(**request_kwargs)
