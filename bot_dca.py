@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.2.4 (26.04.2026)
+Версия 5.2.6 (27.04.2026)
 ИСПРАВЛЕНИЯ:
-- Полное устранение ошибки 170140 (Order value exceeded lower limit)
-- Автоматическая коррекция суммы до минимальной (min_amt) + повторная попытка
-- Исправлена отправка уведомлений об исполненных ордерах
-- Улучшено логирование всех торговых действий
-- Повышена стабильность фоновых задач
+- Полное устранение ошибки 170140 с повторной попыткой
+- Улучшено логирование уведомлений об исполненных ордерах
+- Тестовое сообщение при старте бота для проверки связи
+- Интервал проверки ордеров по умолчанию 5 минут
 """
 
 import os
@@ -70,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.2.4 (26.04.2026)"
+BOT_VERSION = "5.2.6 (27.04.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
@@ -349,7 +348,7 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '15.0'),
                 ('order_execution_notify', 'true'),
-                ('order_check_interval_minutes', '15'),
+                ('order_check_interval_minutes', '5'),   # изменено с 15 на 5 минут
                 ('sell_tracking_enabled', 'true'),
                 ('purchase_notify_enabled', 'true'),
                 ('purchase_notify_time', '06:00'),
@@ -1063,6 +1062,7 @@ class Database:
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
+            logger.info(f"Executed order {order_id} added to database")
             return success
         except Exception as e:
             logger.error(f"Error adding executed order: {e}")
@@ -1088,6 +1088,7 @@ class Database:
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
+            logger.info(f"Order {order_id} marked as added to stats")
             return success
         except Exception as e:
             logger.error(f"Error marking order as added: {e}")
@@ -1101,6 +1102,7 @@ class Database:
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
+            logger.info(f"Order {order_id} marked as skipped")
             return success
         except Exception as e:
             logger.error(f"Error marking order as skipped: {e}")
@@ -1113,7 +1115,7 @@ class Database:
         self.set_setting('order_execution_notify', 'true' if enabled else 'false')
     
     def get_order_check_interval(self) -> int:
-        return int(self.get_setting('order_check_interval_minutes', '15'))
+        return int(self.get_setting('order_check_interval_minutes', '5'))
     
     def set_order_check_interval(self, minutes: int):
         self.set_setting('order_check_interval_minutes', str(minutes))
@@ -1748,8 +1750,8 @@ class BybitClient:
     
     async def place_market_buy(self, symbol: str, amount_usdt: float, retry: bool = True) -> Dict:
         """
-        Размещение рыночного ордера на покупку с коррекцией количества до min_amt.
-        Если первая попытка не удалась, делается вторая с увеличенной суммой.
+        Размещение рыночного ордера на покупку с использованием qty.
+        При ошибке 170140 повторяем с увеличенной суммой (min_amt * 1.2).
         """
         try:
             if not self.session:
@@ -1797,14 +1799,23 @@ class BybitClient:
             
             # 5. Отправляем ордер с qty
             logger.info(f"Market buy: symbol={symbol}, qty={quantity} (~{order_value:.2f} USDT)")
-            response = self.session.place_order(
-                category="spot",
-                symbol=symbol,
-                side="Buy",
-                orderType="Market",
-                qty=str(quantity),
-                timeInForce="GTC"
-            )
+            try:
+                response = self.session.place_order(
+                    category="spot",
+                    symbol=symbol,
+                    side="Buy",
+                    orderType="Market",
+                    qty=str(quantity),
+                    timeInForce="GTC"
+                )
+            except Exception as e:
+                logger.error(f"Market buy exception: {e}")
+                # Пробуем повторно с увеличенной суммой
+                if retry and ('170140' in str(e) or 'minimum' in str(e).lower()):
+                    new_amount = min_amt * 1.2
+                    logger.info(f"Retrying with increased amount: {new_amount:.2f} USDT")
+                    return await self.place_market_buy(symbol, new_amount, retry=False)
+                return {'success': False, 'error': str(e)}
             
             if response['retCode'] == 0:
                 order_id = response['result']['orderId']
@@ -1838,7 +1849,6 @@ class BybitClient:
                 logger.info(f"Market buy executed: {result}")
                 return result
             elif response['retCode'] == 170140 and retry:
-                # Попробуем ещё раз с увеличенной суммой
                 new_amount = min_amt * 1.2
                 logger.warning(f"Ошибка 170140, повторная попытка с суммой {new_amount:.2f} USDT")
                 return await self.place_market_buy(symbol, new_amount, retry=False)
@@ -2098,6 +2108,7 @@ class DCAStrategy:
                                f"✅ Ордер успешно выставлен!")
                         try:
                             await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+                            logger.info(f"Sent pending order notification for {symbol} to user {user_id}")
                         except Exception as e:
                             logger.error(f"Error sending pending order notification: {e}")
                     else:
@@ -2182,6 +2193,7 @@ class DCAStrategy:
             ])
             try:
                 await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
+                logger.info(f"Sent completed sell notification for {symbol} to user {user_id}")
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
         return new_completed
@@ -2349,7 +2361,7 @@ class DCAStrategy:
             try:
                 if user_id:
                     await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
-                    logger.info(f"Sent full-check order notification for {order['order_id']}")
+                    logger.info(f"Sent full-check order notification for {order['order_id']} to user {user_id}")
                 else:
                     logger.error("Cannot send full-check notification: user_id is None")
             except Exception as e:
@@ -2815,6 +2827,17 @@ class FastDCABot:
             f"Главное меню:",
             reply_markup=self.get_main_keyboard()
         )
+        # Отправляем тестовое сообщение для проверки связи
+        if self.authorized_user_id:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=self.authorized_user_id,
+                    text="✅ Бот запущен и готов к работе!\nУведомления об исполненных ордерах будут приходить сюда.",
+                    parse_mode='Markdown'
+                )
+                logger.info(f"Test notification sent to user {self.authorized_user_id}")
+            except Exception as e:
+                logger.error(f"Failed to send test notification: {e}")
     
     async def toggle_trading_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3207,7 +3230,7 @@ class FastDCABot:
         await update.message.reply_text(
             f"⏱ Введите интервал проверки в минутах (от 5 до 1440):\n"
             f"*Текущий интервал: {self.db.get_order_check_interval()} минут*\n\n"
-            f"Рекомендуется: 15 минут",
+            f"Рекомендуется: 5 минут",
             reply_markup=self.get_cancel_keyboard(),
             parse_mode='Markdown'
         )
