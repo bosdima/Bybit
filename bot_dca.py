@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.2.6 (27.04.2026)
+Версия 5.3.0 (01.05.2026)
 ИСПРАВЛЕНИЯ:
-- Полное устранение ошибки 170140 с повторной попыткой
-- Улучшено логирование уведомлений об исполненных ордерах
-- Тестовое сообщение при старте бота для проверки связи
-- Интервал проверки ордеров по умолчанию 5 минут
+- Авто DCA теперь использует лимитные ордера для обхода ошибки 170140
+- Добавлена автоматическая корректировка суммы до минимальной
+- Улучшена проверка минимальной суммы перед запуском DCA
+- Исправлена обработка ошибок при создании ордеров
 """
 
 import os
@@ -69,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.2.6 (27.04.2026)"
+BOT_VERSION = "5.3.0 (01.05.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
@@ -348,7 +348,7 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '15.0'),
                 ('order_execution_notify', 'true'),
-                ('order_check_interval_minutes', '5'),   # изменено с 15 на 5 минут
+                ('order_check_interval_minutes', '5'),
                 ('sell_tracking_enabled', 'true'),
                 ('purchase_notify_enabled', 'true'),
                 ('purchase_notify_time', '06:00'),
@@ -1748,44 +1748,37 @@ class BybitClient:
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
-    async def place_market_buy(self, symbol: str, amount_usdt: float, retry: bool = True) -> Dict:
+    async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float, is_auto: bool = True) -> Dict:
         """
-        Размещение рыночного ордера на покупку с использованием qty.
-        При ошибке 170140 повторяем с увеличенной суммой (min_amt * 1.2).
+        Размещение лимитного ордера на покупку.
+        Для авто DCA (is_auto=True) сумма автоматически корректируется до минимальной.
         """
         try:
             if not self.session:
                 self._init_session()
-            
             instrument_info = await self.get_instrument_info(symbol)
-            min_amt = instrument_info['min_amt']
             min_qty = instrument_info['min_qty']
+            min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
             
-            # 1. Гарантируем минимальную сумму
-            if amount_usdt < min_amt:
+            # Для авто DCA проверяем и увеличиваем сумму до минимальной
+            if is_auto and amount_usdt < min_amt:
                 amount_usdt = min_amt
-                logger.warning(f"Сумма покупки увеличена до минимальной {min_amt} USDT")
+                logger.warning(f"Авто DCA: сумма увеличена до минимальной {min_amt} USDT")
             
-            # 2. Получаем актуальную цену
-            price = await self.get_symbol_price(symbol)
-            if not price:
-                return {'success': False, 'error': 'Не удалось получить текущую цену'}
-            
-            # 3. Рассчитываем ожидаемое количество
-            raw_qty = amount_usdt / price
-            qty_decimal = Decimal(str(raw_qty))
+            quantity = amount_usdt / price
+            qty_decimal = Decimal(str(quantity))
             step_decimal = Decimal(str(qty_step))
             quantity = float((qty_decimal // step_decimal) * step_decimal)
+            
             if quantity < min_qty:
                 quantity = min_qty
             
-            # 4. Пересчитываем стоимость и корректируем до min_amt
             order_value = quantity * price
             if order_value < min_amt:
-                # Увеличиваем quantity пошагово до достижения min_amt
-                needed_qty = min_amt / price
-                qty_decimal = Decimal(str(needed_qty))
+                # Корректируем количество вверх, чтобы достичь min_amt
+                needed_quantity = min_amt / price
+                qty_decimal = Decimal(str(needed_quantity))
                 quantity = float((qty_decimal // step_decimal) * step_decimal)
                 if quantity < min_qty:
                     quantity = min_qty
@@ -1797,108 +1790,20 @@ class BybitClient:
                 order_value = quantity * price
                 logger.info(f"Скорректировано количество для соблюдения минимальной суммы: {quantity} {symbol.replace('USDT','')} (~{order_value:.2f} USDT)")
             
-            # 5. Отправляем ордер с qty
-            logger.info(f"Market buy: symbol={symbol}, qty={quantity} (~{order_value:.2f} USDT)")
-            try:
-                response = self.session.place_order(
-                    category="spot",
-                    symbol=symbol,
-                    side="Buy",
-                    orderType="Market",
-                    qty=str(quantity),
-                    timeInForce="GTC"
-                )
-            except Exception as e:
-                logger.error(f"Market buy exception: {e}")
-                # Пробуем повторно с увеличенной суммой
-                if retry and ('170140' in str(e) or 'minimum' in str(e).lower()):
-                    new_amount = min_amt * 1.2
-                    logger.info(f"Retrying with increased amount: {new_amount:.2f} USDT")
-                    return await self.place_market_buy(symbol, new_amount, retry=False)
-                return {'success': False, 'error': str(e)}
-            
-            if response['retCode'] == 0:
-                order_id = response['result']['orderId']
-                # Ждём 1 секунду и получаем детали исполнения
-                await asyncio.sleep(1)
-                order_details = self.session.get_order_history(category="spot", orderId=order_id)
-                avg_price = price
-                executed_qty = quantity
-                executed_value = quantity * price
-                
-                if order_details['retCode'] == 0 and order_details['result']['list']:
-                    ord_info = order_details['result']['list'][0]
-                    avg_price = float(ord_info.get('avgPrice', price))
-                    executed_qty = float(ord_info.get('cumExecQty', quantity))
-                    executed_value = float(ord_info.get('cumExecValue', executed_qty * avg_price))
-                
-                # Округляем количество в соответствии с шагом
-                qty_decimal = Decimal(str(executed_qty))
-                step_decimal = Decimal(str(qty_step))
-                rounded_qty = float((qty_decimal // step_decimal) * step_decimal)
-                if rounded_qty <= 0:
-                    rounded_qty = min_qty
-                
-                result = {
-                    'success': True,
-                    'order_id': order_id,
-                    'quantity': rounded_qty,
-                    'price': avg_price,
-                    'total_usdt': executed_value
-                }
-                logger.info(f"Market buy executed: {result}")
-                return result
-            elif response['retCode'] == 170140 and retry:
-                new_amount = min_amt * 1.2
-                logger.warning(f"Ошибка 170140, повторная попытка с суммой {new_amount:.2f} USDT")
-                return await self.place_market_buy(symbol, new_amount, retry=False)
-            else:
-                error_msg = response.get('retMsg', 'Unknown error')
-                logger.error(f"Market buy error: {error_msg} (Code: {response.get('retCode')})")
-                return {'success': False, 'error': error_msg}
-        
-        except Exception as e:
-            logger.error(f"Market buy exception: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float, is_auto: bool = True) -> Dict:
-        try:
-            if not self.session:
-                self._init_session()
-            instrument_info = await self.get_instrument_info(symbol)
-            min_qty = instrument_info['min_qty']
-            min_amt = instrument_info['min_amt']
-            qty_step = instrument_info['qty_step']
-            
-            if is_auto and amount_usdt < min_amt:
-                return {'success': False, 'error': f'Минимальная сумма для авто DCA: {min_amt} USDT'}
-            
-            quantity = amount_usdt / price
-            qty_decimal = Decimal(str(quantity))
-            step_decimal = Decimal(str(qty_step))
-            quantity = float((qty_decimal // step_decimal) * step_decimal)
-            
-            if quantity < min_qty:
-                quantity = min_qty
-            
-            order_value = quantity * price
-            if is_auto and order_value < min_amt:
-                needed_quantity = min_amt / price
-                qty_decimal = Decimal(str(needed_quantity))
-                quantity = float((qty_decimal // step_decimal) * step_decimal)
-                if quantity < min_qty:
-                    quantity = min_qty
-                order_value = quantity * price
-                if order_value < min_amt:
-                    quantity += qty_step
-                    order_value = quantity * price
-            
             response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Limit", qty=str(quantity), price=str(price), timeInForce="GTC")
             if response['retCode'] == 0:
                 return {'success': True, 'order_id': response['result']['orderId'], 'quantity': float(quantity), 'price': price, 'total_usdt': order_value}
-            return {'success': False, 'error': response['retMsg']}
+            return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+    
+    async def place_market_buy(self, symbol: str, amount_usdt: float, retry: bool = True) -> Dict:
+        """
+        Устаревший метод. Используйте place_limit_buy с ценой чуть выше рынка.
+        Оставлен для совместимости, но не рекомендуется.
+        """
+        logger.warning("place_market_buy устарел. Используйте place_limit_buy с ценой на 0.1% выше рынка.")
+        return await self.place_limit_buy(symbol, await self.get_symbol_price(symbol), amount_usdt, is_auto=True)
 
 
 class DCAStrategy:
@@ -1915,7 +1820,7 @@ class DCAStrategy:
         settings = self.db.get_ladder_settings(symbol)
         base_amount = settings['base_amount']
         
-        # Проверяем минимальную сумму для покупки
+        # Получаем минимальную сумму для токена
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         
@@ -1942,13 +1847,18 @@ class DCAStrategy:
             amount_usdt = min_amt
             logger.warning(f"Сумма покупки увеличена до минимальной {min_amt} USDT")
         
+        # Проверяем баланс USDT
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
         
         if available_usdt < amount_usdt:
             return {'success': False, 'error': f'Недостаточно средств. Нужно {amount_usdt:.2f} USDT, доступно {available_usdt:.2f} USDT'}
         
-        result = await self.bybit.place_market_buy(symbol, amount_usdt)
+        # Используем лимитный ордер по цене на 0.1% выше текущей для гарантии исполнения
+        limit_price = current_price * 1.001  # 0.1% выше
+        limit_price = round(limit_price, 4)  # округляем до tick_size (предполагаем 4 знака)
+        
+        result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
         
         if result['success']:
             current_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
@@ -2012,7 +1922,6 @@ class DCAStrategy:
         drop_percent = ladder_info.get('drop_percent', 0)
         step_level = ladder_info['step_level']
         
-        # Проверяем минимальную сумму
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         if amount_usdt < min_amt:
@@ -2024,7 +1933,11 @@ class DCAStrategy:
         if available_usdt < amount_usdt:
             return {'success': False, 'error': f'Недостаточно средств. Нужно {amount_usdt:.2f} USDT'}
         
-        result = await self.bybit.place_market_buy(symbol, amount_usdt)
+        # Используем лимитный ордер на 0.1% выше рынка
+        limit_price = current_price * 1.001
+        limit_price = round(limit_price, 4)
+        
+        result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
         
         if result['success']:
             current_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
@@ -2827,7 +2740,6 @@ class FastDCABot:
             f"Главное меню:",
             reply_markup=self.get_main_keyboard()
         )
-        # Отправляем тестовое сообщение для проверки связи
         if self.authorized_user_id:
             try:
                 await self.application.bot.send_message(
@@ -3930,7 +3842,6 @@ class FastDCABot:
         context.user_data['manual_buy_recommendation'] = recommendation
         msg = f"💰 Текущая цена {symbol}: `{format_price(current_price, 4)}` USDT\n\n"
         
-        # Показываем рекомендованную сумму с учетом коэффициента Мартингейла для ручного режима
         rec_manual = self.db.get_recommendation_for_current_drop(current_price, symbol, for_manual=True)
         if rec_manual['success']:
             if rec_manual['is_first']:
@@ -4035,7 +3946,6 @@ class FastDCABot:
         current_price = await self.bybit.get_symbol_price(symbol)
         stats = self.db.get_dca_stats(symbol)
         
-        # Используем for_manual=True для ручного режима
         recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol, for_manual=True)
         
         manual_amount = self.db.get_manual_amount()
@@ -4078,7 +3988,6 @@ class FastDCABot:
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             stats = self.db.get_dca_stats(symbol)
             
-            # Рекомендация для указанной цены (ручной режим)
             recommendation = self.db.get_recommendation_for_current_drop(price, symbol, for_manual=True)
             
             if stats and stats['avg_price'] > 0:
@@ -4221,7 +4130,6 @@ class FastDCABot:
             else:
                 await update.message.reply_text("❌ Ошибка при обновлении")
             await self.show_purchase_after_edit(update, context, purchase_id)
-            # Не выходим из состояния, остаёмся в EDIT_PURCHASE_SELECT
             return EDIT_PURCHASE_SELECT
         except ValueError:
             await update.message.reply_text("❌ Ошибка! Введите число.", reply_markup=self.get_cancel_keyboard())
@@ -4326,7 +4234,6 @@ class FastDCABot:
             purchase_id = context.user_data.get('editing_purchase_id')
             if purchase_id and self.db.delete_purchase(purchase_id):
                 await update.message.reply_text("✅ Покупка удалена!", reply_markup=self.get_main_keyboard())
-                # Очищаем ID покупки
                 context.user_data.pop('editing_purchase_id', None)
                 await self._reset_bot_state(context)
                 return ConversationHandler.END
@@ -4518,7 +4425,6 @@ class FastDCABot:
         await asyncio.sleep(30)
         while self.scheduler_running:
             try:
-                # Динамически получаем интервал на каждой итерации
                 interval_minutes = self.db.get_order_check_interval()
                 if not self.db.get_order_execution_notify():
                     await asyncio.sleep(interval_minutes * 60)
@@ -4578,7 +4484,6 @@ class FastDCABot:
                         stats = self.db.get_dca_stats(symbol)
                         manual_amount = self.db.get_manual_amount()
                         
-                        # Используем for_manual=True для ручного режима
                         recommendation = self.db.get_recommendation_for_current_drop(current_price, symbol, for_manual=True)
                         
                         msg = f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ О ПОКУПКЕ*\n\n"
@@ -4626,7 +4531,6 @@ class FastDCABot:
     
     async def post_init(self, application):
         self.scheduler_running = True
-        # Запускаем фоновые задачи и сохраняем их
         task1 = asyncio.create_task(self.dca_scheduler_loop())
         task2 = asyncio.create_task(self.order_checker_loop())
         task3 = asyncio.create_task(self.sell_checker_loop())
@@ -4638,11 +4542,9 @@ class FastDCABot:
     async def shutdown(self, application):
         logger.info("Shutting down bot...")
         self.scheduler_running = False
-        # Отменяем все фоновые задачи
         for task in self.background_tasks:
             if not task.done():
                 task.cancel()
-        # Ждём их завершения (небольшая задержка)
         await asyncio.sleep(2)
         logger.info("Bot shutdown complete")
     
@@ -4839,7 +4741,6 @@ class FastDCABot:
         )
         self.application.add_handler(edit_purchases_conv)
         
-        # ОСНОВНОЙ КОНВЕРСЕЙШН ДЛЯ НАСТРОЕК
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
@@ -4866,7 +4767,6 @@ class FastDCABot:
         )
         self.application.add_handler(main_conv)
         
-        # Конверсейшн для настроек Авто DCA
         auto_dca_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu)],
             states={
@@ -4917,7 +4817,6 @@ class FastDCABot:
         )
         self.application.add_handler(cancel_order_conv)
         
-        # Обработчики для кнопок главного меню
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
@@ -4948,7 +4847,7 @@ class FastDCABot:
         print(f"{Fore.WHITE}🕐 Московское время: {get_moscow_time().strftime('%H:%M')}")
         print(f"{Fore.CYAN}{'='*60}\n")
         self.application.post_init = self.post_init
-        self.application.shutdown = self.shutdown  # корректное завершение
+        self.application.shutdown = self.shutdown
         try:
             self.application.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0, timeout=60)
         except Exception as e:
