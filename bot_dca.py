@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.3.1 (01.05.2026)
-ИСПРАВЛЕНИЯ:
-- Устранена ошибка 170134 (слишком много знаков у цены) – корректное округление до tick_size
-- Исправлено зацикливание кнопок ввода информации
-- Улучшена обработка ручного ввода (цена, сумма, количество)
-- Добавлена принудительная проверка минимальной суммы перед любой покупкой
-- Исправлено округление цены в лимитных ордерах (и покупка, и продажа)
-- Добавлена синхронизация next_purchase_time при старте бота
-- Улучшены сообщения об ошибках для пользователя
+Версия 5.3.2 (01.05.2026)
+ИСПРАВЛЕНИЯ ВЕРСИИ 5.3.2:
+- Исправлены регулярные выражения для кнопок (время, интервал, настройки)
+- Убрана принудительная корректировка суммы при ручной покупке (ошибка 170140)
+- Добавлена проверка перед созданием ордера на продажу
+- Улучшена обработка кнопок "Назад" и "Отмена"
+- Исправлено зацикливание в диалогах ввода
 """
 
 import os
@@ -72,9 +70,9 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.3.1 (01.05.2026)"
+BOT_VERSION = "5.3.2 (01.05.2026)"
 CONVERSATION_TIMEOUT = 180
-MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
+MIN_ORDER_AMOUNT = 5.0
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
@@ -1600,7 +1598,6 @@ class BybitClient:
                 except (ValueError, TypeError):
                     base_precision = 2
                 
-                # Получаем tick_size как float
                 tick_size_str = price_filter.get('tickSize', '0.0001')
                 tick_size = float(tick_size_str)
                 
@@ -1617,12 +1614,12 @@ class BybitClient:
             return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
     
     def _round_price_by_tick(self, price: float, tick_size: float) -> float:
-        """Округляет цену до шага цены tick_size."""
+        """Округляет цену до шага цены tick_size (вниз, по правилам Bybit)."""
         if tick_size <= 0:
             return round(price, 4)
-        # округление вниз до ближайшего кратного tick_size
+        # Bybit принимает цену, округлённую до tick_size (обычно вниз)
+        # Используем floor для соблюдения лимитной цены (не выше рынка)
         rounded = math.floor(price / tick_size) * tick_size
-        # если округление дало 0, то берём tick_size
         if rounded <= 0:
             rounded = tick_size
         return rounded
@@ -1742,7 +1739,6 @@ class BybitClient:
             qty_step = instrument_info['qty_step']
             tick_size = instrument_info['tick_size']
             
-            # Округляем цену до tick_size
             rounded_price = self._round_price_by_tick(price, tick_size)
             
             qty_decimal = Decimal(str(quantity))
@@ -1774,7 +1770,8 @@ class BybitClient:
         """
         Размещение лимитного ордера на покупку.
         Цена округляется до tick_size.
-        Для авто DCA (is_auto=True) сумма автоматически корректируется до минимальной.
+        Для Авто DCA (is_auto=True) сумма автоматически корректируется до минимальной.
+        Для ручной покупки (is_auto=False) сумма не корректируется (только предупреждение).
         """
         try:
             if not self.session:
@@ -1785,10 +1782,13 @@ class BybitClient:
             qty_step = instrument_info['qty_step']
             tick_size = instrument_info['tick_size']
             
-            # Округляем цену до tick_size
             rounded_price = self._round_price_by_tick(price, tick_size)
             
-            # Для авто DCA проверяем и увеличиваем сумму до минимальной
+            # Для ручной покупки не корректируем сумму, только проверяем
+            if not is_auto and amount_usdt < min_amt:
+                return {'success': False, 'error': f'Сумма {amount_usdt:.2f} USDT меньше минимальной {min_amt} USDT. Пожалуйста, увеличьте сумму.'}
+            
+            # Для Авто DCA корректируем сумму
             if is_auto and amount_usdt < min_amt:
                 amount_usdt = min_amt
                 logger.warning(f"Авто DCA: сумма увеличена до минимальной {min_amt} USDT")
@@ -1803,7 +1803,6 @@ class BybitClient:
             
             order_value = quantity * rounded_price
             if order_value < min_amt:
-                # Корректируем количество вверх, чтобы достичь min_amt
                 needed_quantity = min_amt / rounded_price
                 qty_decimal = Decimal(str(needed_quantity))
                 quantity = float((qty_decimal // step_decimal) * step_decimal)
@@ -1823,16 +1822,6 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-    
-    async def place_market_buy(self, symbol: str, amount_usdt: float, retry: bool = True) -> Dict:
-        """
-        Устаревший метод. Используйте place_limit_buy с ценой чуть выше рынка.
-        Оставлен для совместимости, но не рекомендуется.
-        """
-        logger.warning("place_market_buy устарел. Используйте place_limit_buy с ценой на 0.1% выше рынка.")
-        return await self.place_limit_buy(symbol, await self.get_symbol_price(symbol), amount_usdt, is_auto=True)
-
-
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
@@ -1847,12 +1836,10 @@ class DCAStrategy:
         settings = self.db.get_ladder_settings(symbol)
         base_amount = settings['base_amount']
         
-        # Получаем информацию об инструменте для округления цены
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         tick_size = instrument_info['tick_size']
         
-        # Рассчитываем сумму с учетом коэффициента Мартингейла
         if not stats or stats['total_quantity'] <= 0:
             amount_usdt = base_amount
             drop_percent = 0
@@ -1870,21 +1857,17 @@ class DCAStrategy:
                 drop_percent = 0
                 step_level = 0
         
-        # Корректируем сумму, если она меньше минимальной
         if amount_usdt < min_amt:
             amount_usdt = min_amt
             logger.warning(f"Сумма покупки увеличена до минимальной {min_amt} USDT")
         
-        # Проверяем баланс USDT
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
         
         if available_usdt < amount_usdt:
             return {'success': False, 'error': f'Недостаточно средств. Нужно {amount_usdt:.2f} USDT, доступно {available_usdt:.2f} USDT'}
         
-        # Используем лимитный ордер по цене на 0.1% выше текущей для гарантии исполнения
-        limit_price = current_price * 1.001  # 0.1% выше
-        # Округляем цену до tick_size
+        limit_price = current_price * 1.001
         limit_price = (math.floor(limit_price / tick_size) * tick_size) if tick_size > 0 else round(limit_price, 4)
         if limit_price <= 0:
             limit_price = tick_size
@@ -1966,7 +1949,6 @@ class DCAStrategy:
         if available_usdt < amount_usdt:
             return {'success': False, 'error': f'Недостаточно средств. Нужно {amount_usdt:.2f} USDT'}
         
-        # Используем лимитный ордер на 0.1% выше рынка
         limit_price = current_price * 1.001
         limit_price = (math.floor(limit_price / tick_size) * tick_size) if tick_size > 0 else round(limit_price, 4)
         if limit_price <= 0:
@@ -2028,7 +2010,6 @@ class DCAStrategy:
         for order in pending_orders:
             if current_price >= order['target_price']:
                 new_target_price = current_price * (1 + order['profit_percent'] / 100)
-                # Округляем цену до tick_size
                 rounded_price = (math.floor(new_target_price / tick_size) * tick_size) if tick_size > 0 else round_price_up(new_target_price)
                 if rounded_price <= 0:
                     rounded_price = tick_size
@@ -2769,7 +2750,6 @@ class FastDCABot:
     async def cmd_start_fast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
-        # При старте сбрасываем next_dca_purchase_time, если оно в прошлом (чтобы избежать мгновенного срабатывания)
         next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
         if next_purchase_str:
             try:
@@ -2836,7 +2816,7 @@ class FastDCABot:
             f"🔔 *Уведомления о покупке*\n\n"
             f"📋 Статус: {status_text}\n"
             f"⏰ Время уведомления: `{notify_time}` (МСК)\n"
-            f"🕐 Текущее московское время: `{current_time.strftime('%H:%М')}`\n\n"
+            f"🕐 Текущее московское время: `{current_time.strftime('%H:%M')}`\n\n"
             f"В указанное время бот будет присылать рекомендацию\n"
             f"о покупке по текущей цене.\n\n"
             f"Выберите действие:",
@@ -3651,7 +3631,6 @@ class FastDCABot:
                 await update.message.reply_text("❌ Не удалось получить цену")
                 return
             
-            # Проверяем минимальную сумму
             instrument_info = await self.bybit.get_instrument_info(symbol)
             min_amt = instrument_info['min_amt']
             invest_amount = float(self.db.get_setting('invest_amount', '5.0'))
@@ -3760,7 +3739,6 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Символ {symbol} не найден.", reply_markup=self.get_symbol_selection_keyboard())
             return SELECTING_SYMBOL
         
-        # Проверяем минимальную сумму для нового токена
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         
@@ -3960,7 +3938,6 @@ class FastDCABot:
                 await update.message.reply_text("❌ Ошибка", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
             await update.message.reply_text("⏳ Создаю лимитный ордер...")
-            # Для ручного ввода is_auto=False - не проверяем минимальную сумму биржи
             result = await self.bybit.place_limit_buy(symbol, price, amount, is_auto=False)
             if result['success']:
                 profit_percent = float(self.db.get_setting('profit_percent', '5'))
@@ -4115,7 +4092,6 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         await self._reset_bot_state(context)
-        # Очищаем ID покупки перед показом списка
         context.user_data.pop('editing_purchase_id', None)
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         purchases = self.db.get_purchases(symbol)
@@ -4444,7 +4420,7 @@ class FastDCABot:
                     completed_sells = await self.strategy.check_completed_sells(symbol, self.authorized_user_id, self.application.bot)
                     if completed_sells:
                         logger.info(f"Found {len(completed_sells)} completed sell orders")
-                await asyncio.sleep(3600)  # Проверка раз в час
+                await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 logger.info("Sell checker loop cancelled")
                 break
@@ -4467,7 +4443,7 @@ class FastDCABot:
                     executed = await self.strategy.check_pending_sell_orders(symbol, self.authorized_user_id, self.application.bot)
                     if executed:
                         logger.info(f"Executed {len(executed)} pending sell orders")
-                await asyncio.sleep(1800)  # 30 минут
+                await asyncio.sleep(1800)
             except asyncio.CancelledError:
                 logger.info("Pending sell checker loop cancelled")
                 break
@@ -4778,7 +4754,12 @@ class FastDCABot:
         
         purchase_notify_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings)],
-            states={WAITING_PURCHASE_NOTIFY_TIME: [MessageHandler(filters.Regex('^(🔔 Уведомления Вкл|🔕 Уведомления Выкл)$'), self.toggle_purchase_notify), MessageHandler(filters.Regex('^(⏰ Время уведомления \(\d{2}:\d{2}\)|⏰ Время уведомления)$'), self.set_purchase_notify_time_start), MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings_from_purchase), MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_purchase_notify_time_done)]},
+            states={WAITING_PURCHASE_NOTIFY_TIME: [
+                MessageHandler(filters.Regex('^(🔔 Уведомления Вкл|🔕 Уведомления Выкл)$'), self.toggle_purchase_notify),
+                MessageHandler(filters.Regex('^(⏰ Время уведомления)'), self.set_purchase_notify_time_start),
+                MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings_from_purchase),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_purchase_notify_time_done)
+            ]},
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="purchase_notify_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
@@ -4786,7 +4767,13 @@ class FastDCABot:
         
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
-            states={NOTIFICATION_SETTINGS_MENU: [MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|❌ Отслеживание ордеров Выкл)$'), self.toggle_tracking), MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking_in_settings), MessageHandler(filters.Regex('^(⏱ Интервал проверки Ордеров \d+ мин)$'), self.set_tracking_interval_start), MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking), MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)], WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_tracking_interval_done)]},
+            states={NOTIFICATION_SETTINGS_MENU: [
+                MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|❌ Отслеживание ордеров Выкл)$'), self.toggle_tracking),
+                MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking_in_settings),
+                MessageHandler(filters.Regex('^(⏱ Интервал проверки Ордеров)'), self.set_tracking_interval_start),
+                MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
+                MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)
+            ], WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_tracking_interval_done)]},
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="tracking_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
@@ -4794,7 +4781,15 @@ class FastDCABot:
         
         edit_purchases_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
-            states={EDIT_PURCHASE_SELECT: [MessageHandler(filters.Regex('^(💰 Изменить цену)$'), self.edit_price_start), MessageHandler(filters.Regex('^(📊 Изменить количество)$'), self.edit_amount_start), MessageHandler(filters.Regex('^(📅 Изменить дату)$'), self.edit_date_start), MessageHandler(filters.Regex('^(❌ Удалить покупку)$'), self.delete_purchase_confirm), MessageHandler(filters.Regex('^(🔙 Назад к списку)$'), self.edit_purchases_list), MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main), MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_purchase_selected)], EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_price_save)], EDIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_amount_save)], EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_date_save)], DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.delete_purchase_execute)]},
+            states={EDIT_PURCHASE_SELECT: [
+                MessageHandler(filters.Regex('^(💰 Изменить цену)$'), self.edit_price_start),
+                MessageHandler(filters.Regex('^(📊 Изменить количество)$'), self.edit_amount_start),
+                MessageHandler(filters.Regex('^(📅 Изменить дату)$'), self.edit_date_start),
+                MessageHandler(filters.Regex('^(❌ Удалить покупку)$'), self.delete_purchase_confirm),
+                MessageHandler(filters.Regex('^(🔙 Назад к списку)$'), self.edit_purchases_list),
+                MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_purchase_selected)
+            ], EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_price_save)], EDIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_amount_save)], EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_date_save)], DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.delete_purchase_execute)]},
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="edit_purchases_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
@@ -4830,9 +4825,9 @@ class FastDCABot:
             entry_points=[MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu)],
             states={
                 AUTO_DCA_SETTINGS: [
-                    MessageHandler(filters.Regex(r'^💵 Сумма покупки авто \(\d+\.?\d* USDT\)$'), self.set_amount_start_auto),
-                    MessageHandler(filters.Regex(r'^⏰ Время покупки \(\d{2}:\d{2}\)$'), self.set_time_start_auto),
-                    MessageHandler(filters.Regex(r'^🔄 Частота покупки \(\d+ ч\)$'), self.set_frequency_start_auto),
+                    MessageHandler(filters.Regex('^💵 Сумма покупки авто'), self.set_amount_start_auto),
+                    MessageHandler(filters.Regex('^⏰ Время покупки'), self.set_time_start_auto),
+                    MessageHandler(filters.Regex('^🔄 Частота покупки'), self.set_frequency_start_auto),
                     MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
                 ],
                 SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done_auto)],
@@ -4846,7 +4841,13 @@ class FastDCABot:
         
         ladder_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu)],
-            states={LADDER_MENU: [MessageHandler(filters.Regex('^(📉 Глубина просадки \(%\))$'), self.set_ladder_max_depth_start), MessageHandler(filters.Regex('^(💵 Базовая сумма)$'), self.set_ladder_base_amount_start), MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_ladder_settings), MessageHandler(filters.Regex('^(🔄 Сбросить лестницу)$'), self.reset_ladder), MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)], SET_LADDER_DEPTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_max_depth_save)], SET_LADDER_BASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save)]},
+            states={LADDER_MENU: [
+                MessageHandler(filters.Regex('^(📉 Глубина просадки \(%\))$'), self.set_ladder_max_depth_start),
+                MessageHandler(filters.Regex('^(💵 Базовая сумма)$'), self.set_ladder_base_amount_start),
+                MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_ladder_settings),
+                MessageHandler(filters.Regex('^(🔄 Сбросить лестницу)$'), self.reset_ladder),
+                MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)
+            ], SET_LADDER_DEPTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_max_depth_save)], SET_LADDER_BASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save)]},
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
             name="ladder_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
         )
