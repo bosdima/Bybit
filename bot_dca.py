@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.3.0 (01.05.2026)
+Версия 5.3.1 (01.05.2026)
 ИСПРАВЛЕНИЯ:
-- Авто DCA теперь использует лимитные ордера для обхода ошибки 170140
-- Добавлена автоматическая корректировка суммы до минимальной
-- Улучшена проверка минимальной суммы перед запуском DCA
-- Исправлена обработка ошибок при создании ордеров
+- Устранена ошибка 170134 (слишком много знаков у цены) – корректное округление до tick_size
+- Исправлено зацикливание кнопок ввода информации
+- Улучшена обработка ручного ввода (цена, сумма, количество)
+- Добавлена принудительная проверка минимальной суммы перед любой покупкой
+- Исправлено округление цены в лимитных ордерах (и покупка, и продажа)
+- Добавлена синхронизация next_purchase_time при старте бота
+- Улучшены сообщения об ошибках для пользователя
 """
 
 import os
@@ -69,7 +72,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.3.0 (01.05.2026)"
+BOT_VERSION = "5.3.1 (01.05.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0  # Минимальная сумма для Авто DCA
 
@@ -1597,17 +1600,32 @@ class BybitClient:
                 except (ValueError, TypeError):
                     base_precision = 2
                 
+                # Получаем tick_size как float
+                tick_size_str = price_filter.get('tickSize', '0.0001')
+                tick_size = float(tick_size_str)
+                
                 return {
                     'min_qty': float(lot_size_filter.get('minOrderQty', 0.01)),
                     'min_amt': float(lot_size_filter.get('minOrderAmt', 5)),
                     'qty_step': float(lot_size_filter.get('qtyStep', 0.01)),
-                    'tick_size': float(price_filter.get('tickSize', 0.0001)),
+                    'tick_size': tick_size,
                     'base_precision': base_precision,
                 }
             return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
         except Exception as e:
             logger.error(f"Error getting instrument info: {e}")
             return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+    
+    def _round_price_by_tick(self, price: float, tick_size: float) -> float:
+        """Округляет цену до шага цены tick_size."""
+        if tick_size <= 0:
+            return round(price, 4)
+        # округление вниз до ближайшего кратного tick_size
+        rounded = math.floor(price / tick_size) * tick_size
+        # если округление дало 0, то берём tick_size
+        if rounded <= 0:
+            rounded = tick_size
+        return rounded
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
@@ -1722,6 +1740,10 @@ class BybitClient:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
+            tick_size = instrument_info['tick_size']
+            
+            # Округляем цену до tick_size
+            rounded_price = self._round_price_by_tick(price, tick_size)
             
             qty_decimal = Decimal(str(quantity))
             step_decimal = Decimal(str(qty_step))
@@ -1733,17 +1755,17 @@ class BybitClient:
             if rounded_quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'}
             
-            order_value = rounded_quantity * price
+            order_value = rounded_quantity * rounded_price
             if order_value < min_amt:
-                return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt, 'order_value': order_value, 'quantity': rounded_quantity, 'price': price}
+                return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt, 'order_value': order_value, 'quantity': rounded_quantity, 'price': rounded_price}
             
             response = self.session.place_order(
-                category="spot", symbol=symbol, side="Sell", orderType="Limit", qty=str(rounded_quantity), price=str(price), timeInForce="GTC"
+                category="spot", symbol=symbol, side="Sell", orderType="Limit", qty=str(rounded_quantity), price=str(rounded_price), timeInForce="GTC"
             )
             if response['retCode'] == 0:
-                return {'success': True, 'order_id': response['result']['orderId'], 'quantity': rounded_quantity, 'price': price}
+                return {'success': True, 'order_id': response['result']['orderId'], 'quantity': rounded_quantity, 'price': rounded_price}
             if response['retCode'] == 170140:
-                return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt, 'order_value': order_value, 'quantity': rounded_quantity, 'price': price}
+                return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt, 'order_value': order_value, 'quantity': rounded_quantity, 'price': rounded_price}
             return {'success': False, 'error': f"{response['retMsg']} (Код: {response['retCode']})"}
         except Exception as e:
             return {'success': False, 'error': str(e)}
@@ -1751,6 +1773,7 @@ class BybitClient:
     async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float, is_auto: bool = True) -> Dict:
         """
         Размещение лимитного ордера на покупку.
+        Цена округляется до tick_size.
         Для авто DCA (is_auto=True) сумма автоматически корректируется до минимальной.
         """
         try:
@@ -1760,13 +1783,17 @@ class BybitClient:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
+            tick_size = instrument_info['tick_size']
+            
+            # Округляем цену до tick_size
+            rounded_price = self._round_price_by_tick(price, tick_size)
             
             # Для авто DCA проверяем и увеличиваем сумму до минимальной
             if is_auto and amount_usdt < min_amt:
                 amount_usdt = min_amt
                 logger.warning(f"Авто DCA: сумма увеличена до минимальной {min_amt} USDT")
             
-            quantity = amount_usdt / price
+            quantity = amount_usdt / rounded_price
             qty_decimal = Decimal(str(quantity))
             step_decimal = Decimal(str(qty_step))
             quantity = float((qty_decimal // step_decimal) * step_decimal)
@@ -1774,25 +1801,25 @@ class BybitClient:
             if quantity < min_qty:
                 quantity = min_qty
             
-            order_value = quantity * price
+            order_value = quantity * rounded_price
             if order_value < min_amt:
                 # Корректируем количество вверх, чтобы достичь min_amt
-                needed_quantity = min_amt / price
+                needed_quantity = min_amt / rounded_price
                 qty_decimal = Decimal(str(needed_quantity))
                 quantity = float((qty_decimal // step_decimal) * step_decimal)
                 if quantity < min_qty:
                     quantity = min_qty
                 max_iter = 20
                 for _ in range(max_iter):
-                    if quantity * price >= min_amt:
+                    if quantity * rounded_price >= min_amt:
                         break
                     quantity += qty_step
-                order_value = quantity * price
+                order_value = quantity * rounded_price
                 logger.info(f"Скорректировано количество для соблюдения минимальной суммы: {quantity} {symbol.replace('USDT','')} (~{order_value:.2f} USDT)")
             
-            response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Limit", qty=str(quantity), price=str(price), timeInForce="GTC")
+            response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Limit", qty=str(quantity), price=str(rounded_price), timeInForce="GTC")
             if response['retCode'] == 0:
-                return {'success': True, 'order_id': response['result']['orderId'], 'quantity': float(quantity), 'price': price, 'total_usdt': order_value}
+                return {'success': True, 'order_id': response['result']['orderId'], 'quantity': float(quantity), 'price': rounded_price, 'total_usdt': order_value}
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
@@ -1820,9 +1847,10 @@ class DCAStrategy:
         settings = self.db.get_ladder_settings(symbol)
         base_amount = settings['base_amount']
         
-        # Получаем минимальную сумму для токена
+        # Получаем информацию об инструменте для округления цены
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
+        tick_size = instrument_info['tick_size']
         
         # Рассчитываем сумму с учетом коэффициента Мартингейла
         if not stats or stats['total_quantity'] <= 0:
@@ -1856,7 +1884,10 @@ class DCAStrategy:
         
         # Используем лимитный ордер по цене на 0.1% выше текущей для гарантии исполнения
         limit_price = current_price * 1.001  # 0.1% выше
-        limit_price = round(limit_price, 4)  # округляем до tick_size (предполагаем 4 знака)
+        # Округляем цену до tick_size
+        limit_price = (math.floor(limit_price / tick_size) * tick_size) if tick_size > 0 else round(limit_price, 4)
+        if limit_price <= 0:
+            limit_price = tick_size
         
         result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
         
@@ -1924,6 +1955,8 @@ class DCAStrategy:
         
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
+        tick_size = instrument_info['tick_size']
+        
         if amount_usdt < min_amt:
             amount_usdt = min_amt
         
@@ -1935,7 +1968,9 @@ class DCAStrategy:
         
         # Используем лимитный ордер на 0.1% выше рынка
         limit_price = current_price * 1.001
-        limit_price = round(limit_price, 4)
+        limit_price = (math.floor(limit_price / tick_size) * tick_size) if tick_size > 0 else round(limit_price, 4)
+        if limit_price <= 0:
+            limit_price = tick_size
         
         result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
         
@@ -1988,11 +2023,15 @@ class DCAStrategy:
         
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
+        tick_size = instrument_info['tick_size']
         
         for order in pending_orders:
             if current_price >= order['target_price']:
                 new_target_price = current_price * (1 + order['profit_percent'] / 100)
-                rounded_price = round_price_up(new_target_price)
+                # Округляем цену до tick_size
+                rounded_price = (math.floor(new_target_price / tick_size) * tick_size) if tick_size > 0 else round_price_up(new_target_price)
+                if rounded_price <= 0:
+                    rounded_price = tick_size
                 order_value = order['quantity'] * rounded_price
                 
                 if order_value >= min_amt:
@@ -2433,9 +2472,12 @@ class DCAStrategy:
             
             avg_price = stats['avg_price']
             raw_target_price = avg_price * (1 + profit_percent / 100)
-            rounded_price = round_price_up(raw_target_price)
-            
             instrument_info = await self.bybit.get_instrument_info(symbol)
+            tick_size = instrument_info['tick_size']
+            rounded_price = (math.floor(raw_target_price / tick_size) * tick_size) if tick_size > 0 else round_price_up(raw_target_price)
+            if rounded_price <= 0:
+                rounded_price = tick_size
+            
             qty_step = instrument_info['qty_step']
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
@@ -2727,6 +2769,17 @@ class FastDCABot:
     async def cmd_start_fast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
+        # При старте сбрасываем next_dca_purchase_time, если оно в прошлом (чтобы избежать мгновенного срабатывания)
+        next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
+        if next_purchase_str:
+            try:
+                next_time = datetime.fromisoformat(next_purchase_str)
+                if get_moscow_time() >= next_time:
+                    self.db.set_setting('next_dca_purchase_time', '')
+                    logger.info("Reset next_dca_purchase_time because it was in the past")
+            except:
+                pass
+        
         await self._reset_bot_state(context)
         current_time = get_moscow_time()
         mode = self.db.get_trading_mode()
@@ -2783,7 +2836,7 @@ class FastDCABot:
             f"🔔 *Уведомления о покупке*\n\n"
             f"📋 Статус: {status_text}\n"
             f"⏰ Время уведомления: `{notify_time}` (МСК)\n"
-            f"🕐 Текущее московское время: `{current_time.strftime('%H:%M')}`\n\n"
+            f"🕐 Текущее московское время: `{current_time.strftime('%H:%М')}`\n\n"
             f"В указанное время бот будет присылать рекомендацию\n"
             f"о покупке по текущей цене.\n\n"
             f"Выберите действие:",
@@ -3503,11 +3556,13 @@ class FastDCABot:
                 emoji = "📈" if pnl >= 0 else "📉"
                 text += f"{emoji} Текущий PnL: `{pnl:.2f}` USDT ({pnl_percent:+.2f}%)\n"
             if target_info:
-                rounded_target = round_price_up(target_info['target_price'])
+                instrument_info = await self.bybit.get_instrument_info(symbol)
+                tick_size = instrument_info['tick_size']
+                rounded_target = (math.floor(target_info['target_price'] / tick_size) * tick_size) if tick_size > 0 else round_price_up(target_info['target_price'])
                 text += f"\n🎯 *ЦЕЛЕВАЯ ПРИБЫЛЬ {profit_percent}%:*\n"
                 text += f"Нужно продать: `{format_quantity(target_info['total_qty'], 2)}` {coin}\n"
                 text += f"Цена продажи (расчетная): `{format_price(target_info['target_price'], 4)}` USDT\n"
-                text += f"Цена продажи (с округлением вверх): `{format_price(rounded_target, 4)}` USDT\n"
+                text += f"Цена продажи (округленная): `{format_price(rounded_target, 4)}` USDT\n"
                 text += f"Получите: `{target_info['target_value']:.2f}` USDT\n"
                 text += f"Прибыль: `{target_info['target_profit']:.2f}` USDT\n"
                 if current_price:
@@ -4687,7 +4742,11 @@ class FastDCABot:
             await update.callback_query.message.reply_text("❌ Не удалось рассчитать целевую цену.")
             return
         raw_price = target_info['target_price']
-        rounded_price = round_price_up(raw_price)
+        instrument_info = await self.bybit.get_instrument_info(symbol)
+        tick_size = instrument_info['tick_size']
+        rounded_price = (math.floor(raw_price / tick_size) * tick_size) if tick_size > 0 else round_price_up(raw_price)
+        if rounded_price <= 0:
+            rounded_price = tick_size
         coin = symbol.replace('USDT', '')
         total_quantity = stats['total_quantity']
         display_quantity = total_quantity
