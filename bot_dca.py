@@ -1621,7 +1621,6 @@ class BybitClient:
         if rounded <= 0:
             rounded = tick_size
         return rounded
-    
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
             check_date = from_date if from_date else get_moscow_time_naive() - timedelta(days=90)
@@ -1846,7 +1845,6 @@ class DCAStrategy:
         
         # Проверяем: покупаем только если текущая цена НИЖЕ или РАВНА средней цене
         if stats and stats['total_quantity'] > 0 and current_price > stats['avg_price']:
-            next_purchase_time = self.db.get_setting('next_dca_purchase_time', '')
             return {
                 'success': False, 
                 'error': 'skip_price_above_avg',
@@ -1927,7 +1925,6 @@ class DCAStrategy:
                 result['sell_order_id'] = sell_result['order_id']
                 result['target_price'] = target_price_sell
             elif sell_result.get('error') == 'insufficient_balance':
-                # Если недостаточно баланса, пробуем позже через pending ордер
                 pending_id = self.db.add_pending_sell_order(
                     symbol=symbol,
                     quantity=quantity_for_sell,
@@ -1952,6 +1949,9 @@ class DCAStrategy:
             result['drop_percent'] = drop_percent
             
             self.db.log_action('SCHEDULED_PURCHASE', symbol, f"Сумма: {result['total_usdt']:.2f} USDT, падение: {drop_percent:.1f}%")
+        elif result.get('error') == 'insufficient_balance':
+            logger.error(f"Insufficient balance for purchase: need {amount_usdt} USDT")
+            return {'success': False, 'error': f'Недостаточно USDT на балансе. Нужно {amount_usdt:.2f} USDT'}
         else:
             logger.error(f"Scheduled purchase failed: {result.get('error')}")
         
@@ -3524,7 +3524,8 @@ class FastDCABot:
                 available = coin_balance.get('available', 0)
                 usd_value = coin_balance.get('usdValue', 0)
                 if usd_value == 0 and current_price and equity > 0:
-                    usd_value = equity * current_price                dca_stats = self.db.get_dca_stats(symbol)
+                    usd_value = equity * current_price
+                dca_stats = self.db.get_dca_stats(symbol)
                 avg_price = dca_stats['avg_price'] if dca_stats else 0
                 if avg_price > 0 and current_price and equity > 0:
                     pnl_percent = ((current_price - avg_price) / avg_price * 100)
@@ -3996,7 +3997,6 @@ class FastDCABot:
                 drop_percent = recommendation.get('drop_percent', 0) if recommendation.get('should_buy') else 0
                 step_level = recommendation.get('step_level', 0) if recommendation.get('should_buy') else 0
                 self.db.add_purchase(symbol=symbol, amount_usdt=amount, price=price, quantity=result['quantity'], multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=current_date)
-                # Ждём 2 секунды после покупки для зачисления монет
                 await asyncio.sleep(2)
                 sell_result = await self.bybit.place_limit_sell(symbol, result['quantity'], target_price)
                 if sell_result['success']:
