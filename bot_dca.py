@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.3.2 (01.05.2026)
+Версия 5.3.2 (02.05.2026)
 ИСПРАВЛЕНИЯ ВЕРСИИ 5.3.2:
-- Исправлены регулярные выражения для кнопок (время, интервал, настройки)
-- Убрана принудительная корректировка суммы при ручной покупке (ошибка 170140)
-- Добавлена проверка перед созданием ордера на продажу
-- Улучшена обработка кнопок "Назад" и "Отмена"
-- Исправлено зацикливание в диалогах ввода
+- Устранена ошибка 170131 при создании ордера на продажу (Insufficient balance)
+- Добавлена проверка цены в Авто DCA: покупка только если цена <= средней
+- Улучшена обработка ошибок при создании ордеров на продажу
+- Исправлено извлечение баланса монеты для ордера на продажу
+- Добавлена задержка перед проверкой баланса после покупки
 """
 
 import os
@@ -70,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.3.2 (01.05.2026)"
+BOT_VERSION = "5.3.2 (02.05.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -1617,8 +1617,6 @@ class BybitClient:
         """Округляет цену до шага цены tick_size (вниз, по правилам Bybit)."""
         if tick_size <= 0:
             return round(price, 4)
-        # Bybit принимает цену, округлённую до tick_size (обычно вниз)
-        # Используем floor для соблюдения лимитной цены (не выше рынка)
         rounded = math.floor(price / tick_size) * tick_size
         if rounded <= 0:
             rounded = tick_size
@@ -1762,6 +1760,8 @@ class BybitClient:
                 return {'success': True, 'order_id': response['result']['orderId'], 'quantity': rounded_quantity, 'price': rounded_price}
             if response['retCode'] == 170140:
                 return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt, 'order_value': order_value, 'quantity': rounded_quantity, 'price': rounded_price}
+            if response['retCode'] == 170131:
+                return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
             return {'success': False, 'error': f"{response['retMsg']} (Код: {response['retCode']})"}
         except Exception as e:
             return {'success': False, 'error': str(e)}
@@ -1819,9 +1819,13 @@ class BybitClient:
             response = self.session.place_order(category="spot", symbol=symbol, side="Buy", orderType="Limit", qty=str(quantity), price=str(rounded_price), timeInForce="GTC")
             if response['retCode'] == 0:
                 return {'success': True, 'order_id': response['result']['orderId'], 'quantity': float(quantity), 'price': rounded_price, 'total_usdt': order_value}
+            if response['retCode'] == 170131:
+                return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
@@ -1839,6 +1843,15 @@ class DCAStrategy:
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         tick_size = instrument_info['tick_size']
+        
+        # Проверяем: покупаем только если текущая цена НИЖЕ или РАВНА средней цене
+        if stats and stats['total_quantity'] > 0 and current_price > stats['avg_price']:
+            next_purchase_time = self.db.get_setting('next_dca_purchase_time', '')
+            return {
+                'success': False, 
+                'error': 'skip_price_above_avg',
+                'message': f'⚠️ Покупка пропущена: текущая цена ({format_price(current_price, 4)}) ВЫШЕ средней цены ({format_price(stats["avg_price"], 4)}).\n\nСледующая проверка в следующем запланированном времени.'
+            }
         
         if not stats or stats['total_quantity'] <= 0:
             amount_usdt = base_amount
@@ -1889,23 +1902,44 @@ class DCAStrategy:
             self.db.set_setting('last_purchase_price', str(result['price']))
             self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
+            # Ждём 2 секунды после покупки, чтобы монеты успели зачислиться на баланс
+            await asyncio.sleep(2)
+            
+            # Проверяем баланс монеты после покупки
+            coin = symbol.replace('USDT', '')
+            coin_balance = await self.bybit.get_balance(coin)
+            actual_qty = coin_balance.get('available', 0) if coin_balance else 0
+            
+            # Используем фактическое количество монет для ордера на продажу
+            quantity_for_sell = min(result['quantity'], actual_qty) if actual_qty > 0 else result['quantity']
+            
             target_price_sell = result['price'] * (1 + profit_percent / 100)
-            sell_result = await self.bybit.place_limit_sell(symbol, result['quantity'], target_price_sell)
+            sell_result = await self.bybit.place_limit_sell(symbol, quantity_for_sell, target_price_sell)
             
             if sell_result['success']:
                 self.db.add_sell_order(
                     symbol=symbol,
                     order_id=sell_result['order_id'],
-                    quantity=result['quantity'],
+                    quantity=quantity_for_sell,
                     target_price=target_price_sell,
                     profit_percent=profit_percent
                 )
                 result['sell_order_id'] = sell_result['order_id']
                 result['target_price'] = target_price_sell
+            elif sell_result.get('error') == 'insufficient_balance':
+                # Если недостаточно баланса, пробуем позже через pending ордер
+                pending_id = self.db.add_pending_sell_order(
+                    symbol=symbol,
+                    quantity=quantity_for_sell,
+                    target_price=target_price_sell,
+                    profit_percent=profit_percent
+                )
+                result['pending_order_id'] = pending_id
+                result['sell_warning'] = f"⚠️ Ордер на продажу будет создан позже (баланс обновляется)"
             elif sell_result.get('error') == 'min_amount_error':
                 pending_id = self.db.add_pending_sell_order(
                     symbol=symbol,
-                    quantity=result['quantity'],
+                    quantity=quantity_for_sell,
                     target_price=target_price_sell,
                     profit_percent=profit_percent
                 )
@@ -1964,19 +1998,35 @@ class DCAStrategy:
             self.db.set_setting('last_purchase_price', str(result['price']))
             self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
+            await asyncio.sleep(2)
+            
+            coin = symbol.replace('USDT', '')
+            coin_balance = await self.bybit.get_balance(coin)
+            actual_qty = coin_balance.get('available', 0) if coin_balance else 0
+            quantity_for_sell = min(result['quantity'], actual_qty) if actual_qty > 0 else result['quantity']
+            
             target_price_sell = result['price'] * (1 + profit_percent / 100)
-            sell_result = await self.bybit.place_limit_sell(symbol, result['quantity'], target_price_sell)
+            sell_result = await self.bybit.place_limit_sell(symbol, quantity_for_sell, target_price_sell)
             
             if sell_result['success']:
                 self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'],
-                                      quantity=result['quantity'], target_price=target_price_sell,
+                                      quantity=quantity_for_sell, target_price=target_price_sell,
                                       profit_percent=profit_percent)
                 result['sell_order_id'] = sell_result['order_id']
                 result['target_price'] = target_price_sell
+            elif sell_result.get('error') == 'insufficient_balance':
+                pending_id = self.db.add_pending_sell_order(
+                    symbol=symbol,
+                    quantity=quantity_for_sell,
+                    target_price=target_price_sell,
+                    profit_percent=profit_percent
+                )
+                result['pending_order_id'] = pending_id
+                result['sell_warning'] = f"⚠️ Ордер на продажу будет создан позже"
             elif sell_result.get('error') == 'min_amount_error':
                 pending_id = self.db.add_pending_sell_order(
                     symbol=symbol,
-                    quantity=result['quantity'],
+                    quantity=quantity_for_sell,
                     target_price=target_price_sell,
                     profit_percent=profit_percent
                 )
@@ -3474,8 +3524,7 @@ class FastDCABot:
                 available = coin_balance.get('available', 0)
                 usd_value = coin_balance.get('usdValue', 0)
                 if usd_value == 0 and current_price and equity > 0:
-                    usd_value = equity * current_price
-                dca_stats = self.db.get_dca_stats(symbol)
+                    usd_value = equity * current_price                dca_stats = self.db.get_dca_stats(symbol)
                 avg_price = dca_stats['avg_price'] if dca_stats else 0
                 if avg_price > 0 and current_price and equity > 0:
                     pnl_percent = ((current_price - avg_price) / avg_price * 100)
@@ -3657,7 +3706,8 @@ class FastDCABot:
                 f"📉 Макс. просадка: {ladder_settings['max_depth']}%\n"
                 f"⏰ Расписание: {schedule_time} (МСК), каждые {frequency_hours} ч.\n"
                 f"⏰ Следующая покупка: {next_time.strftime('%d.%m.%Y %H:%M')} (МСК)\n\n"
-                f"⚠️ *Важно:* Минимальная сумма покупки на Bybit для {symbol} составляет {min_amt} USDT",
+                f"⚠️ *Важно:* Минимальная сумма покупки на Bybit для {symbol} составляет {min_amt} USDT\n\n"
+                f"💡 *Логика покупки:* покупка происходит только если текущая цена НИЖЕ средней цены закупа",
                 reply_markup=self.get_main_keyboard()
             )
             logger.info(f"DCA activated. Next purchase at {next_time.isoformat()}")
@@ -3946,9 +3996,14 @@ class FastDCABot:
                 drop_percent = recommendation.get('drop_percent', 0) if recommendation.get('should_buy') else 0
                 step_level = recommendation.get('step_level', 0) if recommendation.get('should_buy') else 0
                 self.db.add_purchase(symbol=symbol, amount_usdt=amount, price=price, quantity=result['quantity'], multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=current_date)
+                # Ждём 2 секунды после покупки для зачисления монет
+                await asyncio.sleep(2)
                 sell_result = await self.bybit.place_limit_sell(symbol, result['quantity'], target_price)
                 if sell_result['success']:
                     self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'], quantity=result['quantity'], target_price=target_price, profit_percent=profit_percent)
+                elif sell_result.get('error') == 'insufficient_balance':
+                    pending_id = self.db.add_pending_sell_order(symbol=symbol, quantity=result['quantity'], target_price=target_price, profit_percent=profit_percent)
+                    await update.message.reply_text(f"⚠️ *ОРДЕР НА ПРОДАЖУ ОТЛОЖЕН*\n\nБаланс обновляется. Ордер будет автоматически создан позже.", parse_mode='Markdown')
                 elif sell_result.get('error') == 'min_amount_error':
                     pending_id = self.db.add_pending_sell_order(symbol=symbol, quantity=result['quantity'], target_price=target_price, profit_percent=profit_percent)
                     await update.message.reply_text(f"⚠️ *ОРДЕР НА ПРОДАЖУ ОТЛОЖЕН*\n\nСумма ордера ({sell_result['order_value']:.2f} USDT) меньше минимальной ({sell_result['min_amt']} USDT).\n\n✅ Ордер сохранен и будет автоматически выставлен при достижении нужной цены.", parse_mode='Markdown')
@@ -4370,6 +4425,17 @@ class FastDCABot:
                                 msg += f"\n⚠️ {result['sell_warning']}"
                             try:
                                 await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
+                            except:
+                                pass
+                    elif result.get('error') == 'skip_price_above_avg':
+                        logger.info(f"Scheduled purchase skipped: price above avg")
+                        if self.authorized_user_id:
+                            try:
+                                await self.application.bot.send_message(
+                                    chat_id=self.authorized_user_id,
+                                    text=result.get('message', 'Покупка пропущена: цена выше средней'),
+                                    parse_mode='Markdown'
+                                )
                             except:
                                 pass
                     else:
