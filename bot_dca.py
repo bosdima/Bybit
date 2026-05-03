@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.3.2 (02.05.2026)
-ИСПРАВЛЕНИЯ ВЕРСИИ 5.3.2:
-- Устранена ошибка 170131 при создании ордера на продажу (Insufficient balance)
-- Добавлена проверка цены в Авто DCA: покупка только если цена <= средней
-- Улучшена обработка ошибок при создании ордеров на продажу
-- Исправлено извлечение баланса монеты для ордера на продажу
-- Добавлена задержка перед проверкой баланса после покупки
+Версия 5.3.3 (03.05.2026)
+ИСПРАВЛЕНИЯ ВЕРСИИ 5.3.3:
+- Исправлено: при срабатывании Авто DCA теперь ОТМЕНЯЕТ старые ордера на продажу ДО создания нового
+- Устранена ошибка склеивания строк в show_portfolio (SyntaxError)
+- Добавлена принудительная задержка (2 сек) после отмены старых ордеров
+- Улучшена проверка баланса перед созданием ордера на продажу
+- Добавлен пропуск создания ордера на продажу при отсутствии монет на балансе
 """
 
 import os
@@ -70,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.3.2 (02.05.2026)"
+BOT_VERSION = "5.3.3 (03.05.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -1621,6 +1621,7 @@ class BybitClient:
         if rounded <= 0:
             rounded = tick_size
         return rounded
+    
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
             check_date = from_date if from_date else get_moscow_time_naive() - timedelta(days=90)
@@ -1823,12 +1824,33 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-
-
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
         self.bybit = bybit
+    
+    async def cancel_old_sell_orders(self, symbol: str) -> int:
+        """Отменяет все старые ордера на продажу и возвращает количество отменённых."""
+        try:
+            open_orders = await self.bybit.get_open_orders(symbol)
+            sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
+            
+            if not sell_orders:
+                return 0
+            
+            logger.info(f"Found {len(sell_orders)} old sell orders for {symbol}, cancelling...")
+            cancelled_count, cancelled_ids = await self.bybit.cancel_all_sell_orders(symbol)
+            
+            for order_id in cancelled_ids:
+                self.db.update_sell_order_status(order_id, 'cancelled')
+            
+            if cancelled_count > 0:
+                await asyncio.sleep(2)
+            
+            return cancelled_count
+        except Exception as e:
+            logger.error(f"Error cancelling old sell orders: {e}")
+            return 0
     
     async def execute_scheduled_purchase(self, symbol: str, profit_percent: float) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
@@ -1883,6 +1905,11 @@ class DCAStrategy:
         if limit_price <= 0:
             limit_price = tick_size
         
+        # ОТМЕНЯЕМ СТАРЫЕ ОРДЕРА НА ПРОДАЖУ ПЕРЕД ПОКУПКОЙ
+        cancelled_old = await self.cancel_old_sell_orders(symbol)
+        if cancelled_old > 0:
+            logger.info(f"Cancelled {cancelled_old} old sell orders before new purchase")
+        
         result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
         
         if result['success']:
@@ -1910,6 +1937,15 @@ class DCAStrategy:
             
             # Используем фактическое количество монет для ордера на продажу
             quantity_for_sell = min(result['quantity'], actual_qty) if actual_qty > 0 else result['quantity']
+            
+            # Если монет нет на балансе - пропускаем создание ордера на продажу
+            if quantity_for_sell <= 0:
+                logger.warning(f"No coins available for sell order after purchase, skipping sell order")
+                result['sell_warning'] = f"⚠️ Монеты не зачислены на баланс. Ордер на продажу не создан."
+                result['sell_skipped'] = True
+                result['amount_usdt'] = amount_usdt
+                result['drop_percent'] = drop_percent
+                return result
             
             target_price_sell = result['price'] * (1 + profit_percent / 100)
             sell_result = await self.bybit.place_limit_sell(symbol, quantity_for_sell, target_price_sell)
@@ -1988,6 +2024,11 @@ class DCAStrategy:
         if limit_price <= 0:
             limit_price = tick_size
         
+        # ОТМЕНЯЕМ СТАРЫЕ ОРДЕРА НА ПРОДАЖУ ПЕРЕД ПОКУПКОЙ
+        cancelled_old = await self.cancel_old_sell_orders(symbol)
+        if cancelled_old > 0:
+            logger.info(f"Cancelled {cancelled_old} old sell orders before new purchase")
+        
         result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
         
         if result['success']:
@@ -2005,35 +2046,39 @@ class DCAStrategy:
             actual_qty = coin_balance.get('available', 0) if coin_balance else 0
             quantity_for_sell = min(result['quantity'], actual_qty) if actual_qty > 0 else result['quantity']
             
-            target_price_sell = result['price'] * (1 + profit_percent / 100)
-            sell_result = await self.bybit.place_limit_sell(symbol, quantity_for_sell, target_price_sell)
-            
-            if sell_result['success']:
-                self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'],
-                                      quantity=quantity_for_sell, target_price=target_price_sell,
-                                      profit_percent=profit_percent)
-                result['sell_order_id'] = sell_result['order_id']
-                result['target_price'] = target_price_sell
-            elif sell_result.get('error') == 'insufficient_balance':
-                pending_id = self.db.add_pending_sell_order(
-                    symbol=symbol,
-                    quantity=quantity_for_sell,
-                    target_price=target_price_sell,
-                    profit_percent=profit_percent
-                )
-                result['pending_order_id'] = pending_id
-                result['sell_warning'] = f"⚠️ Ордер на продажу будет создан позже"
-            elif sell_result.get('error') == 'min_amount_error':
-                pending_id = self.db.add_pending_sell_order(
-                    symbol=symbol,
-                    quantity=quantity_for_sell,
-                    target_price=target_price_sell,
-                    profit_percent=profit_percent
-                )
-                result['pending_order_id'] = pending_id
-                result['sell_warning'] = f"Сумма ордера ({sell_result['order_value']:.2f} USDT) меньше минимальной ({sell_result['min_amt']} USDT). Ордер отложен до достижения нужной цены."
+            if quantity_for_sell <= 0:
+                result['sell_warning'] = f"⚠️ Монеты не зачислены на баланс. Ордер на продажу не создан."
+                result['sell_skipped'] = True
             else:
-                result['sell_warning'] = sell_result.get('error', 'Не удалось создать ордер на продажу')
+                target_price_sell = result['price'] * (1 + profit_percent / 100)
+                sell_result = await self.bybit.place_limit_sell(symbol, quantity_for_sell, target_price_sell)
+                
+                if sell_result['success']:
+                    self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'],
+                                          quantity=quantity_for_sell, target_price=target_price_sell,
+                                          profit_percent=profit_percent)
+                    result['sell_order_id'] = sell_result['order_id']
+                    result['target_price'] = target_price_sell
+                elif sell_result.get('error') == 'insufficient_balance':
+                    pending_id = self.db.add_pending_sell_order(
+                        symbol=symbol,
+                        quantity=quantity_for_sell,
+                        target_price=target_price_sell,
+                        profit_percent=profit_percent
+                    )
+                    result['pending_order_id'] = pending_id
+                    result['sell_warning'] = f"⚠️ Ордер на продажу будет создан позже"
+                elif sell_result.get('error') == 'min_amount_error':
+                    pending_id = self.db.add_pending_sell_order(
+                        symbol=symbol,
+                        quantity=quantity_for_sell,
+                        target_price=target_price_sell,
+                        profit_percent=profit_percent
+                    )
+                    result['pending_order_id'] = pending_id
+                    result['sell_warning'] = f"Сумма ордера ({sell_result['order_value']:.2f} USDT) меньше минимальной ({sell_result['min_amt']} USDT). Ордер отложен до достижения нужной цены."
+                else:
+                    result['sell_warning'] = sell_result.get('error', 'Не удалось создать ордер на продажу')
             
             result['step_level'] = step_level
             result['amount_usdt'] = amount_usdt
