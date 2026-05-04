@@ -5073,154 +5073,161 @@ class FastDCABot:
         self.db.reset_incremental_check_time()
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
     
-    def setup_handlers(self):
-        logger.info("Setting up handlers...")
-        self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
-        self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_|confirm_clear_stats_|skip_clear_stats_)'))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start))
-        self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
-        self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_import_file))
-        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
-        
-        purchase_notify_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings)],
-            states={WAITING_PURCHASE_NOTIFY_TIME: [
-                MessageHandler(filters.Regex('^(🔔 Уведомления Вкл|🔕 Уведомления Выкл)$'), self.toggle_purchase_notify),
-                MessageHandler(filters.Regex('^(⏰ Время уведомления)'), self.set_purchase_notify_time_start),
-                MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings_from_purchase),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_purchase_notify_time_done)
-            ]},
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="purchase_notify_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(purchase_notify_conv)
-        
-        tracking_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
-            states={NOTIFICATION_SETTINGS_MENU: [
-                MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|❌ Отслеживание ордеров Выкл)$'), self.toggle_tracking),
-                MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking_in_settings),
-                MessageHandler(filters.Regex('^(⏱ Интервал проверки Ордеров)'), self.set_tracking_interval_start),
-                MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
-                MessageHandler(filters.Regex('^(🔄 Синхронизация с биржей)$'), self.manual_sync_exchange),
-                MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)
-            ], WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_tracking_interval_done)]},
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="tracking_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(tracking_conv)
-        
-        edit_purchases_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
-            states={EDIT_PURCHASE_SELECT: [
-                MessageHandler(filters.Regex('^(💰 Изменить цену)$'), self.edit_price_start),
-                MessageHandler(filters.Regex('^(📊 Изменить количество)$'), self.edit_amount_start),
-                MessageHandler(filters.Regex('^(📅 Изменить дату)$'), self.edit_date_start),
-                MessageHandler(filters.Regex('^(❌ Удалить покупку)$'), self.delete_purchase_confirm),
-                MessageHandler(filters.Regex('^(🔙 Назад к списку)$'), self.edit_purchases_list),
-                MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_purchase_selected)
-            ], EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_price_save)], EDIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_amount_save)], EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_date_save)], DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.delete_purchase_execute)]},
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="edit_purchases_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(edit_purchases_conv)
-        
-        main_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
-            states={
-                SELECTING_ACTION: [
-                    MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start),
-                    MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu),
-                    MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start),
-                    MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu),
-                    MessageHandler(filters.Regex('^(💵 Сумма для ручного ордера)$'), self.set_manual_amount_start),
-                    MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
-                    MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings),
-                    MessageHandler(filters.Regex('^🌐 Режим: (Обычный|Демо)$'), self.toggle_trading_mode),
-                    MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export),
-                    MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start),
-                    MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
-                ],
-                SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
-                SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)],
-                SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)],
-                SET_MANUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_manual_amount_done)],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="main_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(main_conv)
-        
-        auto_dca_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu)],
-            states={
-                AUTO_DCA_SETTINGS: [
-                    MessageHandler(filters.Regex('^💵 Сумма покупки авто'), self.set_amount_start_auto),
-                    MessageHandler(filters.Regex('^⏰ Время покупки'), self.set_time_start_auto),
-                    MessageHandler(filters.Regex('^🔄 Частота покупки'), self.set_frequency_start_auto),
-                    MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
-                ],
-                SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done_auto)],
-                SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done_auto)],
-                SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done_auto)],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="auto_dca_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(auto_dca_conv)
-        
-        ladder_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu)],
-            states={LADDER_MENU: [
-                MessageHandler(filters.Regex('^(📉 Глубина просадки \(%\))$'), self.set_ladder_max_depth_start),
-                MessageHandler(filters.Regex('^(💵 Базовая сумма)$'), self.set_ladder_base_amount_start),
-                MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_ladder_settings),
-                MessageHandler(filters.Regex('^(🔄 Сбросить лестницу)$'), self.reset_ladder),
-                MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)
-            ], SET_LADDER_DEPTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_max_depth_save)], SET_LADDER_BASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save)]},
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="ladder_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(ladder_conv)
-        
-        manual_limit_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(💰 Ручная покупка \(лимит\))$'), self.manual_buy_start)],
-            states={MANUAL_BUY_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_buy_price_done)], MANUAL_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_buy_amount_done)]},
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="manual_buy_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(manual_limit_conv)
-        
-        manual_add_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(➕ Добавить покупку вручную)$'), self.manual_add_start)],
-            states={MANUAL_ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND), self.manual_add_price], MANUAL_ADD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_add_amount)]},
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="manual_add_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(manual_add_conv)
-        
-        cancel_order_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start)],
-            states={WAITING_ORDER_ID_TO_CANCEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cancel_order_execute)]},
-            fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
-            name="cancel_order_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
-        )
-        self.application.add_handler(cancel_order_conv)
-        
-        self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
-        self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
-        self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
-        self.application.add_handler(MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking))
-        self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
-        self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
-        self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu))
-        
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
+def setup_handlers(self):
+    logger.info("Setting up handlers...")
+    self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
+    self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_|confirm_clear_stats_|skip_clear_stats_)'))
+    self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
+    self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start))
+    self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
+    self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_import_file))
+    self.application.add_handler(MessageHandler(filters.Regex('^(✅ Да, выставить ордер на продажу|❌ Нет, отмена)$'), self.handle_sell_confirmation))
+    
+    purchase_notify_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings)],
+        states={WAITING_PURCHASE_NOTIFY_TIME: [
+            MessageHandler(filters.Regex('^(🔔 Уведомления Вкл|🔕 Уведомления Выкл)$'), self.toggle_purchase_notify),
+            MessageHandler(filters.Regex('^(⏰ Время уведомления)'), self.set_purchase_notify_time_start),
+            MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings_from_purchase),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_purchase_notify_time_done)
+        ]},
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="purchase_notify_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(purchase_notify_conv)
+    
+    tracking_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
+        states={NOTIFICATION_SETTINGS_MENU: [
+            MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|❌ Отслеживание ордеров Выкл)$'), self.toggle_tracking),
+            MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking_in_settings),
+            MessageHandler(filters.Regex('^(⏱ Интервал проверки Ордеров)'), self.set_tracking_interval_start),
+            MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
+            MessageHandler(filters.Regex('^(🔄 Синхронизация с биржей)$'), self.manual_sync_exchange),
+            MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)
+        ], WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_tracking_interval_done)]},
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="tracking_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(tracking_conv)
+    
+    edit_purchases_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
+        states={EDIT_PURCHASE_SELECT: [
+            MessageHandler(filters.Regex('^(💰 Изменить цену)$'), self.edit_price_start),
+            MessageHandler(filters.Regex('^(📊 Изменить количество)$'), self.edit_amount_start),
+            MessageHandler(filters.Regex('^(📅 Изменить дату)$'), self.edit_date_start),
+            MessageHandler(filters.Regex('^(❌ Удалить покупку)$'), self.delete_purchase_confirm),
+            MessageHandler(filters.Regex('^(🔙 Назад к списку)$'), self.edit_purchases_list),
+            MessageHandler(filters.Regex('^(🏠 Главное меню)$'), self.back_to_main),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_purchase_selected)
+        ], EDIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_price_save)], 
+           EDIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_amount_save)], 
+           EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_date_save)], 
+           DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.delete_purchase_execute)]},
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="edit_purchases_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(edit_purchases_conv)
+    
+    main_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
+        states={
+            SELECTING_ACTION: [
+                MessageHandler(filters.Regex('^(🪙 Выбор токена)$'), self.set_symbol_start),
+                MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu),
+                MessageHandler(filters.Regex('^(📊 Процент прибыли)$'), self.set_profit_start),
+                MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu),
+                MessageHandler(filters.Regex('^(💵 Сумма для ручного ордера)$'), self.set_manual_amount_start),
+                MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings),
+                MessageHandler(filters.Regex('^(🔔 Уведомления о покупке)$'), self.purchase_notify_settings),
+                MessageHandler(filters.Regex('^🌐 Режим: (Обычный|Демо)$'), self.toggle_trading_mode),
+                MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export),
+                MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start),
+                MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
+            ],
+            SELECTING_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_symbol_selection)],
+            SET_SYMBOL_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_manual)],
+            SET_PROFIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_profit_done)],
+            SET_MANUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_manual_amount_done)],
+        },
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="main_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(main_conv)
+    
+    auto_dca_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu)],
+        states={
+            AUTO_DCA_SETTINGS: [
+                MessageHandler(filters.Regex('^💵 Сумма покупки авто'), self.set_amount_start_auto),
+                MessageHandler(filters.Regex('^⏰ Время покупки'), self.set_time_start_auto),
+                MessageHandler(filters.Regex('^🔄 Частота покупки'), self.set_frequency_start_auto),
+                MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
+            ],
+            SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done_auto)],
+            SET_SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_time_done_auto)],
+            SET_FREQUENCY_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_frequency_done_auto)],
+        },
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="auto_dca_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(auto_dca_conv)
+    
+    ladder_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu)],
+        states={LADDER_MENU: [
+            MessageHandler(filters.Regex('^(📉 Глубина просадки \(%\))$'), self.set_ladder_max_depth_start),
+            MessageHandler(filters.Regex('^(💵 Базовая сумма)$'), self.set_ladder_base_amount_start),
+            MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_ladder_settings),
+            MessageHandler(filters.Regex('^(🔄 Сбросить лестницу)$'), self.reset_ladder),
+            MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)
+        ], SET_LADDER_DEPTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_max_depth_save)], 
+           SET_LADDER_BASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_ladder_base_amount_save)]},
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="ladder_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(ladder_conv)
+    
+    manual_limit_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(💰 Ручная покупка \(лимит\))$'), self.manual_buy_start)],
+        states={MANUAL_BUY_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_buy_price_done)], 
+                MANUAL_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_buy_amount_done)]},
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="manual_buy_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(manual_limit_conv)
+    
+    manual_add_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(➕ Добавить покупку вручную)$'), self.manual_add_start)],
+        states={MANUAL_ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_add_price)], 
+                MANUAL_ADD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.manual_add_amount)]},
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="manual_add_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(manual_add_conv)
+    
+    cancel_order_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^(❌ Удалить ордер)$'), self.cancel_order_start)],
+        states={WAITING_ORDER_ID_TO_CANCEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cancel_order_execute)]},
+        fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
+        name="cancel_order_conversation", persistent=False, conversation_timeout=CONVERSATION_TIMEOUT
+    )
+    self.application.add_handler(cancel_order_conv)
+    
+    self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
+    self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
+    self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
+    self.application.add_handler(MessageHandler(filters.Regex('^(📋 Статус бота)$'), self.show_status))
+    self.application.add_handler(MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu))
+    self.application.add_handler(MessageHandler(filters.Regex('^(✅ Отслеживание ордеров Вкл|⏳ Отслеживание ордеров Выкл)$'), self.toggle_order_execution))
+    self.application.add_handler(MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking))
+    self.application.add_handler(MessageHandler(filters.Regex('^(📋 Список открытых ордеров)$'), self.show_open_orders))
+    self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
+    self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu))
+    
+    self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
+    logger.info("Handlers setup completed")
         logger.info("Handlers setup completed")
     
     def run(self):
