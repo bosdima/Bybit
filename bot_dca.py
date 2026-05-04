@@ -2158,9 +2158,8 @@ class FastDCABot:
             entry_points=[MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu)],
             states={
                 AUTO_DCA_SETTINGS: [
-                    MessageHandler(filters.Regex('^💵'), self.set_amount_start_auto),
-                    MessageHandler(filters.Regex('^                    MessageHandler(filters.Regex('^💵'), self.set_amount_start_auto),
-                    MessageHandler(filters.Regex('^⏰'), self.set_time_start_auto),
+                    MessageHandler(filters.Regex(r'^💵'), self.set_amount_start_auto),
+                    MessageHandler(filters.Regex(r'^⏰'), self.set_time_start_auto),
                     MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings),
                 ],
                 SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done_auto)],
