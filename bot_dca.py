@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.4.0 (04.05.2026)
-ИСПРАВЛЕНИЯ ВЕРСИИ 5.4.0:
-- Добавлена полная сверка ордеров с биржей при ежедневной проверке
-- При расхождении статистики с реальными ордерами предлагается удалить лишние покупки
-- Исправлен расчет доступного количества для продажи (только реальный баланс)
-- Добавлена автоматическая синхронизация статистики с балансом на бирже
-- Улучшена логика определения "заблокированных" монет
+Версия 5.3.3 (03.05.2026)
+ИСПРАВЛЕНИЯ ВЕРСИИ 5.3.3:
+- Исправлено: при срабатывании Авто DCA теперь ОТМЕНЯЕТ старые ордера на продажу ДО создания нового
+- Устранена ошибка склеивания строк в show_portfolio (SyntaxError)
+- Добавлена принудительная задержка (2 сек) после отмены старых ордеров
+- Улучшена проверка баланса перед созданием ордера на продажу
+- Добавлен пропуск создания ордера на продажу при отсутствии монет на балансе
 """
 
 import os
@@ -70,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.4.0 (04.05.2026)"
+BOT_VERSION = "5.3.3 (03.05.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -120,8 +120,7 @@ def get_moscow_time_naive() -> datetime:
     WAITING_PURCHASE_NOTIFY_TIME,
     AUTO_DCA_SETTINGS,
     SET_MANUAL_AMOUNT,
-    WAITING_SYNC_CONFIRMATION,
-) = range(37)
+) = range(36)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
 POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
@@ -296,16 +295,6 @@ class Database:
             if 'step_percent' not in columns:
                 cursor.execute("ALTER TABLE ladder_settings ADD COLUMN step_percent REAL DEFAULT 1.0")
             
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS sync_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    sync_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    purchases_deleted INTEGER DEFAULT 0,
-                    details TEXT
-                )
-            ''')
-            
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='executed_orders'")
             table_exists = cursor.fetchone()
             
@@ -371,7 +360,6 @@ class Database:
                 ('first_order_date', ''),
                 ('next_dca_purchase_time', ''),
                 ('trading_mode', 'real'),
-                ('last_daily_sync_time', ''),
             ]
             
             for key, value in defaults:
@@ -1185,31 +1173,6 @@ class Database:
         except Exception as e:
             logger.error(f"Error saving authorized user id: {e}")
     
-    def get_last_daily_sync_time(self) -> Optional[datetime]:
-        time_str = self.get_setting('last_daily_sync_time', '')
-        if time_str:
-            try:
-                return datetime.fromisoformat(time_str)
-            except:
-                return None
-        return None
-    
-    def set_last_daily_sync_time(self, sync_time: datetime):
-        self.set_setting('last_daily_sync_time', sync_time.isoformat())
-    
-    def add_sync_history(self, symbol: str, purchases_deleted: int, details: str):
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO sync_history (symbol, purchases_deleted, details)
-                VALUES (?, ?, ?)
-            ''', (symbol, purchases_deleted, details))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.error(f"Error adding sync history: {e}")
-    
     def export_database(self) -> Tuple[bool, int, str]:
         try:
             purchases = self.get_purchases()
@@ -1496,6 +1459,8 @@ class Database:
         except Exception as e:
             logger.error(f"Error importing database: {e}")
             return False, str(e)
+
+
 class BybitClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -1649,6 +1614,7 @@ class BybitClient:
             return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
     
     def _round_price_by_tick(self, price: float, tick_size: float) -> float:
+        """Округляет цену до шага цены tick_size (вниз, по правилам Bybit)."""
         if tick_size <= 0:
             return round(price, 4)
         rounded = math.floor(price / tick_size) * tick_size
@@ -1801,6 +1767,12 @@ class BybitClient:
             return {'success': False, 'error': str(e)}
     
     async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float, is_auto: bool = True) -> Dict:
+        """
+        Размещение лимитного ордера на покупку.
+        Цена округляется до tick_size.
+        Для Авто DCA (is_auto=True) сумма автоматически корректируется до минимальной.
+        Для ручной покупки (is_auto=False) сумма не корректируется (только предупреждение).
+        """
         try:
             if not self.session:
                 self._init_session()
@@ -1812,9 +1784,11 @@ class BybitClient:
             
             rounded_price = self._round_price_by_tick(price, tick_size)
             
+            # Для ручной покупки не корректируем сумму, только проверяем
             if not is_auto and amount_usdt < min_amt:
                 return {'success': False, 'error': f'Сумма {amount_usdt:.2f} USDT меньше минимальной {min_amt} USDT. Пожалуйста, увеличьте сумму.'}
             
+            # Для Авто DCA корректируем сумму
             if is_auto and amount_usdt < min_amt:
                 amount_usdt = min_amt
                 logger.warning(f"Авто DCA: сумма увеличена до минимальной {min_amt} USDT")
@@ -1850,14 +1824,13 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
-
-
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
         self.bybit = bybit
     
     async def cancel_old_sell_orders(self, symbol: str) -> int:
+        """Отменяет все старые ордера на продажу и возвращает количество отменённых."""
         try:
             open_orders = await self.bybit.get_open_orders(symbol)
             sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
@@ -1879,72 +1852,6 @@ class DCAStrategy:
             logger.error(f"Error cancelling old sell orders: {e}")
             return 0
     
-    async def sync_purchases_with_exchange(self, symbol: str, user_id: int, bot) -> Dict:
-        """
-        Полная сверка покупок в статистике с реальными ордерами на бирже.
-        Удаляет из статистики те покупки, которых нет на Bybit.
-        """
-        try:
-            first_order_date = self.db.get_first_order_date()
-            if first_order_date is None:
-                first_order_date = get_moscow_time_naive() - timedelta(days=90)
-            
-            check_date = first_order_date - timedelta(days=1)
-            
-            exchange_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
-            
-            exchange_order_keys = set()
-            for order in exchange_orders:
-                key = f"{round(order['price'], 6)}_{round(order['quantity'], 6)}"
-                exchange_order_keys.add(key)
-            
-            purchases = self.db.get_purchases(symbol)
-            
-            purchases_to_delete = []
-            for purchase in purchases:
-                purchase_key = f"{round(purchase['price'], 6)}_{round(purchase['quantity'], 6)}"
-                if purchase_key not in exchange_order_keys:
-                    purchases_to_delete.append(purchase)
-            
-            if not purchases_to_delete:
-                return {'success': True, 'deleted_count': 0, 'message': 'Статистика синхронизирована с биржей'}
-            
-            deleted_count = 0
-            deleted_details = []
-            
-            for purchase in purchases_to_delete:
-                if self.db.delete_purchase(purchase['id']):
-                    deleted_count += 1
-                    deleted_details.append(f"ID{purchase['id']}: {purchase['quantity']:.4f} @ {purchase['price']:.4f}")
-            
-            if deleted_count > 0:
-                self.db.add_sync_history(symbol, deleted_count, f"Удалено {deleted_count} покупок: {', '.join(deleted_details[:5])}")
-                
-                if user_id:
-                    msg = (f"🔄 *СИНХРОНИЗАЦИЯ С БИРЖЕЙ*\n\n"
-                           f"🪙 Токен: `{symbol}`\n"
-                           f"🗑 Удалено из статистики: `{deleted_count}` покупок\n\n"
-                           f"❌ Удалены следующие покупки (их нет на бирже):\n")
-                    for detail in deleted_details[:10]:
-                        msg += f"• {detail}\n"
-                    if len(deleted_details) > 10:
-                        msg += f"_...и еще {len(deleted_details) - 10}_\n"
-                    msg += f"\n✅ Статистика теперь соответствует реальному балансу!\n"
-                    msg += f"📊 Новый средний: пересчитан автоматически."
-                    
-                    try:
-                        await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
-                    except Exception as e:
-                        logger.error(f"Error sending sync notification: {e}")
-                
-                logger.info(f"Sync: removed {deleted_count} purchases for {symbol}")
-            
-            return {'success': True, 'deleted_count': deleted_count, 'deleted_details': deleted_details}
-        
-        except Exception as e:
-            logger.error(f"Error syncing purchases with exchange: {e}")
-            return {'success': False, 'error': str(e)}
-    
     async def execute_scheduled_purchase(self, symbol: str, profit_percent: float) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
@@ -1958,6 +1865,7 @@ class DCAStrategy:
         min_amt = instrument_info['min_amt']
         tick_size = instrument_info['tick_size']
         
+        # Проверяем: покупаем только если текущая цена НИЖЕ или РАВНА средней цене
         if stats and stats['total_quantity'] > 0 and current_price > stats['avg_price']:
             return {
                 'success': False, 
@@ -1997,6 +1905,7 @@ class DCAStrategy:
         if limit_price <= 0:
             limit_price = tick_size
         
+        # ОТМЕНЯЕМ СТАРЫЕ ОРДЕРА НА ПРОДАЖУ ПЕРЕД ПОКУПКОЙ
         cancelled_old = await self.cancel_old_sell_orders(symbol)
         if cancelled_old > 0:
             logger.info(f"Cancelled {cancelled_old} old sell orders before new purchase")
@@ -2018,14 +1927,20 @@ class DCAStrategy:
             self.db.set_setting('last_purchase_price', str(result['price']))
             self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
+            # Ждём 2 секунды после покупки, чтобы монеты успели зачислиться на баланс
             await asyncio.sleep(2)
             
+            # Проверяем баланс монеты после покупки
             coin = symbol.replace('USDT', '')
             coin_balance = await self.bybit.get_balance(coin)
             actual_qty = coin_balance.get('available', 0) if coin_balance else 0
+            
+            # Используем фактическое количество монет для ордера на продажу
             quantity_for_sell = min(result['quantity'], actual_qty) if actual_qty > 0 else result['quantity']
             
+            # Если монет нет на балансе - пропускаем создание ордера на продажу
             if quantity_for_sell <= 0:
+                logger.warning(f"No coins available for sell order after purchase, skipping sell order")
                 result['sell_warning'] = f"⚠️ Монеты не зачислены на баланс. Ордер на продажу не создан."
                 result['sell_skipped'] = True
                 result['amount_usdt'] = amount_usdt
@@ -2109,6 +2024,7 @@ class DCAStrategy:
         if limit_price <= 0:
             limit_price = tick_size
         
+        # ОТМЕНЯЕМ СТАРЫЕ ОРДЕРА НА ПРОДАЖУ ПЕРЕД ПОКУПКОЙ
         cancelled_old = await self.cancel_old_sell_orders(symbol)
         if cancelled_old > 0:
             logger.info(f"Cancelled {cancelled_old} old sell orders before new purchase")
@@ -2791,7 +2707,6 @@ class FastDCABot:
             [KeyboardButton(sell_tracking_button)],
             [KeyboardButton(f"⏱ Интервал проверки Ордеров {current_interval} мин")],
             [KeyboardButton("🔍 Тест отслеживания")],
-            [KeyboardButton("🔄 Синхронизация с биржей")],
             [KeyboardButton("🔙 Назад в настройки")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -3052,50 +2967,6 @@ class FastDCABot:
     async def back_to_settings_from_purchase(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚙️ *Настройки*", reply_markup=self.get_settings_keyboard(), parse_mode='Markdown')
         return ConversationHandler.END
-    
-    async def manual_sync_exchange(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Ручная синхронизация статистики с биржей"""
-        if not await self._check_user_fast(update):
-            return NOTIFICATION_SETTINGS_MENU
-        
-        await update.message.reply_text("🔄 *Запускаю синхронизацию с биржей...*\n\nЭто может занять некоторое время.", parse_mode='Markdown')
-        
-        self._init_bybit()
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_tracking_settings_keyboard())
-            return NOTIFICATION_SETTINGS_MENU
-        
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        
-        result = await self.strategy.sync_purchases_with_exchange(symbol, self.authorized_user_id, self.application.bot)
-        
-        if result['success']:
-            if result['deleted_count'] > 0:
-                await update.message.reply_text(
-                    f"✅ *Синхронизация завершена!*\n\n"
-                    f"🪙 Токен: `{symbol}`\n"
-                    f"🗑 Удалено из статистики: `{result['deleted_count']}` покупок\n\n"
-                    f"📊 Статистика теперь соответствует реальному балансу на бирже.",
-                    parse_mode='Markdown',
-                    reply_markup=self.get_tracking_settings_keyboard()
-                )
-            else:
-                await update.message.reply_text(
-                    f"✅ *Синхронизация завершена!*\n\n"
-                    f"🪙 Токен: `{symbol}`\n"
-                    f"📊 Статистика уже синхронизирована с биржей.\n\n"
-                    f"Расхождений не найдено.",
-                    parse_mode='Markdown',
-                    reply_markup=self.get_tracking_settings_keyboard()
-                )
-        else:
-            await update.message.reply_text(
-                f"❌ *Ошибка синхронизации*\n\n{result.get('error', 'Неизвестная ошибка')}",
-                parse_mode='Markdown',
-                reply_markup=self.get_tracking_settings_keyboard()
-            )
-        
-        return NOTIFICATION_SETTINGS_MENU
     
     async def auto_dca_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -4722,63 +4593,6 @@ class FastDCABot:
                 logger.error(f"Order checker error: {e}")
                 await asyncio.sleep(60)
     
-    async def daily_sync_loop(self):
-        """Ежедневная синхронизация статистики с биржей в 19:00 МСК"""
-        logger.info("Daily sync loop started")
-        await asyncio.sleep(60)
-        while self.scheduler_running:
-            try:
-                now = get_moscow_time()
-                last_sync = self.db.get_last_daily_sync_time()
-                
-                if last_sync is None or now.date() > last_sync.date():
-                    if now.hour >= 19:
-                        logger.info(f"Running daily sync at {now.strftime('%H:%M')} MSK")
-                        
-                        if not self.bybit_initialized:
-                            self._init_bybit()
-                        
-                        if self.bybit_initialized and self.authorized_user_id:
-                            symbol = self.db.get_setting('symbol', 'TONUSDT')
-                            
-                            await self.application.bot.send_message(
-                                chat_id=self.authorized_user_id,
-                                text=f"🔄 *ЕЖЕДНЕВНАЯ СИНХРОНИЗАЦИЯ С БИРЖЕЙ*\n\nЗапускаю сверку статистики с реальными ордерами на Bybit...",
-                                parse_mode='Markdown'
-                            )
-                            
-                            result = await self.strategy.sync_purchases_with_exchange(symbol, self.authorized_user_id, self.application.bot)
-                            
-                            if result['success']:
-                                if result['deleted_count'] > 0:
-                                    await self.application.bot.send_message(
-                                        chat_id=self.authorized_user_id,
-                                        text=f"✅ *Синхронизация завершена!*\n\n🪙 `{symbol}`\n🗑 Удалено из статистики: `{result['deleted_count']}` покупок\n\n📊 Статистика теперь соответствует реальному балансу.",
-                                        parse_mode='Markdown'
-                                    )
-                                else:
-                                    await self.application.bot.send_message(
-                                        chat_id=self.authorized_user_id,
-                                        text=f"✅ *Синхронизация завершена!*\n\n🪙 `{symbol}`\n📊 Расхождений не найдено. Статистика в порядке.",
-                                        parse_mode='Markdown'
-                                    )
-                            else:
-                                await self.application.bot.send_message(
-                                    chat_id=self.authorized_user_id,
-                                    text=f"❌ *Ошибка синхронизации*\n\n{result.get('error', 'Неизвестная ошибка')}",
-                                    parse_mode='Markdown'
-                                )
-                        
-                        self.db.set_last_daily_sync_time(now)
-                
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                logger.info("Daily sync loop cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Daily sync loop error: {e}")
-                await asyncio.sleep(3600)
-    
     async def purchase_notify_loop(self):
         logger.info("Purchase notify loop started (Moscow timezone)")
         await asyncio.sleep(10)
@@ -4864,8 +4678,7 @@ class FastDCABot:
         task3 = asyncio.create_task(self.sell_checker_loop())
         task4 = asyncio.create_task(self.pending_sell_checker_loop())
         task5 = asyncio.create_task(self.purchase_notify_loop())
-        task6 = asyncio.create_task(self.daily_sync_loop())
-        self.background_tasks = [task1, task2, task3, task4, task5, task6]
+        self.background_tasks = [task1, task2, task3, task4, task5]
         logger.info("Bot initialized, scheduler loops started")
     
     async def shutdown(self, application):
@@ -5070,7 +4883,6 @@ class FastDCABot:
                 MessageHandler(filters.Regex('^(💰 Отслеживание продаж Вкл|⏳ Отслеживание продаж Выкл)$'), self.toggle_sell_tracking_in_settings),
                 MessageHandler(filters.Regex('^(⏱ Интервал проверки Ордеров)'), self.set_tracking_interval_start),
                 MessageHandler(filters.Regex('^(🔍 Тест отслеживания)$'), self.test_tracking),
-                MessageHandler(filters.Regex('^(🔄 Синхронизация с биржей)$'), self.manual_sync_exchange),
                 MessageHandler(filters.Regex('^(🔙 Назад в настройки)$'), self.back_to_settings)
             ], WAITING_ORDER_CHECK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_tracking_interval_done)]},
             fallbacks=[CommandHandler("cancel", self.cancel_conversation)],
