@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.3.3 (03.05.2026)
-ИСПРАВЛЕНИЯ ВЕРСИИ 5.3.3:
-- Исправлено: при срабатывании Авто DCA теперь ОТМЕНЯЕТ старые ордера на продажу ДО создания нового
-- Устранена ошибка склеивания строк в show_portfolio (SyntaxError)
-- Добавлена принудительная задержка (2 сек) после отмены старых ордеров
-- Улучшена проверка баланса перед созданием ордера на продажу
-- Добавлен пропуск создания ордера на продажу при отсутствии монет на балансе
+Версия 5.3.4 (04.05.2026)
+ИСПРАВЛЕНИЯ ВЕРСИИ 5.3.4:
+- ИСПРАВЛЕНО: отслеживание выполненных ордеров на продажу теперь работает корректно
+- Улучшена проверка завершенных продаж (без вычитания 24 часов)
+- Исправлена фильтрация дат в get_completed_sell_orders
 """
 
 import os
@@ -70,7 +68,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.3.3 (03.05.2026)"
+BOT_VERSION = "5.3.4 (04.05.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -1624,6 +1622,7 @@ class BybitClient:
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
+            # Если дата не указана, берем за 90 дней
             check_date = from_date if from_date else get_moscow_time_naive() - timedelta(days=90)
             orders = await self.get_order_history(symbol, limit=500)
             executed = []
@@ -1665,19 +1664,23 @@ class BybitClient:
             return []
     
     async def get_completed_sell_orders(self, symbol: str = None, from_date: datetime = None) -> List[Dict]:
+        """Получает полностью исполненные ордера на продажу за указанный период (или за последние 90 дней)"""
         try:
+            # Если дата не указана, берем за последние 90 дней
             check_date = from_date if from_date else get_moscow_time_naive() - timedelta(days=90)
             orders = await self.get_order_history(symbol, limit=500)
             completed = []
             for order in orders:
                 order_status = order.get('orderStatus', '')
                 side = order.get('side', '')
+                # Проверяем что ордер полностью исполнен и это продажа
                 if order_status in ['Filled'] and side == 'Sell':
                     created_time_str = order.get('createdTime', '')
                     if created_time_str:
                         try:
                             created_time_ms = int(created_time_str)
                             created_time = datetime.fromtimestamp(created_time_ms / 1000)
+                            # Проверяем что ордер исполнен после check_date
                             if created_time >= check_date:
                                 avg_price = float(order.get('avgPrice', 0))
                                 if avg_price == 0:
@@ -1824,6 +1827,8 @@ class BybitClient:
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
         self.db = db
@@ -2153,28 +2158,61 @@ class DCAStrategy:
                 self.db.log_action('SELL_COMPLETED', symbol, f"Продано по {format_price(order['target_price'])}")
     
     async def check_completed_sells(self, symbol: str, user_id: int, bot) -> List[Dict]:
+        """Проверяет завершенные продажи без вычитания лишних часов"""
         last_check = self.db.get_last_sell_check_time()
-        first_order_date = self.db.get_first_order_date()
-        if first_order_date is None:
-            first_order_date = get_moscow_time_naive() - timedelta(days=30)
-        check_date = last_check if last_check and last_check > first_order_date else first_order_date
-        check_date = check_date - timedelta(hours=24)
         
+        # Если проверка была давно (больше 24 часов) или никогда, берем последние 30 дней
+        if last_check is None:
+            # Проверяем за последние 30 дней, если нет истории
+            check_date = get_moscow_time_naive() - timedelta(days=30)
+            logger.info(f"No last sell check time, checking last 30 days from {check_date}")
+        else:
+            # Проверяем с момента последней проверки, но не более 30 дней назад
+            # (на случай если последняя проверка была очень давно)
+            min_date = get_moscow_time_naive() - timedelta(days=30)
+            check_date = max(last_check, min_date)
+            logger.info(f"Checking completed sells from {check_date} (last check was {last_check})")
+        
+        # Получаем все завершенные продажи с указанной даты
         all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
+        logger.info(f"Found {len(all_completed)} completed sell orders for {symbol} since {check_date}")
+        
+        # Обновляем время последней проверки (на текущее время)
         self.db.set_last_sell_check_time(get_moscow_time_naive())
         
+        # Получаем уже обработанные продажи
         already_processed = self.db.get_completed_sells_not_notified(symbol)
         processed_order_ids = set([s['order_id'] for s in already_processed])
+        
+        # Получаем активные ордера на продажу (наши)
         active_sell_orders = self.db.get_active_sell_orders(symbol)
         active_order_ids = {o['order_id'] for o in active_sell_orders}
-        new_completed = []
         
+        # Находим новые завершенные продажи
+        new_completed = []
         for sell in all_completed:
+            # Пропускаем уже обработанные
             if sell['order_id'] in processed_order_ids:
                 continue
+            
+            # Проверяем, был ли это наш ордер
             was_our_order = sell['order_id'] in active_order_ids
+            
+            # Если ордер не наш, но он есть в базе как завершенный - тоже обрабатываем
+            # Проверяем в базе sell_orders
             if not was_our_order:
+                conn = sqlite3.connect(self.db.db_file, timeout=5)
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM sell_orders WHERE order_id = ?', (sell['order_id'],))
+                exists = cursor.fetchone() is not None
+                conn.close()
+                was_our_order = exists
+            
+            if not was_our_order:
+                logger.info(f"Skipping sell order {sell['order_id']} - not our order")
                 continue
+            
+            # Рассчитываем прибыль
             stats = self.db.get_dca_stats(symbol)
             if stats and stats['total_quantity'] > 0:
                 avg_price = stats['avg_price']
@@ -2183,6 +2221,8 @@ class DCAStrategy:
             else:
                 profit_percent = 0
                 profit_usdt = 0
+            
+            # Добавляем в базу завершенных продаж
             sell_id = self.db.add_completed_sell(
                 symbol=symbol,
                 order_id=sell['order_id'],
@@ -2191,6 +2231,10 @@ class DCAStrategy:
                 profit_percent=profit_percent,
                 profit_usdt=profit_usdt
             )
+            
+            # Обновляем статус ордера в таблице sell_orders
+            self.db.update_sell_order_status(sell['order_id'], 'completed')
+            
             new_completed.append({
                 'id': sell_id,
                 'order_id': sell['order_id'],
@@ -2201,8 +2245,8 @@ class DCAStrategy:
                 'profit_percent': profit_percent,
                 'profit_usdt': profit_usdt
             })
-            self.db.update_sell_order_status(sell['order_id'], 'completed')
         
+        # Отправляем уведомления о новых продажах
         for sell in new_completed:
             profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
             profit_color = "+" if sell['profit_usdt'] >= 0 else ""
@@ -2224,6 +2268,7 @@ class DCAStrategy:
                 logger.info(f"Sent completed sell notification for {symbol} to user {user_id}")
             except Exception as e:
                 logger.error(f"Error sending notification: {e}")
+        
         return new_completed
     
     async def get_recommended_purchase(self, symbol: str) -> Dict:
@@ -2470,22 +2515,47 @@ class DCAStrategy:
         }
     
     async def force_check_completed_sells(self, symbol: str, bot, user_id: int) -> Dict:
+        """Принудительная проверка завершенных продаж за последние 90 дней"""
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
             first_order_date = get_moscow_time_naive() - timedelta(days=90)
         check_date = first_order_date - timedelta(days=1)
+        
         all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
+        logger.info(f"Force check: found {len(all_completed)} completed sell orders for {symbol} since {check_date}")
+        
         already_processed = self.db.get_completed_sells_not_notified(symbol)
         processed_order_ids = set([s['order_id'] for s in already_processed])
+        
+        # Получаем также из completed_sells с notified=1
+        conn = sqlite3.connect(self.db.db_file, timeout=5)
+        cursor = conn.cursor()
+        cursor.execute('SELECT order_id FROM completed_sells WHERE symbol = ? AND notified = 1', (symbol,))
+        for row in cursor.fetchall():
+            processed_order_ids.add(row[0])
+        conn.close()
+        
         active_sell_orders = self.db.get_active_sell_orders(symbol)
         active_order_ids = {o['order_id'] for o in active_sell_orders}
+        
         missing_sells = []
         for sell in all_completed:
             if sell['order_id'] in processed_order_ids:
                 continue
+            
+            # Проверяем, был ли это наш ордер
             was_our_order = sell['order_id'] in active_order_ids
             if not was_our_order:
+                conn = sqlite3.connect(self.db.db_file, timeout=5)
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM sell_orders WHERE order_id = ?', (sell['order_id'],))
+                exists = cursor.fetchone() is not None
+                conn.close()
+                was_our_order = exists
+            
+            if not was_our_order:
                 continue
+            
             stats = self.db.get_dca_stats(symbol)
             if stats and stats['total_quantity'] > 0:
                 avg_price = stats['avg_price']
@@ -2494,7 +2564,15 @@ class DCAStrategy:
             else:
                 profit_percent = 0
                 profit_usdt = 0
-            sell_id = self.db.add_completed_sell(symbol=symbol, order_id=sell['order_id'], quantity=sell['quantity'], sell_price=sell['sell_price'], profit_percent=profit_percent, profit_usdt=profit_usdt)
+            
+            sell_id = self.db.add_completed_sell(
+                symbol=symbol,
+                order_id=sell['order_id'],
+                quantity=sell['quantity'],
+                sell_price=sell['sell_price'],
+                profit_percent=profit_percent,
+                profit_usdt=profit_usdt
+            )
             missing_sells.append({
                 'id': sell_id,
                 'order_id': sell['order_id'],
