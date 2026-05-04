@@ -760,7 +760,6 @@ class Database:
             logger.error(f"Error saving authorized user id: {e}")
 
 
-# Классы BybitClient, DCAStrategy, FastDCABot - продолжение следует из-за ограничения длины...
 class BybitClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -1105,7 +1104,6 @@ class DCAStrategy:
             return 0
     
     async def sync_purchases_with_exchange(self, symbol: str, user_id: int, bot) -> Dict:
-        """Полная сверка покупок в статистике с реальными ордерами на бирже по order_id"""
         try:
             first_order_date = self.db.get_first_order_date()
             if first_order_date is None:
@@ -1708,13 +1706,43 @@ class FastDCABot:
         await update.message.reply_text("🚀 *Настройки Авто DCA*", reply_markup=self.get_auto_dca_keyboard(), parse_mode='Markdown')
         return AUTO_DCA_SETTINGS
     
+    async def set_amount_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("💵 Введите сумму для Авто DCA (мин 5 USDT):", reply_markup=self.get_cancel_keyboard())
+        return SET_AMOUNT
+    
     async def set_amount_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("✅ Сумма изменена", reply_markup=self.get_auto_dca_keyboard())
-        return AUTO_DCA_SETTINGS
+        text = update.message.text.strip()
+        if text in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        try:
+            amount = float(text)
+            if amount < 5:
+                raise ValueError("Минимальная сумма 5 USDT")
+            self.db.set_setting('invest_amount', str(amount))
+            await update.message.reply_text(f"✅ Сумма изменена на {amount} USDT", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        except ValueError:
+            await update.message.reply_text("❌ Некорректная сумма. Введите число больше 5", reply_markup=self.get_cancel_keyboard())
+            return SET_AMOUNT
+    
+    async def set_time_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("⏰ Введите время (ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
+        return SET_SCHEDULE_TIME
     
     async def set_time_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("✅ Время изменено", reply_markup=self.get_auto_dca_keyboard())
-        return AUTO_DCA_SETTINGS
+        time_str = update.message.text.strip()
+        if time_str in ["❌ ОТМЕНА", "❌ Отмена"]:
+            await update.message.reply_text("❌ Отменено", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        try:
+            datetime.strptime(time_str, "%H:%M")
+            self.db.set_setting('schedule_time', time_str)
+            await update.message.reply_text(f"✅ Время изменено на {time_str}", reply_markup=self.get_auto_dca_keyboard())
+            return AUTO_DCA_SETTINGS
+        except ValueError:
+            await update.message.reply_text("❌ Некорректный формат. Используйте ЧЧ:ММ", reply_markup=self.get_cancel_keyboard())
+            return SET_SCHEDULE_TIME
     
     async def purchase_notify_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔔 *Уведомления*", reply_markup=self.get_purchase_notify_settings_keyboard(), parse_mode='Markdown')
@@ -2073,11 +2101,9 @@ class FastDCABot:
     def setup_handlers(self):
         logger.info("Setting up handlers...")
         
-        # Базовые обработчики
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback))
         
-        # Прямые команды
         self.application.add_handler(MessageHandler(filters.Regex('^(📊 Мой Портфель)$'), self.show_portfolio))
         self.application.add_handler(MessageHandler(filters.Regex('^(🚀 Запустить Авто DCA|⏹ Остановить Авто DCA)$'), self.toggle_dca))
         self.application.add_handler(MessageHandler(filters.Regex('^(📈 Статистика DCA)$'), self.show_dca_stats_detailed))
@@ -2085,13 +2111,11 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main))
         
-        # Импорт/экспорт
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
         self.application.add_handler(MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.handle_import_start))
         self.application.add_handler(MessageHandler(filters.Regex('^❌ Отмена$'), self.handle_import_cancel))
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_import_file))
         
-        # Настройки отслеживания
         tracking_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки отслеживания)$'), self.tracking_settings)],
             states={
@@ -2107,7 +2131,6 @@ class FastDCABot:
         )
         self.application.add_handler(tracking_conv)
         
-        # Основные настройки
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
@@ -2134,7 +2157,6 @@ class FastDCABot:
         )
         self.application.add_handler(main_conv)
         
-        # Лестница
         ladder_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🪜 Лестница Мартингейла)$'), self.ladder_settings_menu)],
             states={
@@ -2153,7 +2175,6 @@ class FastDCABot:
         )
         self.application.add_handler(ladder_conv)
         
-        # Авто DCA
         auto_dca_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🚀 Настройки Авто DCA)$'), self.auto_dca_settings_menu)],
             states={
@@ -2170,7 +2191,6 @@ class FastDCABot:
         )
         self.application.add_handler(auto_dca_conv)
         
-        # Уведомления
         notify_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🔔 Уведомления)$'), self.purchase_notify_settings)],
             states={
@@ -2186,7 +2206,6 @@ class FastDCABot:
         )
         self.application.add_handler(notify_conv)
         
-        # Редактирование покупок
         edit_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
             states={
@@ -2209,7 +2228,6 @@ class FastDCABot:
         )
         self.application.add_handler(edit_conv)
         
-        # Ручная покупка
         manual_limit_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(💰 Ручная покупка)$'), self.manual_buy_start)],
             states={
@@ -2221,7 +2239,6 @@ class FastDCABot:
         )
         self.application.add_handler(manual_limit_conv)
         
-        # Добавление покупки вручную
         manual_add_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(➕ Добавить покупку)$'), self.manual_add_start)],
             states={
@@ -2233,7 +2250,6 @@ class FastDCABot:
         )
         self.application.add_handler(manual_add_conv)
         
-        # Неизвестные команды
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         
         logger.info("Handlers setup completed")
@@ -2243,10 +2259,8 @@ class FastDCABot:
         while self.scheduler_running:
             try:
                 await asyncio.sleep(30)
-                
                 if self.db.get_setting('dca_active', 'false') != 'true':
                     continue
-                
                 if not self.bybit_initialized:
                     self._init_bybit()
                 if not self.bybit_initialized:
@@ -2254,7 +2268,6 @@ class FastDCABot:
                 
                 now = get_moscow_time()
                 next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
-                
                 if not next_purchase_str:
                     next_time = self._calculate_next_purchase_time()
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
@@ -2270,15 +2283,10 @@ class FastDCABot:
                 if now >= next_time:
                     symbol = self.db.get_setting('symbol', 'TONUSDT')
                     profit_percent = float(self.db.get_setting('profit_percent', '5'))
-                    
-                    logger.info(f"Scheduled purchase triggered")
                     result = await self.strategy.execute_scheduled_purchase(symbol, profit_percent)
                     
                     if result.get('success') and self.authorized_user_id:
-                        msg = (f"🪜 *АВТО DCA ПОКУПКА*\n\n"
-                               f"🪙 {symbol}\n"
-                               f"💰 Сумма: {result.get('total_usdt', 0):.2f} USDT\n"
-                               f"💵 Цена: {result.get('price', 0):.4f} USDT")
+                        msg = f"🪜 *АВТО DCA ПОКУПКА*\n\n🪙 {symbol}\n💰 Сумма: {result.get('total_usdt', 0):.2f} USDT\n💵 Цена: {result.get('price', 0):.4f} USDT"
                         try:
                             await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
                         except:
@@ -2290,9 +2298,7 @@ class FastDCABot:
                         next_time += timedelta(hours=frequency_hours)
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                 
-                current_symbol = self.db.get_setting('symbol', 'TONUSDT')
-                await self.strategy.check_and_update_sell_orders(current_symbol)
-                
+                await self.strategy.check_and_update_sell_orders(self.db.get_setting('symbol', 'TONUSDT'))
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -2367,7 +2373,6 @@ class FastDCABot:
                 await asyncio.sleep(60)
     
     async def daily_sync_loop(self):
-        """Ежедневная синхронизация в 19:00 МСК"""
         logger.info("Daily sync loop started")
         await asyncio.sleep(60)
         while self.scheduler_running:
@@ -2378,43 +2383,20 @@ class FastDCABot:
                 if last_sync is None or now.date() > last_sync.date():
                     if now.hour >= 19:
                         logger.info(f"Running daily sync at {now.strftime('%H:%M')}")
-                        
                         if not self.bybit_initialized:
                             self._init_bybit()
-                        
                         if self.bybit_initialized and self.authorized_user_id:
                             symbol = self.db.get_setting('symbol', 'TONUSDT')
-                            
-                            await self.application.bot.send_message(
-                                chat_id=self.authorized_user_id,
-                                text="🔄 *ЕЖЕДНЕВНАЯ СИНХРОНИЗАЦИЯ*\nЗапущена сверка с биржей...",
-                                parse_mode='Markdown'
-                            )
-                            
+                            await self.application.bot.send_message(chat_id=self.authorized_user_id, text="🔄 *ЕЖЕДНЕВНАЯ СИНХРОНИЗАЦИЯ*\nЗапущена сверка с биржей...", parse_mode='Markdown')
                             result = await self.strategy.sync_purchases_with_exchange(symbol, self.authorized_user_id, self.application.bot)
-                            
                             if result['success']:
                                 if result['deleted_count'] > 0:
-                                    await self.application.bot.send_message(
-                                        chat_id=self.authorized_user_id,
-                                        text=f"✅ Синхронизация завершена!\n🗑 Удалено {result['deleted_count']} покупок",
-                                        parse_mode='Markdown'
-                                    )
+                                    await self.application.bot.send_message(chat_id=self.authorized_user_id, text=f"✅ Синхронизация завершена!\n🗑 Удалено {result['deleted_count']} покупок", parse_mode='Markdown')
                                 else:
-                                    await self.application.bot.send_message(
-                                        chat_id=self.authorized_user_id,
-                                        text="✅ Синхронизация завершена!\n📊 Расхождений не найдено",
-                                        parse_mode='Markdown'
-                                    )
+                                    await self.application.bot.send_message(chat_id=self.authorized_user_id, text="✅ Синхронизация завершена!\n📊 Расхождений не найдено", parse_mode='Markdown')
                             else:
-                                await self.application.bot.send_message(
-                                    chat_id=self.authorized_user_id,
-                                    text=f"❌ Ошибка синхронизации: {result.get('error')}",
-                                    parse_mode='Markdown'
-                                )
-                        
+                                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=f"❌ Ошибка синхронизации: {result.get('error')}", parse_mode='Markdown')
                         self.db.set_last_daily_sync_time(now)
-                
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 break
@@ -2443,7 +2425,6 @@ class FastDCABot:
                 
                 should_notify = False
                 notify_hour, notify_minute = map(int, notify_time_str.split(':'))
-                
                 if now.hour == notify_hour and now.minute >= notify_minute and now.minute < notify_minute + 5:
                     if last_notify_date != current_date_str:
                         should_notify = True
@@ -2453,20 +2434,16 @@ class FastDCABot:
                     current_price = await self.bybit.get_symbol_price(symbol)
                     if current_price:
                         manual_amount = self.db.get_manual_amount()
-                        msg = (f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ*\n\n"
-                               f"💰 {symbol}: {format_price(current_price, 4)} USDT\n"
-                               f"💡 Сумма для ручного ордера: {manual_amount:.2f} USDT")
+                        msg = f"🔔 *ЕЖЕДНЕВНОЕ УВЕДОМЛЕНИЕ*\n\n💰 {symbol}: {format_price(current_price, 4)} USDT\n💡 Сумма для ручного ордера: {manual_amount:.2f} USDT"
                         try:
                             await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
                             self.db.set_last_purchase_notify_date(current_date_str)
                         except Exception as e:
                             logger.error(f"Error sending notification: {e}")
-                
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Purchase notify error: {e}")
-            
             await asyncio.sleep(60)
     
     async def post_init(self, application):
